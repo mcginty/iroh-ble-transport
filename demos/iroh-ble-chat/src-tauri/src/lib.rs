@@ -6,7 +6,7 @@ use std::time::Instant;
 use bytes::Bytes;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId, RelayMode};
-use iroh_ble::transport::BleTransport;
+use iroh_ble_transport::transport::BleTransport;
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;

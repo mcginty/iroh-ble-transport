@@ -10,7 +10,7 @@
 //!
 //! Start `cargo run --example peripheral -p iroh-ble` first so there is something to connect to.
 
-use iroh_ble::{Central, CentralEvent, DeviceId, ScanFilter};
+use iroh_ble_transport::{Central, CentralEvent, DeviceId, ScanFilter};
 use std::{env, time::Duration};
 use tokio::time;
 use tokio_stream::StreamExt as _;
@@ -101,7 +101,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &device_id,
             CHAR_UUID,
             msg,
-            iroh_ble::WriteType::WithResponse,
+            iroh_ble_transport::WriteType::WithResponse,
         )
         .await?;
     println!("Wrote: \"hello from central\"");

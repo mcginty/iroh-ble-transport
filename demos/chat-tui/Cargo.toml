@@ -9,7 +9,7 @@ name = "chat-tui"
 path = "src/main.rs"
 
 [dependencies]
-iroh-ble = { path = "../../crates/iroh-ble" }
+iroh-ble-transport = { path = "../../crates/iroh-ble-transport" }
 iroh-ble-chat-protocol = { path = "../protocol" }
 iroh = { version = "0.97", features = ["unstable-custom-transports"] }
 iroh-gossip = "0.97"

@@ -1,5 +1,5 @@
 [package]
-name = "iroh-ble"
+name = "iroh-ble-transport"
 version = "0.1.0-alpha.1"
 edition = "2024"
 authors = ["Jake McGinty <me@jakebot.org>"]
@@ -10,7 +10,7 @@ keywords = ["bluetooth", "ble", "iroh", "p2p", "transport"]
 categories = ["network-programming"]
 
 [dependencies]
-blew = { git = "https://github.com/mcginty/blew.git" }
+blew = "0.1.0-alpha.2"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"
@@ -31,4 +31,4 @@ tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 rand = "0.9"
-blew = { git = "https://github.com/mcginty/blew.git", features = ["testing"] }
+blew = { version = "0.1.0-alpha.2", features = ["testing"] }

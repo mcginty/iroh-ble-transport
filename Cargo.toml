@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "crates/iroh-ble",
+    "crates/iroh-ble-transport",
     "demos/protocol",
     "demos/chat-tui",
     "demos/iroh-ble-chat/src-tauri",

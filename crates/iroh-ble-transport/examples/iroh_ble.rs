@@ -41,7 +41,7 @@ mod key_utils;
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh_ble::transport::BleTransport;
+use iroh_ble_transport::transport::BleTransport;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 

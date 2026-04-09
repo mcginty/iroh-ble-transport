@@ -29,7 +29,7 @@ library for Rust.
 ## Usage
 
 ```rust
-use iroh_ble::BleTransport;
+use iroh_ble_transport::BleTransport;
 use iroh::Endpoint;
 
 let transport = BleTransport::new().await?;

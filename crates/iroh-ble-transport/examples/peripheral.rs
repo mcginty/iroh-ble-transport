@@ -10,7 +10,7 @@
 //! Then run `cargo run --example central -p iroh-ble` on the same or another
 //! machine to connect to it.
 
-use iroh_ble::{
+use iroh_ble_transport::{
     AdvertisingConfig, AttributePermissions, CharacteristicProperties, GattCharacteristic,
     GattService, Peripheral, PeripheralEvent,
 };

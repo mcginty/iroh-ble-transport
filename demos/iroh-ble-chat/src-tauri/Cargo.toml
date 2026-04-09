@@ -21,7 +21,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-iroh-ble = { path = "../../../crates/iroh-ble" }
+iroh-ble-transport = { path = "../../../crates/iroh-ble-transport" }
 iroh-ble-chat-protocol = { path = "../../protocol" }
 iroh = { version = "0.97.0", features = ["unstable-custom-transports"] }
 iroh-base = "0.97"
@@ -36,7 +36,11 @@ blake3 = "1"
 bytes = "1"
 postcard = { version = "1", features = ["alloc"] }
 n0-future = "0.1"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "webp",
+] }
 ravif = "0.11"
 rgb = "0.8"
 base64 = "0.22"
