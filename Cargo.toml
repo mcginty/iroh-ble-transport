@@ -1,0 +1,8 @@
+[workspace]
+members = [
+    "crates/iroh-ble",
+    "demos/protocol",
+    "demos/chat-tui",
+    "demos/iroh-ble-chat/src-tauri",
+]
+resolver = "2"

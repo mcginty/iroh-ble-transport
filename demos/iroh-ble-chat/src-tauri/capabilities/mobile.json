@@ -1,0 +1,11 @@
+{
+  "identifier": "mobile",
+  "description": "Additional capabilities for mobile",
+  "platforms": ["android", "iOS"],
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "barcode-scanner:default"
+  ]
+}

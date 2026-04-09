@@ -1,0 +1,85 @@
+# iroh-ble-transport development tasks
+# Install mise: https://mise.jdx.dev
+# Usage: mise run <task>   or   mise r <task>
+
+[tools]
+rust = { version = "stable", components = "rustfmt,clippy", targets = "aarch64-apple-ios,aarch64-linux-android" }
+cargo-binstall = "latest"
+"cargo:cargo-ndk" = "latest"
+"cargo:cargo-deny" = "latest"
+"cargo:cargo-nextest" = "latest"
+node = "22"
+pnpm = "10"
+java = "temurin-21"
+ktlint = "latest"
+android-sdk = "latest"
+
+[tasks.build]
+description = "Build all crates"
+run = "cargo build"
+
+[tasks.check]
+description = "Type-check all crates (no codegen)"
+run = "cargo check --workspace"
+
+[tasks.lint]
+description = "Run clippy on all code"
+depends = ["fmt:check"]
+run = "cargo clippy --workspace -- -D warnings"
+
+[tasks."lint:fix"]
+description = "Run clippy --fix on all code"
+depends = ["fmt"]
+run = "cargo clippy --workspace --fix"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo nextest run --workspace"
+
+[tasks.fmt]
+description = "Format all Rust code"
+run = "cargo fmt --all"
+
+[tasks."fmt:check"]
+description = "Check formatting without modifying files"
+run = "cargo fmt --all -- --check"
+
+[tasks.deny]
+description = "Check dependencies for license and vulnerability issues"
+run = "cargo deny check"
+
+# --- Chat app tasks ---------------------------------------------------
+
+[tasks."chat:dev"]
+description = "Run the chat app in desktop dev mode"
+run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri dev"
+
+[tasks."chat:build"]
+description = "Build the chat app for desktop"
+run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri build"
+
+[tasks."chat:dev:ios"]
+description = "Run the chat app on iOS device"
+run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri ios dev --open"
+
+[tasks."chat:dev:android"]
+description = "Run the chat app on Android device"
+run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri android dev --open"
+
+[tasks."chat:tui"]
+description = "Run the terminal chat UI"
+run = "cargo run -p iroh-ble-chat-tui"
+
+# --- CI ---------------------------------------------------------------
+
+[tasks."ci:lint"]
+description = "Run clippy on all crates"
+run = "cargo clippy --workspace -- -D warnings"
+
+[tasks."ci:check-ios"]
+description = "Type-check for iOS"
+run = "cargo check --target aarch64-apple-ios -p iroh-ble"
+
+[tasks."ci:check-android"]
+description = "Type-check for Android"
+run = "cargo ndk -t arm64-v8a check -p iroh-ble"

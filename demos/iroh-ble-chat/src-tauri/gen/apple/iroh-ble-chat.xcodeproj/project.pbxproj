@@ -1,0 +1,488 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0C42C1760FDF7ED0A50A252A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C02121B9008B56CA974BE8C3 /* Assets.xcassets */; };
+		3C5FCB955C36D904D23A108F /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9848CF8A940FD36FBFCE9733 /* MetalKit.framework */; };
+		498D2F5A152C6B79357E96EF /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FD3C135BBFC786FFB0A59255 /* CoreGraphics.framework */; };
+		8023C7F2A1C3EA13B176F711 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E10E8F0D41129AFEA2533AA7 /* Metal.framework */; };
+		9092B4052264194273C76046 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5CAB67ABFB04096AF1187CA /* Security.framework */; };
+		93A320D2C5DB323A095BBB17 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B28576AB0BA4738DE6899C22 /* WebKit.framework */; };
+		A378C0409B1882DE904042ED /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 91C0A8189E2FDC9DC5505B75 /* assets */; };
+		A7A066FA3ECFA288B0F58CFE /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 94D79508C0059A24D3F77573 /* QuartzCore.framework */; };
+		AB907D7E17DB133CB4FF8823 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 98D0F0F2BC4287B76CC28DE8 /* libapp.a */; };
+		AEE7CB633EBB8AF6E7650DFF /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4AE5C92AC983DA2628EBF3EE /* UIKit.framework */; };
+		B8E442B751422255FA26DBBD /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 47A0F7EC6C2E1519B4EDB222 /* main.mm */; };
+		BB1234567890ABCDEF012345 /* CoreBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA9876543210FEDCBA987654 /* CoreBluetooth.framework */; };
+		C151D94DD6BB1ABAB433E389 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 730CCA979685231E910DB05B /* LaunchScreen.storyboard */; };
+		EB940ABC2F86DB7B003828B6 /* a blue tooth.icon in Resources */ = {isa = PBXBuildFile; fileRef = EB940ABB2F86DB7B003828B6 /* a blue tooth.icon */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		17F0333CEDD20D1E54B70211 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		2A7990F14FC42B31A45D7024 /* iroh-ble-chat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "iroh-ble-chat.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		47A0F7EC6C2E1519B4EDB222 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		4AE5C92AC983DA2628EBF3EE /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+		730CCA979685231E910DB05B /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		91C0A8189E2FDC9DC5505B75 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		92B02D26D52191407DA2011A /* main.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = main.rs; sourceTree = "<group>"; };
+		94D79508C0059A24D3F77573 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		9848CF8A940FD36FBFCE9733 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		98D0F0F2BC4287B76CC28DE8 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		A878A610429EB86014638AA2 /* lib.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = lib.rs; sourceTree = "<group>"; };
+		AA9876543210FEDCBA987654 /* CoreBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreBluetooth.framework; path = System/Library/Frameworks/CoreBluetooth.framework; sourceTree = SDKROOT; };
+		B28576AB0BA4738DE6899C22 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		C02121B9008B56CA974BE8C3 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		C82870CC0F573F133D5E0AED /* iroh-ble-chat_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "iroh-ble-chat_iOS.entitlements"; sourceTree = "<group>"; };
+		D5CAB67ABFB04096AF1187CA /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		E10E8F0D41129AFEA2533AA7 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		EB940ABB2F86DB7B003828B6 /* a blue tooth.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = "a blue tooth.icon"; sourceTree = "<group>"; };
+		FC2D78775BFCBE4B7E4E6E70 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		FD3C135BBFC786FFB0A59255 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		743AAFB9FF2AE795042DA90D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				AB907D7E17DB133CB4FF8823 /* libapp.a in Frameworks */,
+				498D2F5A152C6B79357E96EF /* CoreGraphics.framework in Frameworks */,
+				8023C7F2A1C3EA13B176F711 /* Metal.framework in Frameworks */,
+				3C5FCB955C36D904D23A108F /* MetalKit.framework in Frameworks */,
+				A7A066FA3ECFA288B0F58CFE /* QuartzCore.framework in Frameworks */,
+				9092B4052264194273C76046 /* Security.framework in Frameworks */,
+				AEE7CB633EBB8AF6E7650DFF /* UIKit.framework in Frameworks */,
+				93A320D2C5DB323A095BBB17 /* WebKit.framework in Frameworks */,
+				BB1234567890ABCDEF012345 /* CoreBluetooth.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		1BB4E5C48CBC9B36245BD7D0 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				EB940ABB2F86DB7B003828B6 /* a blue tooth.icon */,
+				FD3C135BBFC786FFB0A59255 /* CoreGraphics.framework */,
+				98D0F0F2BC4287B76CC28DE8 /* libapp.a */,
+				E10E8F0D41129AFEA2533AA7 /* Metal.framework */,
+				9848CF8A940FD36FBFCE9733 /* MetalKit.framework */,
+				94D79508C0059A24D3F77573 /* QuartzCore.framework */,
+				D5CAB67ABFB04096AF1187CA /* Security.framework */,
+				4AE5C92AC983DA2628EBF3EE /* UIKit.framework */,
+				B28576AB0BA4738DE6899C22 /* WebKit.framework */,
+				AA9876543210FEDCBA987654 /* CoreBluetooth.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		3C4905C66F713FCF51658910 /* src */ = {
+			isa = PBXGroup;
+			children = (
+				A878A610429EB86014638AA2 /* lib.rs */,
+				92B02D26D52191407DA2011A /* main.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+		63566C011034567634D7C103 /* iroh-ble-chat */ = {
+			isa = PBXGroup;
+			children = (
+				47A0F7EC6C2E1519B4EDB222 /* main.mm */,
+				6E92B0687D8A26F87EBFB952 /* bindings */,
+			);
+			path = "iroh-ble-chat";
+			sourceTree = "<group>";
+		};
+		6E92B0687D8A26F87EBFB952 /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				FC2D78775BFCBE4B7E4E6E70 /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		90E0F9A5BC5B35607F519906 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				63566C011034567634D7C103 /* iroh-ble-chat */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		A682EB2131178F4B60AA6015 /* iroh-ble-chat_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				17F0333CEDD20D1E54B70211 /* Info.plist */,
+				C82870CC0F573F133D5E0AED /* iroh-ble-chat_iOS.entitlements */,
+			);
+			path = "iroh-ble-chat_iOS";
+			sourceTree = "<group>";
+		};
+		AD5ABAF7E6ABEE89D916D1D3 /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+		B9932BF90B7077965A2EB012 = {
+			isa = PBXGroup;
+			children = (
+				91C0A8189E2FDC9DC5505B75 /* assets */,
+				C02121B9008B56CA974BE8C3 /* Assets.xcassets */,
+				730CCA979685231E910DB05B /* LaunchScreen.storyboard */,
+				AD5ABAF7E6ABEE89D916D1D3 /* Externals */,
+				A682EB2131178F4B60AA6015 /* iroh-ble-chat_iOS */,
+				90E0F9A5BC5B35607F519906 /* Sources */,
+				3C4905C66F713FCF51658910 /* src */,
+				1BB4E5C48CBC9B36245BD7D0 /* Frameworks */,
+				CA2B060DC95215A6A8C8E2A0 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		CA2B060DC95215A6A8C8E2A0 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				2A7990F14FC42B31A45D7024 /* iroh-ble-chat.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		5FFFAC84D1070959FC08CCE8 /* iroh-ble-chat_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 3FED906327C7517523649128 /* Build configuration list for PBXNativeTarget "iroh-ble-chat_iOS" */;
+			buildPhases = (
+				A9F9FA02548C76BDEA5BD4D5 /* Build Rust Code */,
+				04DF3D713AFE23B9F9682E37 /* Sources */,
+				21413FA8F6AA05AFF84B21A1 /* Resources */,
+				743AAFB9FF2AE795042DA90D /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = "iroh-ble-chat_iOS";
+			packageProductDependencies = (
+			);
+			productName = "iroh-ble-chat_iOS";
+			productReference = 2A7990F14FC42B31A45D7024 /* iroh-ble-chat.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		D95A48CB4D3E0E5885CF7C25 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+			};
+			buildConfigurationList = C930CBCB665D2368B487439C /* Build configuration list for PBXProject "iroh-ble-chat" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = B9932BF90B7077965A2EB012;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = CA2B060DC95215A6A8C8E2A0 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				5FFFAC84D1070959FC08CCE8 /* iroh-ble-chat_iOS */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		21413FA8F6AA05AFF84B21A1 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				0C42C1760FDF7ED0A50A252A /* Assets.xcassets in Resources */,
+				C151D94DD6BB1ABAB433E389 /* LaunchScreen.storyboard in Resources */,
+				A378C0409B1882DE904042ED /* assets in Resources */,
+				EB940ABC2F86DB7B003828B6 /* a blue tooth.icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A9F9FA02548C76BDEA5BD4D5 /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "if [ -f \"$SRCROOT/.xcode.env\" ]; then\n  . \"$SRCROOT/.xcode.env\"\nfi\n\n# In Xcode Cloud, libapp.a is pre-built by ci_post_clone.sh\nif [ \"${CI_XCODE_CLOUD:-}\" = \"TRUE\" ]; then\n  echo \"Xcode Cloud: skipping tauri xcode-script (libapp.a built in ci_post_clone)\"\n  exit 0\nfi\n\npnpm tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		04DF3D713AFE23B9F9682E37 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B8E442B751422255FA26DBBD /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		26C31D503550B20DF21B761D /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+		2AA37D1C5287C59C0A5E099C /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		EEBB9F241479EC8D87C766BE /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_APPICON_NAME = "a blue tooth";
+				CODE_SIGN_ENTITLEMENTS = "iroh-ble-chat_iOS/iroh-ble-chat_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = XG66F95CNS;
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "iroh-ble-chat_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION)",
+					"$(SDKROOT)/usr/lib/swift",
+					"$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+					"$(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION)",
+					"$(SDKROOT)/usr/lib/swift",
+					"$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+					"$(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.jakebot.iroh-ble-chat;
+				PRODUCT_NAME = "iroh-ble-chat";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = release;
+		};
+		EF1BB401F67396566C07F31D /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = arm64;
+				ASSETCATALOG_COMPILER_APPICON_NAME = "a blue tooth";
+				CODE_SIGN_ENTITLEMENTS = "iroh-ble-chat_iOS/iroh-ble-chat_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				DEVELOPMENT_TEAM = XG66F95CNS;
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "iroh-ble-chat_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION)",
+					"$(SDKROOT)/usr/lib/swift",
+					"$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+					"$(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = (
+					"$(inherited)",
+					"$(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION)",
+					"$(SDKROOT)/usr/lib/swift",
+					"$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
+					"$(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = org.jakebot.iroh-ble-chat;
+				PRODUCT_NAME = "iroh-ble-chat";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		3FED906327C7517523649128 /* Build configuration list for PBXNativeTarget "iroh-ble-chat_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				EF1BB401F67396566C07F31D /* debug */,
+				EEBB9F241479EC8D87C766BE /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		C930CBCB665D2368B487439C /* Build configuration list for PBXProject "iroh-ble-chat" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2AA37D1C5287C59C0A5E099C /* debug */,
+				26C31D503550B20DF21B761D /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = D95A48CB4D3E0E5885CF7C25 /* Project object */;
+}
