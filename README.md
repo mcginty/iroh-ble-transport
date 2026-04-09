@@ -1,3 +1,6 @@
+[![iroh-ble-transport Crates.io](https://img.shields.io/crates/v/iroh-ble-transport)](https://crates.io/crates/iroh-ble-transport)
+[![iroh-ble-transport Docs.rs](https://img.shields.io/docsrs/iroh-ble-transport)](https://docs.rs/iroh-ble-transport)
+
 # `iroh-ble-transport`
 
 🔥 Warning 🔥 This library is in alpha state and is subject to change without
