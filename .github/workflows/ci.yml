@@ -8,7 +8,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
-  LINUX_APT_DEPS: libglib2.0-dev libdbus-1-dev pkg-config libssl-dev
+  LINUX_APT_DEPS: libdbus-1-dev libglib2.0-dev pkg-config libgtk-3-dev libssl-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libayatana-appindicator3-dev nasm
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
