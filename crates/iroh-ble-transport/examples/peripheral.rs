@@ -5,9 +5,9 @@
 //! subscribed centrals.
 //!
 //! Run with:
-//!   cargo run --example peripheral -p iroh-ble
+//!   cargo run --example peripheral -p iroh-ble-transport
 //!
-//! Then run `cargo run --example central -p iroh-ble` on the same or another
+//! Then run `cargo run --example central -p iroh-ble-transport` on the same or another
 //! machine to connect to it.
 
 use iroh_ble_transport::{

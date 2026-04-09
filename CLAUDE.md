@@ -17,8 +17,8 @@ mise run lint                            # clippy
 mise run fmt                             # format
 mise run fmt:check                       # check formatting
 mise run deny                            # license/vulnerability audit
-cargo run --example iroh_ble -p iroh-ble            # echo/speed test (listener)
-cargo run --example iroh_ble -p iroh-ble -- <id>    # echo/speed test (dialer)
+cargo run --example iroh_ble -p iroh-ble-transport            # echo/speed test (listener)
+cargo run --example iroh_ble -p iroh-ble-transport -- <id>    # echo/speed test (dialer)
 ```
 
 ## Style

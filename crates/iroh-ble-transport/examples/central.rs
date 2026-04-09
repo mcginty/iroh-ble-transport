@@ -5,10 +5,10 @@
 //! subscribes to notifications and prints them as they arrive.
 //!
 //! Run with:
-//!   cargo run --example central -p iroh-ble
-//!   cargo run --example central -p iroh-ble -- --name my-device
+//!   cargo run --example central -p iroh-ble-transport
+//!   cargo run --example central -p iroh-ble-transport -- --name my-device
 //!
-//! Start `cargo run --example peripheral -p iroh-ble` first so there is something to connect to.
+//! Start `cargo run --example peripheral -p iroh-ble-transport` first so there is something to connect to.
 
 use iroh_ble_transport::{Central, CentralEvent, DeviceId, ScanFilter};
 use std::{env, time::Duration};

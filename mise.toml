@@ -78,8 +78,8 @@ run = "cargo clippy --workspace -- -D warnings"
 
 [tasks."ci:check-ios"]
 description = "Type-check for iOS"
-run = "cargo check --target aarch64-apple-ios -p iroh-ble"
+run = "cargo check --target aarch64-apple-ios -p iroh-ble-transport"
 
 [tasks."ci:check-android"]
 description = "Type-check for Android"
-run = "cargo ndk -t arm64-v8a check -p iroh-ble"
+run = "cargo ndk -t arm64-v8a check -p iroh-ble-transport"

@@ -43,10 +43,10 @@ let endpoint = Endpoint::builder()
 
 ```sh
 # Echo + speed test (listener)
-cargo run --example iroh_ble -p iroh-ble
+cargo run --example iroh_ble -p iroh-ble-transport
 
 # Echo + speed test (dialer)
-cargo run --example iroh_ble -p iroh-ble -- <endpoint-id>
+cargo run --example iroh_ble -p iroh-ble-transport -- <endpoint-id>
 ```
 
 ## Demo App
