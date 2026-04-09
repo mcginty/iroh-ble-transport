@@ -22,9 +22,9 @@ library for Rust.
 
 | Platform | Backend | Status |
 |----------|---------|--------|
-| macOS / iOS | CoreBluetooth (via `objc2`) | Full support |
-| Linux | BlueZ (via `bluer`) | Full support |
-| Android | JNI + Kotlin (via `jni` and `ndk-context`) | Full support |
+| macOS / iOS | CoreBluetooth (via `objc2`) | Supported |
+| Linux | BlueZ (via `bluer`) | Supported |
+| Android | JNI + Kotlin (via `jni` and `ndk-context`) | Supported |
 
 ## Usage
 
@@ -48,6 +48,13 @@ cargo run --example iroh_ble -p iroh-ble
 # Echo + speed test (dialer)
 cargo run --example iroh_ble -p iroh-ble -- <endpoint-id>
 ```
+
+## Demo App
+
+There's a Tauri-based demo group chat app to show off Iroh BLE connectivity in
+`demos/iroh-ble-chat`. More details on this app will follow, but please do not
+use it for anything sensitive, it is not secure or in any way was written as a
+toy solely to demonstrate the underlying transport.
 
 ## License
 
