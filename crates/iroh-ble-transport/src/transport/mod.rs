@@ -783,7 +783,7 @@ impl CustomSender for BleSender {
                 let state = self.state.clone();
                 let data = transmit.contents.to_vec();
                 let waker = cx.waker().clone();
-                info!(device = %device_key, "poll_send: no peer channel, triggering reconnect");
+                debug!(device = %device_key, "poll_send: no peer channel, triggering reconnect");
                 tokio::spawn(async move {
                     if let Err(e) = ensure_connected_and_send(&state, &device_key, data).await {
                         warn!(device = %device_key, err = %e, "send failed (no channel)");
@@ -819,7 +819,7 @@ impl CustomSender for BleSender {
                 if tx.is_closed() {
                     let state = self.state.clone();
                     let stale = Arc::clone(&peer_channel);
-                    info!(device = %device_key, "poll_send: stale L2CAP channel, triggering reconnect");
+                    debug!(device = %device_key, "poll_send: stale L2CAP channel, triggering reconnect");
                     tokio::spawn(async move {
                         let removed = {
                             let mut channels = state.peer_channels.lock().await;
@@ -871,7 +871,6 @@ async fn ensure_connected_and_send(
     data: Vec<u8>,
 ) -> io::Result<()> {
     let device_id: DeviceId = DeviceId::from(device_key);
-    info!(device = %device_key, bytes = data.len(), "ensure_connected_and_send: start");
 
     let mut last_err = None;
     for attempt in 0..CONNECT_RETRY_COUNT {
@@ -897,7 +896,7 @@ async fn ensure_connected_and_send(
                     DataChannel::Gatt(_) => "gatt",
                     DataChannel::L2cap { .. } => "l2cap",
                 };
-                info!(device = %device_key, path, attempt, "ensure_connected_and_send: connected, sending first datagram");
+                debug!(device = %device_key, path, attempt, "ensure_connected_and_send: connected, sending first datagram");
                 match &pc.channel {
                     DataChannel::Gatt(rel) => {
                         rel.enqueue_datagram(data).await;
@@ -1325,7 +1324,7 @@ async fn ensure_connected(
         return Ok(());
     }
 
-    info!(device = %device_key, "connecting to peer");
+    debug!(device = %device_key, "connecting to peer");
 
     let result = ensure_connected_inner(state, device_id, device_key.clone()).await;
     state.connection_locks.lock().await.remove(&device_key);
@@ -1343,14 +1342,14 @@ async fn ensure_connected_inner(
         .connect(device_id)
         .await
         .map_err(BleError::from)?;
-    debug!(device = %device_key, "BLE connection established");
+    trace!(device = %device_key, "BLE connection established");
 
     state
         .central
         .discover_services(device_id)
         .await
         .map_err(BleError::from)?;
-    debug!(device = %device_key, "GATT services discovered");
+    trace!(device = %device_key, "GATT services discovered");
 
     // Check protocol version before proceeding.
     let version_bytes = state
@@ -1367,11 +1366,11 @@ async fn ensure_connected_inner(
             remote: remote_version,
         });
     }
-    debug!(device = %device_key, version = remote_version, "protocol version verified");
+    trace!(device = %device_key, version = remote_version, "protocol version verified");
 
     // Try L2CAP first — it's the preferred high-throughput path.
     if let Some(data_channel) = try_l2cap_path(state, device_id).await {
-        debug!(%device_key, "established L2CAP data path");
+        trace!(%device_key, "established L2CAP data path");
         let done = match &data_channel {
             DataChannel::L2cap { done, .. } => Arc::clone(done),
             _ => unreachable!(),
@@ -1382,19 +1381,19 @@ async fn ensure_connected_inner(
         });
         register_peer_channel(state, device_key.clone(), pc).await;
         spawn_l2cap_cleanup_monitor(Arc::clone(state), device_key.clone(), done);
-        info!(device = %device_key, "outbound L2CAP connection fully established");
+        debug!(device = %device_key, "outbound L2CAP connection fully established");
         return Ok(());
     }
 
     // GATT fallback.
-    debug!(%device_key, "using GATT data path");
+    trace!(%device_key, "using GATT data path");
 
     state
         .central
         .subscribe_characteristic(device_id, IROH_P2C_CHAR_UUID)
         .await
         .map_err(BleError::from)?;
-    debug!(device = %device_key, "subscribed to P2C notifications");
+    trace!(device = %device_key, "subscribed to P2C notifications");
 
     let (channel, datagram_rx) =
         ReliableChannel::new(DEFAULT_CHUNK_SIZE, Arc::clone(&state.retransmits));
@@ -1451,7 +1450,7 @@ async fn handle_central_event(
                 state.events_discovery_iroh.fetch_add(1, Ordering::Relaxed);
                 let is_new = !state.discovered.read().contains_key(&prefix);
                 if is_new {
-                    info!(
+                    debug!(
                         device = %device.id,
                         name = device.name.as_deref().unwrap_or("N/A"),
                         n_services = device.services.len(),
@@ -1480,7 +1479,7 @@ async fn handle_central_event(
         }
 
         CentralEvent::DeviceConnected { device_id } => {
-            debug!(device = %device_id, "BLE DeviceConnected");
+            info!(device = %device_id, "peer connected");
         }
 
         CentralEvent::DeviceDisconnected { device_id } => {
