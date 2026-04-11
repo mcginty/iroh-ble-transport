@@ -68,7 +68,7 @@ use iroh::endpoint::presets::Preset;
 use iroh::endpoint::transports::{Addr, CustomEndpoint, CustomSender, CustomTransport, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_watcher::Watchable;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio_stream::StreamExt as _;
 use tracing::{debug, info, trace, warn};
 use uuid::{Uuid, uuid};
@@ -194,6 +194,7 @@ pub(super) enum DataChannel {
         tx: tokio::sync::mpsc::Sender<Vec<u8>>,
         send_task: tokio::task::JoinHandle<()>,
         recv_task: tokio::task::JoinHandle<()>,
+        done: Arc<Notify>,
     },
 }
 
@@ -272,6 +273,19 @@ struct BleTransportState {
 
     /// Reduced duty cycle while active connections exist to lower radio contention.
     scan_low_power: Mutex<bool>,
+
+    /// Current L2CAP PSM, served dynamically via ReadRequest events.
+    current_psm: RwLock<Option<u16>>,
+
+    /// AbortHandle for the currently-running L2CAP accept task. Set when
+    /// the accept loop is (re)started; used to force a restart on power-on.
+    current_accept_abort: parking_lot::Mutex<Option<tokio::task::AbortHandle>>,
+
+    /// Key-encoded advertising UUID, stored for re-advertising after power cycle.
+    key_uuid: Uuid,
+
+    /// Advertising config, stored for re-advertising after power cycle.
+    advertising_config: AdvertisingConfig,
 
     /// Per-device locks to serialise connection setup.
     connection_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
@@ -371,14 +385,18 @@ impl BleTransport {
             }
         };
 
-        register_gatt_services(
-            &peripheral,
-            &local_id,
-            l2cap_psm.as_ref().map(|(psm, _)| *psm),
-        )
-        .await?;
+        let key_uuid = iroh_key_uuid(&local_id);
+        let advertising_config = AdvertisingConfig {
+            local_name: "iroh".to_string(),
+            service_uuids: vec![key_uuid],
+        };
+
+        register_gatt_services(&peripheral, key_uuid).await?;
 
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(256);
+
+        peripheral.start_advertising(&advertising_config).await?;
+        info!(key_uuid = %key_uuid, "advertising started");
 
         let state = Arc::new(BleTransportState {
             central,
@@ -399,12 +417,23 @@ impl BleTransport {
             bytes_rx: Arc::new(AtomicU64::new(0)),
             retransmits: Arc::new(AtomicU64::new(0)),
             scan_low_power: Mutex::new(false),
+            current_psm: RwLock::new(l2cap_psm.as_ref().map(|(psm, _)| psm.value())),
+            current_accept_abort: parking_lot::Mutex::new(None),
+            key_uuid,
+            advertising_config: advertising_config.clone(),
         });
 
-        if let Some((_, stream)) = l2cap_psm {
+        if let Some((_psm, stream)) = l2cap_psm {
             let accept_state = Arc::clone(&state);
-            tokio::spawn(async move {
+            let first_handle = tokio::spawn(async move {
                 l2cap_accept_loop(accept_state, Box::pin(stream)).await;
+            });
+            *state.current_accept_abort.lock() = Some(first_handle.abort_handle());
+            let restart_state = Arc::clone(&state);
+            tokio::spawn(async move {
+                let _ = first_handle.await;
+                warn!("initial L2CAP accept loop exited, entering restart loop");
+                l2cap_accept_loop_with_restart(restart_state).await;
             });
         }
 
@@ -450,12 +479,8 @@ pub struct TransportStats {
     pub rx_bytes: u64,
 }
 
-async fn register_gatt_services(
-    peripheral: &Peripheral,
-    local_id: &EndpointId,
-    l2cap_psm: Option<blew::l2cap::types::Psm>,
-) -> Result<Uuid, BleError> {
-    let mut characteristics = vec![
+async fn register_gatt_services(peripheral: &Peripheral, key_uuid: Uuid) -> Result<(), BleError> {
+    let characteristics = vec![
         GattCharacteristic {
             uuid: IROH_C2P_CHAR_UUID,
             properties: CharacteristicProperties::WRITE_WITHOUT_RESPONSE
@@ -472,23 +497,21 @@ async fn register_gatt_services(
             value: vec![],
             descriptors: vec![],
         },
-    ];
-    characteristics.push(GattCharacteristic {
-        uuid: IROH_VERSION_CHAR_UUID,
-        properties: CharacteristicProperties::READ,
-        permissions: AttributePermissions::READ,
-        value: vec![PROTOCOL_VERSION],
-        descriptors: vec![],
-    });
-    if let Some(psm) = l2cap_psm {
-        characteristics.push(GattCharacteristic {
+        GattCharacteristic {
+            uuid: IROH_VERSION_CHAR_UUID,
+            properties: CharacteristicProperties::READ,
+            permissions: AttributePermissions::READ,
+            value: vec![],
+            descriptors: vec![],
+        },
+        GattCharacteristic {
             uuid: IROH_PSM_CHAR_UUID,
             properties: CharacteristicProperties::READ,
             permissions: AttributePermissions::READ,
-            value: psm.value().to_le_bytes().to_vec(),
+            value: vec![],
             descriptors: vec![],
-        });
-    }
+        },
+    ];
     peripheral
         .add_service(&GattService {
             uuid: IROH_SERVICE_UUID,
@@ -497,7 +520,6 @@ async fn register_gatt_services(
         })
         .await?;
 
-    let key_uuid = iroh_key_uuid(local_id);
     peripheral
         .add_service(&GattService {
             uuid: key_uuid,
@@ -507,15 +529,7 @@ async fn register_gatt_services(
         .await?;
     debug!(service = %IROH_SERVICE_UUID, key_service = %key_uuid, "registered GATT services");
 
-    peripheral
-        .start_advertising(&AdvertisingConfig {
-            local_name: "iroh".to_string(),
-            service_uuids: vec![key_uuid],
-        })
-        .await?;
-    info!(key_uuid = %key_uuid, "advertising started");
-
-    Ok(key_uuid)
+    Ok(())
 }
 
 fn spawn_health_check(state: Arc<BleTransportState>) {
@@ -801,6 +815,40 @@ impl CustomSender for BleSender {
                 }
             }
             DataChannel::L2cap { tx, .. } => {
+                if tx.is_closed() {
+                    let state = self.state.clone();
+                    let stale = Arc::clone(&peer_channel);
+                    tokio::spawn(async move {
+                        let removed = {
+                            let mut channels = state.peer_channels.lock().await;
+                            if channels
+                                .get(&device_key)
+                                .is_some_and(|c| Arc::ptr_eq(c, &stale))
+                            {
+                                channels.remove(&device_key);
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        drop(stale);
+                        if removed {
+                            let no_connections = {
+                                let mut active = state.active_connections.write();
+                                active.remove(&device_key);
+                                active.is_empty()
+                            };
+                            if no_connections {
+                                switch_scan_mode(&state, ScanMode::LowLatency).await;
+                            }
+                        }
+                        if let Err(e) = ensure_connected_and_send(&state, &device_key, data).await {
+                            warn!(device = %device_key, err = %e, "send failed after L2CAP recovery");
+                        }
+                        waker.wake();
+                    });
+                    return Poll::Ready(Ok(()));
+                }
                 let tx = tx.clone();
                 tokio::spawn(async move {
                     if tx.send(data).await.is_err() {
@@ -898,7 +946,7 @@ async fn try_l2cap_path(
         .await
         .ok()?;
 
-    let (tx, send_task, recv_task) = l2cap::spawn_l2cap_io_tasks(
+    let (tx, send_task, recv_task, done) = l2cap::spawn_l2cap_io_tasks(
         reader,
         writer,
         device_id.to_string(),
@@ -911,6 +959,7 @@ async fn try_l2cap_path(
         tx,
         send_task,
         recv_task,
+        done,
     })
 }
 
@@ -938,6 +987,48 @@ where
         });
     }
     debug!("l2cap accept loop exited (stream closed)");
+}
+
+/// Start (or restart) the L2CAP listener. Returns a `JoinHandle` for the
+/// accept loop on success, or `None` if the listener could not be started.
+///
+/// Updates `state.current_psm` with the new PSM value.
+async fn start_l2cap_listener(
+    state: &Arc<BleTransportState>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    match state.peripheral.l2cap_listener().await {
+        Ok((psm, stream)) => {
+            info!(psm = psm.value(), "L2CAP listener (re)started");
+            *state.current_psm.write() = Some(psm.value());
+            let accept_state = Arc::clone(state);
+            let handle = tokio::spawn(async move {
+                l2cap_accept_loop(accept_state, Box::pin(stream)).await;
+            });
+            *state.current_accept_abort.lock() = Some(handle.abort_handle());
+            Some(handle)
+        }
+        Err(e) => {
+            warn!(?e, "l2cap_listener failed; GATT-only data path");
+            *state.current_psm.write() = None;
+            None
+        }
+    }
+}
+
+/// Wrapper that restarts the L2CAP accept loop whenever it exits.
+async fn l2cap_accept_loop_with_restart(state: Arc<BleTransportState>) {
+    loop {
+        match start_l2cap_listener(&state).await {
+            Some(handle) => {
+                let _ = handle.await;
+                warn!("L2CAP accept loop exited, restarting");
+            }
+            None => {
+                warn!("L2CAP listener failed to start, retrying in 10s");
+                tokio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
+    }
 }
 
 /// Handle one incoming L2CAP channel: read central's identity, install `PeerChannel`.
@@ -978,7 +1069,7 @@ async fn handle_incoming_l2cap(
     // as soon as the recv task delivers the first inbound QUIC packet.
     // Without this atomicity, iroh may try to respond before the channel is
     // registered, triggering a redundant GATT connection attempt.
-    {
+    let done = {
         let mut channels = state.peer_channels.lock().await;
 
         // Supersede any existing GATT channel for this device -- L2CAP is preferred.
@@ -992,7 +1083,7 @@ async fn handle_incoming_l2cap(
             );
         }
 
-        let (tx, send_task, recv_task) = l2cap::spawn_l2cap_io_tasks(
+        let (tx, send_task, recv_task, done) = l2cap::spawn_l2cap_io_tasks(
             reader,
             writer,
             device_key.clone(),
@@ -1005,11 +1096,13 @@ async fn handle_incoming_l2cap(
                 tx,
                 send_task,
                 recv_task,
+                done: Arc::clone(&done),
             },
             send_loop: None,
         });
         channels.insert(device_key.clone(), peer_channel);
-    }
+        done
+    };
     // Update active_connections outside the peer_channels lock.
     let first_connection = {
         let mut active = state.active_connections.write();
@@ -1020,6 +1113,7 @@ async fn handle_incoming_l2cap(
     if first_connection {
         switch_scan_mode(&state, ScanMode::LowPower).await;
     }
+    spawn_l2cap_cleanup_monitor(Arc::clone(&state), device_key.clone(), done);
 
     debug!(device = %device_key, "L2CAP inbound connection ready");
     Ok(())
@@ -1056,6 +1150,87 @@ async fn unregister_peer(state: &Arc<BleTransportState>, device_key: &str) {
     if no_connections {
         switch_scan_mode(state, ScanMode::LowLatency).await;
     }
+}
+
+/// Remove all peer channels and reset active connections.
+///
+/// Used after a BLE power cycle when all connections are known to be dead.
+async fn purge_all_peer_channels(state: &Arc<BleTransportState>) {
+    let removed: Vec<String> = {
+        let mut channels = state.peer_channels.lock().await;
+        let keys: Vec<String> = channels.keys().cloned().collect();
+        channels.clear();
+        keys
+    };
+    if !removed.is_empty() {
+        let mut active = state.active_connections.write();
+        for key in &removed {
+            active.remove(key);
+        }
+        // parking_lot write guard is !Send; drop before awaiting switch_scan_mode.
+        drop(active);
+        info!(
+            count = removed.len(),
+            "purged all peer channels after power cycle"
+        );
+    }
+    restart_scan(state, ScanMode::LowLatency).await;
+}
+
+/// Force a scan stop + restart. Use after a BLE power cycle where the OS may
+/// have silently stopped scanning — `switch_scan_mode` would short-circuit
+/// because the cached mode state hasn't changed.
+async fn restart_scan(state: &Arc<BleTransportState>, mode: ScanMode) {
+    let want_low_power = mode == ScanMode::LowPower;
+    *state.scan_low_power.lock().await = want_low_power;
+
+    let _ = state.central.stop_scan().await;
+    if let Err(e) = state
+        .central
+        .start_scan(ScanFilter {
+            mode,
+            ..Default::default()
+        })
+        .await
+    {
+        warn!(err = %e, "failed to restart scan after power cycle");
+    } else {
+        info!("scan restarted after power cycle");
+    }
+}
+
+/// Restart BLE advertising with the stored config.
+async fn restart_advertising(state: &Arc<BleTransportState>) {
+    let _ = state.peripheral.stop_advertising().await;
+    if let Err(e) = state
+        .peripheral
+        .start_advertising(&state.advertising_config)
+        .await
+    {
+        warn!(err = %e, "failed to restart advertising after power cycle");
+    } else {
+        info!(key_uuid = %state.key_uuid, "advertising restarted");
+    }
+}
+
+fn spawn_l2cap_cleanup_monitor(
+    state: Arc<BleTransportState>,
+    device_key: String,
+    done: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        done.notified().await;
+        let should_cleanup = {
+            let channels = state.peer_channels.lock().await;
+            channels.get(&device_key).is_some_and(
+                |pc| matches!(&pc.channel, DataChannel::L2cap { tx, .. } if tx.is_closed()),
+            )
+        };
+        if should_cleanup {
+            warn!(device = %device_key, "L2CAP I/O task exited, cleaning up stale channel");
+            unregister_peer(&state, &device_key).await;
+        }
+    });
 }
 
 fn spawn_gatt_send_loop<F, Fut>(
@@ -1189,11 +1364,16 @@ async fn ensure_connected_inner(
     // Try L2CAP first — it's the preferred high-throughput path.
     if let Some(data_channel) = try_l2cap_path(state, device_id).await {
         debug!(%device_key, "established L2CAP data path");
+        let done = match &data_channel {
+            DataChannel::L2cap { done, .. } => Arc::clone(done),
+            _ => unreachable!(),
+        };
         let pc = Arc::new(PeerChannel {
             channel: data_channel,
             send_loop: None,
         });
         register_peer_channel(state, device_key.clone(), pc).await;
+        spawn_l2cap_cleanup_monitor(Arc::clone(state), device_key.clone(), done);
         info!(device = %device_key, "outbound L2CAP connection fully established");
         return Ok(());
     }
@@ -1302,6 +1482,22 @@ async fn handle_central_event(
             // for MAX_RETRIES * ACK_TIMEOUT_MAX (~75s) of zombie retransmits.
             unregister_peer(&state, &device_key).await;
         }
+
+        CentralEvent::AdapterStateChanged { powered } => {
+            // Belt-and-suspenders with the peripheral stream: same adapter,
+            // same event. Helpers are idempotent so duplicate firing is safe.
+            if powered {
+                info!("BLE adapter powered on (central), recovering transport state");
+                purge_all_peer_channels(&state).await;
+                restart_advertising(&state).await;
+                if let Some(abort) = state.current_accept_abort.lock().take() {
+                    abort.abort();
+                }
+            } else {
+                warn!("BLE adapter powered off (central), purging all connections");
+                purge_all_peer_channels(&state).await;
+            }
+        }
     }
 }
 async fn handle_peripheral_event(
@@ -1310,8 +1506,19 @@ async fn handle_peripheral_event(
     incoming_tx: &mpsc::Sender<IncomingPacket>,
 ) {
     match event {
-        PeripheralEvent::ReadRequest { responder, .. } => {
-            responder.respond(vec![]);
+        PeripheralEvent::ReadRequest {
+            char_uuid,
+            responder,
+            ..
+        } => {
+            if char_uuid == IROH_PSM_CHAR_UUID {
+                let psm = *state.current_psm.read();
+                responder.respond(psm.map_or(vec![], |p| p.to_le_bytes().to_vec()));
+            } else if char_uuid == IROH_VERSION_CHAR_UUID {
+                responder.respond(vec![PROTOCOL_VERSION]);
+            } else {
+                responder.respond(vec![]);
+            }
         }
 
         PeripheralEvent::WriteRequest {
@@ -1346,7 +1553,17 @@ async fn handle_peripheral_event(
         }
 
         PeripheralEvent::AdapterStateChanged { powered } => {
-            trace!(powered, "adapter state changed");
+            if powered {
+                info!("BLE adapter powered on, recovering transport state");
+                purge_all_peer_channels(&state).await;
+                restart_advertising(&state).await;
+                if let Some(abort) = state.current_accept_abort.lock().take() {
+                    abort.abort();
+                }
+            } else {
+                warn!("BLE adapter powered off, purging all connections");
+                purge_all_peer_channels(&state).await;
+            }
         }
     }
 }

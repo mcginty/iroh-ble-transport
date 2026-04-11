@@ -10,7 +10,7 @@ keywords = ["bluetooth", "ble", "iroh", "p2p", "transport"]
 categories = ["network-programming"]
 
 [dependencies]
-blew = "0.1.0-alpha.2"
+blew = "0.1.0-alpha.3"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"

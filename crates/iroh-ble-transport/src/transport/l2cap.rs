@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -89,6 +90,14 @@ pub(super) async fn read_identity<R: AsyncReadExt + Unpin>(
     }
 }
 
+struct NotifyOnDrop(Arc<Notify>);
+
+impl Drop for NotifyOnDrop {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
+}
+
 pub(super) fn spawn_l2cap_io_tasks<R, W>(
     reader: R,
     writer: W,
@@ -96,18 +105,27 @@ pub(super) fn spawn_l2cap_io_tasks<R, W>(
     incoming_tx: mpsc::Sender<IncomingPacket>,
     bytes_tx: Arc<AtomicU64>,
     bytes_rx: Arc<AtomicU64>,
-) -> (mpsc::Sender<Vec<u8>>, JoinHandle<()>, JoinHandle<()>)
+) -> (
+    mpsc::Sender<Vec<u8>>,
+    JoinHandle<()>,
+    JoinHandle<()>,
+    Arc<Notify>,
+)
 where
     R: AsyncRead + Send + Unpin + 'static,
     W: AsyncWrite + Send + Unpin + 'static,
 {
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<Vec<u8>>(64);
 
+    let done = Arc::new(Notify::new());
+
     let dk = device_key.clone();
+    let send_guard = NotifyOnDrop(Arc::clone(&done));
     let mut writer = writer;
     let send_task = tokio::spawn(async move {
+        let _guard = send_guard;
         while let Some(datagram) = outbound_rx.recv().await {
-            let len = datagram.len() as u64 + 2; // payload + 2-byte length prefix
+            let len = datagram.len() as u64 + 2;
             if let Err(e) = write_framed_datagram(&mut writer, &datagram).await {
                 warn!(device = %dk, ?e, "l2cap send task exiting on error");
                 break;
@@ -117,12 +135,14 @@ where
         debug!(device = %dk, "l2cap send task exiting");
     });
 
+    let recv_guard = NotifyOnDrop(Arc::clone(&done));
     let mut reader = reader;
     let recv_task = tokio::spawn(async move {
+        let _guard = recv_guard;
         loop {
             match read_framed_datagram(&mut reader).await {
                 Ok(Some(data)) => {
-                    let len = data.len() as u64 + 2; // payload + 2-byte length prefix
+                    let len = data.len() as u64 + 2;
                     bytes_rx.fetch_add(len, Ordering::Relaxed);
                     if incoming_tx
                         .send(IncomingPacket {
@@ -148,7 +168,7 @@ where
         }
     });
 
-    (outbound_tx, send_task, recv_task)
+    (outbound_tx, send_task, recv_task, done)
 }
 
 #[cfg(test)]
@@ -277,7 +297,7 @@ mod tests {
         let (a_rd, a_wr) = split(central_side);
         let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
         let device_key = "test-device".to_string();
-        let (tx, _send_task, _recv_task) = super::spawn_l2cap_io_tasks(
+        let (tx, _send_task, _recv_task, _done) = super::spawn_l2cap_io_tasks(
             a_rd,
             a_wr,
             device_key.clone(),
@@ -318,5 +338,48 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn done_notify_fires_on_task_exit() {
+        let (a, b) = L2capChannel::pair(8192);
+        let (a_rd, a_wr) = split(a);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(16);
+        let (_tx, _send_task, _recv_task, done) = super::spawn_l2cap_io_tasks(
+            a_rd,
+            a_wr,
+            "test-device".to_string(),
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        drop(b);
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), done.notified())
+            .await
+            .expect("done notify should fire when I/O task exits");
+    }
+
+    #[tokio::test]
+    async fn done_notify_fires_on_task_abort() {
+        let (a, _b) = L2capChannel::pair(8192);
+        let (a_rd, a_wr) = split(a);
+        let (incoming_tx, _incoming_rx) = mpsc::channel(16);
+        let (_tx, send_task, recv_task, done) = super::spawn_l2cap_io_tasks(
+            a_rd,
+            a_wr,
+            "test-device".to_string(),
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        send_task.abort();
+        recv_task.abort();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), done.notified())
+            .await
+            .expect("done notify should fire when tasks are aborted");
     }
 }
