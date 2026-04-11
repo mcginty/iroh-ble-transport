@@ -1,6 +1,6 @@
 [package]
 name = "iroh-ble-transport"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 authors = ["Jake McGinty <me@jakebot.org>"]
 license = "AGPL-3.0-or-later"
