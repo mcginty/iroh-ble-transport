@@ -11,7 +11,7 @@ cargo-binstall = "latest"
 "cargo:cargo-release" = "latest"
 node = "25"
 pnpm = "10"
-java = "temurin-26"
+java = "temurin-17"
 ktlint = "latest"
 android-sdk = "latest"
 
@@ -66,6 +66,59 @@ run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri ios dev --open"
 [tasks."chat:dev:android"]
 description = "Run the chat app on Android device"
 run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri android dev --open"
+
+
+[tasks."chat:deploy:android:all"]
+description = "Build debug APK and deploy+launch on all connected Android devices"
+dir = "demos/iroh-ble-chat"
+file = "scripts/deploy-android-all.sh"
+
+[tasks."chat:deploy:ios:all"]
+description = "Build debug iOS app and deploy+launch on all connected iPhones"
+dir = "demos/iroh-ble-chat"
+file = "scripts/deploy-ios-all.sh"
+
+[tasks."chat:deploy:mobile:all"]
+description = "Build and deploy to all connected Android + iOS devices"
+depends = ["chat:deploy:android:all", "chat:deploy:ios:all"]
+
+[tasks."chat:uninstall:android:all"]
+description = "Uninstall iroh-ble-chat from all connected Android devices"
+run = """
+DEVICES=$(adb devices 2>/dev/null | grep -w 'device$' | awk '{print $1}')
+if [ -z "$DEVICES" ]; then
+  echo "No Android devices connected."
+  exit 0
+fi
+COUNT=0
+for dev in $DEVICES; do
+  echo "==> Uninstalling from $dev..."
+  adb -s "$dev" uninstall org.jakebot.iroh_ble_chat || echo "    (not installed)"
+  COUNT=$((COUNT + 1))
+done
+echo "==> Uninstalled from $COUNT Android device(s)."
+"""
+
+[tasks."chat:uninstall:ios:all"]
+description = "Uninstall iroh-ble-chat from all connected iOS devices"
+run = """
+DEVICES=$(xcrun devicectl list devices 2>/dev/null | awk '/available/ && !/unavailable|simulator|Simulator/ {for(i=1;i<=NF;i++) if($i ~ /^[0-9A-Fa-f-]{20,}$/) print $i}')
+if [ -z "$DEVICES" ]; then
+  echo "No iOS devices connected."
+  exit 0
+fi
+COUNT=0
+for udid in $DEVICES; do
+  echo "==> Uninstalling from $udid..."
+  xcrun devicectl device uninstall app --device "$udid" org.jakebot.iroh-ble-chat 2>&1 || echo "    (not installed)"
+  COUNT=$((COUNT + 1))
+done
+echo "==> Uninstalled from $COUNT iOS device(s)."
+"""
+
+[tasks."chat:uninstall:mobile:all"]
+description = "Uninstall iroh-ble-chat from all connected Android + iOS devices"
+depends = ["chat:uninstall:android:all", "chat:uninstall:ios:all"]
 
 [tasks."chat:tui"]
 description = "Run the terminal chat UI"
