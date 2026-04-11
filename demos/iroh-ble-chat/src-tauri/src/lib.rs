@@ -443,7 +443,10 @@ impl<S: tracing::Subscriber> Layer<S> for DebugLogLayer {
         let level = *event.metadata().level();
         let target = event.metadata().target();
 
-        if !(target.starts_with("iroh_ble") || target.starts_with("iroh_gossip")) {
+        if !(target.starts_with("iroh_ble")
+            || target.starts_with("iroh_gossip")
+            || target.starts_with("blew"))
+        {
             return;
         }
         if level > tracing::Level::DEBUG {
@@ -855,7 +858,7 @@ pub fn run() {
             let env_filter =
                 tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new(
-                        "iroh_ble=debug,iroh_gossip=info,iroh_ble_chat=info,warn",
+                        "iroh_ble_transport=debug,iroh_gossip=info,iroh_ble_chat=info,blew=info,warn",
                     )
                 });
             tracing_subscriber::registry()

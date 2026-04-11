@@ -783,6 +783,7 @@ impl CustomSender for BleSender {
                 let state = self.state.clone();
                 let data = transmit.contents.to_vec();
                 let waker = cx.waker().clone();
+                info!(device = %device_key, "poll_send: no peer channel, triggering reconnect");
                 tokio::spawn(async move {
                     if let Err(e) = ensure_connected_and_send(&state, &device_key, data).await {
                         warn!(device = %device_key, err = %e, "send failed (no channel)");
@@ -818,6 +819,7 @@ impl CustomSender for BleSender {
                 if tx.is_closed() {
                     let state = self.state.clone();
                     let stale = Arc::clone(&peer_channel);
+                    info!(device = %device_key, "poll_send: stale L2CAP channel, triggering reconnect");
                     tokio::spawn(async move {
                         let removed = {
                             let mut channels = state.peer_channels.lock().await;
@@ -869,6 +871,7 @@ async fn ensure_connected_and_send(
     data: Vec<u8>,
 ) -> io::Result<()> {
     let device_id: DeviceId = DeviceId::from(device_key);
+    info!(device = %device_key, bytes = data.len(), "ensure_connected_and_send: start");
 
     let mut last_err = None;
     for attempt in 0..CONNECT_RETRY_COUNT {
@@ -890,6 +893,11 @@ async fn ensure_connected_and_send(
                         "peer channel missing after ensure_connected",
                     ));
                 };
+                let path = match &pc.channel {
+                    DataChannel::Gatt(_) => "gatt",
+                    DataChannel::L2cap { .. } => "l2cap",
+                };
+                info!(device = %device_key, path, attempt, "ensure_connected_and_send: connected, sending first datagram");
                 match &pc.channel {
                     DataChannel::Gatt(rel) => {
                         rel.enqueue_datagram(data).await;
@@ -986,7 +994,7 @@ where
             }
         });
     }
-    debug!("l2cap accept loop exited (stream closed)");
+    info!("l2cap accept loop exited (stream closed)");
 }
 
 /// Start (or restart) the L2CAP listener. Returns a `JoinHandle` for the
@@ -1491,6 +1499,7 @@ async fn handle_central_event(
                 purge_all_peer_channels(&state).await;
                 restart_advertising(&state).await;
                 if let Some(abort) = state.current_accept_abort.lock().take() {
+                    info!("aborting L2CAP accept task to force listener restart");
                     abort.abort();
                 }
             } else {
@@ -1558,6 +1567,7 @@ async fn handle_peripheral_event(
                 purge_all_peer_channels(&state).await;
                 restart_advertising(&state).await;
                 if let Some(abort) = state.current_accept_abort.lock().take() {
+                    info!("aborting L2CAP accept task to force listener restart");
                     abort.abort();
                 }
             } else {
