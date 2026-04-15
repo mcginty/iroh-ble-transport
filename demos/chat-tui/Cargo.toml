@@ -1,6 +1,6 @@
 [package]
 name = "iroh-ble-chat-tui"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 edition = "2024"
 publish = false
 
