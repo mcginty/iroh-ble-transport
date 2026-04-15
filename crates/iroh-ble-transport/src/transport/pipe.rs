@@ -88,7 +88,7 @@ pub async fn run_data_pipe(
             maybe_datagram = datagram_rx.recv() => {
                 match maybe_datagram {
                     Some(data) => {
-                        tracing::debug!(
+                        tracing::trace!(
                             device = %device_id,
                             len = data.len(),
                             "pipe reassembled datagram -> incoming_tx"

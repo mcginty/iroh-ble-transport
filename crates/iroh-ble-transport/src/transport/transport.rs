@@ -368,7 +368,7 @@ impl CustomEndpoint for BleEndpoint {
                         continue;
                     }
                     let token = self.routing.mint_token_for_source(&packet.device_id);
-                    tracing::debug!(
+                    tracing::trace!(
                         device = %packet.device_id,
                         token,
                         len = packet.data.len(),

@@ -95,7 +95,7 @@ pub async fn run_central_events(
                 char_uuid: _,
                 value,
             } => {
-                tracing::debug!(
+                tracing::trace!(
                     device = %device_id,
                     len = value.len(),
                     "central CharacteristicNotification received (P2C)"
@@ -142,7 +142,7 @@ pub async fn run_peripheral_events(
                 if let Some(r) = responder {
                     r.success();
                 }
-                tracing::debug!(
+                tracing::trace!(
                     device = %client_id,
                     len = value.len(),
                     "peripheral WriteRequest received (C2P)"

@@ -282,7 +282,7 @@ impl BleInterface for BlewDriver {
             )
             .await;
         match &result {
-            Ok(()) => tracing::debug!(device = %device_id, len, "write_c2p ok"),
+            Ok(()) => tracing::trace!(device = %device_id, len, "write_c2p ok"),
             Err(e) => tracing::warn!(device = %device_id, len, err = %e, "write_c2p err"),
         }
         result?;
@@ -301,7 +301,7 @@ impl BleInterface for BlewDriver {
             .notify_characteristic(P2C_CHAR_UUID, bytes.to_vec())
             .await;
         match &result {
-            Ok(()) => tracing::debug!(len, "notify_p2c ok"),
+            Ok(()) => tracing::trace!(len, "notify_p2c ok"),
             Err(e) => tracing::warn!(len, err = %e, "notify_p2c err"),
         }
         result?;

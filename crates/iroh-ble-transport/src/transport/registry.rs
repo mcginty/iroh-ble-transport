@@ -140,7 +140,7 @@ impl Registry {
                     SendDecision::Buffer => "buffer",
                     SendDecision::StartAndEnqueue => "start_and_enqueue",
                 };
-                tracing::debug!(
+                tracing::trace!(
                     device = %device_id,
                     incoming_tx_gen = tx_gen,
                     entry_tx_gen,
