@@ -32,10 +32,11 @@ pub const MIN_SANE_MTU: u16 = 24;
 pub const DEFAULT_FALLBACK_MTU: u16 = 512;
 
 /// Max time to wait after `StartDataPipe` for the platform's MTU reading to
-/// become sane. 1 s is generous relative to real BLE MTU exchange (~200 ms)
-/// but short enough that a broken peer limps along on the fallback instead
-/// of wedging the pipe.
-pub const MTU_READY_DEADLINE: Duration = Duration::from_secs(1);
+/// become sane. 3 s comfortably clears the peripheral-side race where the
+/// central's `requestMtu` → `onMtuChanged` dance lands after our first poll,
+/// while still being short enough that a broken peer limps along on the
+/// fallback instead of wedging the pipe.
+pub const MTU_READY_DEADLINE: Duration = Duration::from_secs(3);
 
 /// Interval between polls while waiting for the MTU to become sane.
 pub const MTU_POLL_INTERVAL: Duration = Duration::from_millis(50);
