@@ -127,10 +127,6 @@ echo "==> Uninstalled from $COUNT iOS device(s)."
 description = "Uninstall iroh-ble-chat from all connected Android + iOS devices"
 depends = ["chat:uninstall:android:all", "chat:uninstall:ios:all"]
 
-[tasks."chat:tui"]
-description = "Run the terminal chat UI"
-run = "cargo run -p iroh-ble-chat-tui"
-
 [tasks."chat:logs:android"]
 description = "Tail logcat from all connected Android devices, filtered to iroh/blew/chat"
 run = """

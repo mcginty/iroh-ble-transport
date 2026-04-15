@@ -2,7 +2,6 @@
 members = [
     "crates/iroh-ble-transport",
     "demos/protocol",
-    "demos/chat-tui",
     "demos/iroh-ble-chat/src-tauri",
 ]
 resolver = "2"

@@ -26,7 +26,6 @@ mise run ci:check-android # cargo ndk check for arm64-v8a
 mise run chat:dev                # desktop dev server
 mise run chat:dev:ios            # iOS device dev server
 mise run chat:dev:android        # Android device dev server
-mise run chat:tui                # terminal chat client
 mise run chat:deploy:android:all # build APK + install/launch on every connected adb device
 mise run chat:deploy:ios:all     # build + install/launch on every connected iPhone
 mise run chat:deploy:mobile:all  # both at once
@@ -295,10 +294,6 @@ A Tauri 2 cross-platform chat app (`demos/iroh-ble-chat`). Desktop + iOS + Andro
 **Android integration:** Uses `tauri-plugin-blew` (from blew repo) for BLE setup. Registered conditionally via `#[cfg(target_os = "android")]`.
 
 **Frontend:** Vanilla TypeScript + Vite (`demos/iroh-ble-chat/src/main.ts`).
-
-## demos/chat-tui
-
-Terminal UI chat demo (`demos/chat-tui`). Uses `iroh-ble-chat-protocol` over `BleTransport`. Run with `mise run chat:tui`.
 
 ## Example crate
 
