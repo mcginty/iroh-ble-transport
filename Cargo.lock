@@ -104,6 +104,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
+name = "arc-swap"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "arg_enum_proc_macro"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -480,9 +489,9 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd0b9f19ca900dece920335ad3a57bdcc276d8244fe5ba8f92b3ee88c4c09d79"
+checksum = "a7f6592edb1874aedc5b935a359e27227d9880f558c7ead25c515a31101bbfd1"
 dependencies = [
  "bitflags 2.11.0",
  "bluer",
@@ -3159,7 +3168,9 @@ name = "iroh-ble-transport"
 version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-stream",
+ "async-trait",
  "atomic-waker",
  "blew",
  "bytes",
@@ -3170,6 +3181,7 @@ dependencies = [
  "noq-udp",
  "parking_lot",
  "rand 0.9.3",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -6851,8 +6863,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.1.0-alpha.2"
-source = "git+https://github.com/mcginty/blew.git#6ceba0946209fc31089c00b75e808f89bb4e8709"
+version = "0.1.0-alpha.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9cef7041bcf18437c9a6bcc6bd1ace548cb625f9e7377d2a40c3fb4b590e92a"
 dependencies = [
  "blew",
  "jni 0.22.4",

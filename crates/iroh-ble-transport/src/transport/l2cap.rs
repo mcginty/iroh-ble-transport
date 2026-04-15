@@ -1,13 +1,20 @@
 //! L2CAP data-path primitives for `BleTransport`.
 //!
-//! This module contains pure helpers (framing, identity exchange, I/O task
-//! spawning) that operate on `AsyncRead + AsyncWrite` streams. It does not
-//! depend on `BleTransportState`, so all helpers are unit-testable with
-//! `L2capChannel::pair()`.
+//! This module contains pure helpers (framing, I/O task spawning) that
+//! operate on `AsyncRead + AsyncWrite` streams. The new actor-based driver
+//! does not yet wire the L2CAP data path end-to-end; the helpers live here
+//! so the wiring can be picked up later without rewriting the framing
+//! primitives.
 //!
-//! Wire format:
-//! - First 32 bytes in each direction: sender's `EndpointId` (no header).
-//! - Each subsequent datagram: `[u16 LE length] [payload bytes]`.
+//! Wire format: each datagram is `[u16 LE length] [payload bytes]`. There is
+//! no pre-handshake identity exchange — the I/O task is told the peer's
+//! `blew::DeviceId` up front by the caller.
+//!
+//! Note: `blew::Peripheral::l2cap_listener` does not expose a remote device
+//! id on accept, so the accept-side path needs a separate strategy for
+//! tagging incoming frames before it can be wired into the driver.
+
+#![allow(dead_code)]
 
 use std::io;
 use std::sync::Arc;
@@ -66,30 +73,6 @@ pub(super) async fn read_framed_datagram<R: AsyncReadExt + Unpin>(
     Ok(Some(buf))
 }
 
-pub(super) async fn write_identity<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    id: &[u8; 32],
-) -> io::Result<()> {
-    writer.write_all(id).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-pub(super) async fn read_identity<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
-    timeout: std::time::Duration,
-) -> io::Result<[u8; 32]> {
-    let mut buf = [0u8; 32];
-    match tokio::time::timeout(timeout, reader.read_exact(&mut buf)).await {
-        Ok(Ok(_)) => Ok(buf),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "timed out waiting for identity",
-        )),
-    }
-}
-
 struct NotifyOnDrop(Arc<Notify>);
 
 impl Drop for NotifyOnDrop {
@@ -101,7 +84,7 @@ impl Drop for NotifyOnDrop {
 pub(super) fn spawn_l2cap_io_tasks<R, W>(
     reader: R,
     writer: W,
-    device_key: String,
+    device_id: blew::DeviceId,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     bytes_tx: Arc<AtomicU64>,
     bytes_rx: Arc<AtomicU64>,
@@ -119,7 +102,7 @@ where
 
     let done = Arc::new(Notify::new());
 
-    let dk = device_key.clone();
+    let dev = device_id.clone();
     let send_guard = NotifyOnDrop(Arc::clone(&done));
     let mut writer = writer;
     let send_task = tokio::spawn(async move {
@@ -127,12 +110,12 @@ where
         while let Some(datagram) = outbound_rx.recv().await {
             let len = datagram.len() as u64 + 2;
             if let Err(e) = write_framed_datagram(&mut writer, &datagram).await {
-                warn!(device = %dk, ?e, "l2cap send task exiting on error");
+                warn!(device = %dev, ?e, "l2cap send task exiting on error");
                 break;
             }
             bytes_tx.fetch_add(len, Ordering::Relaxed);
         }
-        debug!(device = %dk, "l2cap send task exiting");
+        debug!(device = %dev, "l2cap send task exiting");
     });
 
     let recv_guard = NotifyOnDrop(Arc::clone(&done));
@@ -146,22 +129,22 @@ where
                     bytes_rx.fetch_add(len, Ordering::Relaxed);
                     if incoming_tx
                         .send(IncomingPacket {
-                            device_key: device_key.clone(),
-                            data,
+                            device_id: device_id.clone(),
+                            data: data.into(),
                         })
                         .await
                         .is_err()
                     {
-                        debug!(device = %device_key, "incoming_tx closed, exiting recv task");
+                        debug!(device = %device_id, "incoming_tx closed, exiting recv task");
                         break;
                     }
                 }
                 Ok(None) => {
-                    debug!(device = %device_key, "l2cap recv task EOF");
+                    debug!(device = %device_id, "l2cap recv task EOF");
                     break;
                 }
                 Err(e) => {
-                    warn!(device = %device_key, ?e, "l2cap recv task exiting on error");
+                    warn!(device = %device_id, ?e, "l2cap recv task exiting on error");
                     break;
                 }
             }
@@ -253,42 +236,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exchange_identities_symmetric() {
-        let (a, b) = L2capChannel::pair(8192);
-        let (mut a_rd, mut a_wr) = split(a);
-        let (mut b_rd, mut b_wr) = split(b);
-
-        let id_a = [1_u8; 32];
-        let id_b = [2_u8; 32];
-
-        let fut_a = async {
-            write_identity(&mut a_wr, &id_a).await.unwrap();
-            read_identity(&mut a_rd, std::time::Duration::from_secs(1))
-                .await
-                .unwrap()
-        };
-        let fut_b = async {
-            write_identity(&mut b_wr, &id_b).await.unwrap();
-            read_identity(&mut b_rd, std::time::Duration::from_secs(1))
-                .await
-                .unwrap()
-        };
-        let (got_a, got_b) = tokio::join!(fut_a, fut_b);
-        assert_eq!(got_a, id_b);
-        assert_eq!(got_b, id_a);
-    }
-
-    #[tokio::test]
-    async fn read_identity_times_out_if_peer_never_writes() {
-        let (_a, b) = L2capChannel::pair(8192);
-        let (mut b_rd, _b_wr) = split(b);
-        let err = read_identity(&mut b_rd, std::time::Duration::from_millis(50))
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
-    }
-
-    #[tokio::test]
     async fn spawn_l2cap_io_tasks_round_trips_datagrams() {
         use tokio::sync::mpsc;
 
@@ -296,11 +243,11 @@ mod tests {
 
         let (a_rd, a_wr) = split(central_side);
         let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
-        let device_key = "test-device".to_string();
+        let device_id = blew::DeviceId::from("l2cap-test");
         let (tx, _send_task, _recv_task, _done) = super::spawn_l2cap_io_tasks(
             a_rd,
             a_wr,
-            device_key.clone(),
+            device_id.clone(),
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
@@ -322,22 +269,43 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(pkt.data, b"pong");
-        assert_eq!(pkt.device_key, device_key);
+        assert_eq!(pkt.data.as_ref(), b"pong");
+        assert_eq!(pkt.device_id, device_id);
     }
 
     #[tokio::test]
-    async fn read_identity_errors_on_short_stream() {
-        let (a, b) = L2capChannel::pair(8192);
-        let (_a_rd, mut a_wr) = split(a);
-        a_wr.write_all(&[1_u8; 10]).await.unwrap();
-        a_wr.shutdown().await.unwrap();
-        drop(a_wr);
-        let (mut b_rd, _b_wr) = split(b);
-        let err = read_identity(&mut b_rd, std::time::Duration::from_secs(1))
-            .await
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    async fn spawn_l2cap_io_tasks_stamps_incoming_with_device_id() {
+        use tokio::sync::mpsc;
+
+        let (central_side, peripheral_side) = L2capChannel::pair(8192);
+        let (a_rd, a_wr) = split(central_side);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        let device_id = blew::DeviceId::from("device-id-stamp");
+        let (_tx, _send_task, _recv_task, _done) = super::spawn_l2cap_io_tasks(
+            a_rd,
+            a_wr,
+            device_id.clone(),
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let (_b_rd, mut b_wr) = split(peripheral_side);
+        for i in 0_u8..3 {
+            let payload = vec![i; 8];
+            super::write_framed_datagram(&mut b_wr, &payload)
+                .await
+                .unwrap();
+        }
+
+        for i in 0_u8..3 {
+            let pkt = tokio::time::timeout(std::time::Duration::from_secs(1), incoming_rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pkt.device_id, device_id);
+            assert_eq!(pkt.data.as_ref(), vec![i; 8].as_slice());
+        }
     }
 
     #[tokio::test]
@@ -348,7 +316,7 @@ mod tests {
         let (_tx, _send_task, _recv_task, done) = super::spawn_l2cap_io_tasks(
             a_rd,
             a_wr,
-            "test-device".to_string(),
+            blew::DeviceId::from("exit-test"),
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
@@ -369,7 +337,7 @@ mod tests {
         let (_tx, send_task, recv_task, done) = super::spawn_l2cap_io_tasks(
             a_rd,
             a_wr,
-            "test-device".to_string(),
+            blew::DeviceId::from("abort-test"),
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),

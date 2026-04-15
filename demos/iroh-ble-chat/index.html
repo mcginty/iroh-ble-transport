@@ -31,6 +31,8 @@
                 <div id="bandwidth-indicator" class="bandwidth-indicator">
                     <div class="bw-row"><span class="bw-arrow bw-up">&#x2191;</span><span id="bw-tx">0</span> <span class="bw-unit">kbps</span></div>
                     <div class="bw-row"><span class="bw-arrow bw-down">&#x2193;</span><span id="bw-rx">0</span> <span class="bw-unit">kbps</span></div>
+                    <div class="bw-row"><span class="bw-arrow">&#x21bb;</span><span id="bw-rtx">0</span> <span class="bw-unit">rtx</span></div>
+                    <div class="bw-row"><span class="bw-arrow">&#x2702;</span><span id="bw-trunc">0</span> <span class="bw-unit">trunc</span></div>
                 </div>
                 <div class="header-actions">
                     <label class="debug-toggle" title="Show BLE/gossip debug events">
@@ -126,6 +128,12 @@
                     </div>
                     <div id="members-list" class="members-list">
                         <!-- Populated by JS -->
+                    </div>
+                    <div id="ble-peers-section" class="ble-peers-section" style="display:none">
+                        <div class="ble-peers-header">BLE peers</div>
+                        <div id="ble-peers-list" class="ble-peers-list">
+                            <!-- Populated by JS -->
+                        </div>
                     </div>
                 </aside>
             </div>

@@ -38,10 +38,12 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
+use iroh::endpoint::presets;
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId, RelayMode};
+use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{ChatMsg, load_known_peers, save_known_peers};
 use iroh_ble_transport::transport::BleTransport;
+use iroh_ble_transport::{Central, CentralConfig, Peripheral};
 use iroh_gossip::Gossip;
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use ratatui::{
@@ -831,11 +833,21 @@ async fn main() -> anyhow::Result<()> {
     let initial_nick = load_nickname(&cache_dir).unwrap_or_else(|| default_nickname(&own_id));
 
     eprintln!("Initialising BLE transport...");
-    let transport = BleTransport::new(&secret).await?;
+    let central = Arc::new(
+        Central::with_config(CentralConfig {
+            restore_identifier: Some("org.jakebot.chat-tui.central".into()),
+        })
+        .await?,
+    );
+    let peripheral = Arc::new(Peripheral::new().await?);
+    let transport = BleTransport::new(own_id, central, peripheral).await?;
+    let lookup = transport.address_lookup();
+    let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = Arc::new(transport);
 
-    let ep = Endpoint::builder(transport.preset())
+    let ep = Endpoint::builder(presets::N0DisableRelay)
+        .add_custom_transport(Arc::clone(&transport))
+        .address_lookup(lookup)
         .secret_key(secret)
-        .relay_mode(RelayMode::Disabled)
         .clear_ip_transports()
         .bind()
         .await?;

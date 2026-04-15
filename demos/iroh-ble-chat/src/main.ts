@@ -8,11 +8,32 @@ import { scan, Format, checkPermissions, requestPermissions } from "@tauri-apps/
 // Types
 // ---------------------------------------------------------------------------
 
+type PeerStatus =
+  | "self"
+  | "connected"
+  | "handshaking"
+  | "connecting"
+  | "reconnecting"
+  | "in_topic"
+  | "nearby"
+  | "draining"
+  | "stale"
+  | "dead"
+  | "unknown";
+
 interface PeerStateUI {
   id: string;
   nickname: string | null;
-  status: "self" | "direct" | "in_topic" | "stale";
+  status: PeerStatus;
+  ble_phase: string | null;
+  ble_failures: number;
   last_seen_secs_ago: number;
+}
+
+interface BlePeerDebugUI {
+  device_id: string;
+  phase: string;
+  consecutive_failures: number;
 }
 
 interface ChatMsgPayload {
@@ -52,6 +73,7 @@ interface ImageProgressPayload {
 let myId = "";
 let myNickname = "";
 const peers = new Map<string, PeerStateUI>();
+const blePeers = new Map<string, BlePeerDebugUI>();
 
 // Sender colour palette (8 colours, indexed by hash of EndpointId)
 const SENDER_COLOURS = 8;
@@ -82,6 +104,8 @@ const copyIdBtn = document.getElementById("copy-id-btn") as HTMLButtonElement;
 const membersToggleBtn = document.getElementById("members-toggle-btn") as HTMLButtonElement;
 const membersSidebar = document.getElementById("members-sidebar")!;
 const membersList = document.getElementById("members-list")!;
+const blePeersSection = document.getElementById("ble-peers-section")!;
+const blePeersList = document.getElementById("ble-peers-list")!;
 const membersCount = document.getElementById("members-count")!;
 const membersBadge = document.getElementById("members-badge")!;
 const sidebarCloseBtn = document.getElementById("sidebar-close-btn") as HTMLButtonElement;
@@ -113,24 +137,39 @@ function setStatus(text: string, cls: string) {
 }
 
 function updateStatusFromPeers() {
-  let direct = 0;
+  let connected = 0;
+  let pending = 0;
   let inTopic = 0;
   for (const p of peers.values()) {
-    if (p.status === "direct") direct++;
-    else if (p.status === "in_topic") inTopic++;
+    switch (p.status) {
+      case "connected":
+        connected++;
+        break;
+      case "handshaking":
+      case "connecting":
+      case "reconnecting":
+      case "nearby":
+        pending++;
+        break;
+      case "in_topic":
+        inTopic++;
+        break;
+      default:
+        break;
+    }
   }
-  if (direct === 0 && inTopic === 0) {
-    setStatus("Waiting for peers", "ready");
+  if (connected === 0 && pending === 0 && inTopic === 0) {
+    setStatus("Scanning…", "ready");
   } else {
     const parts: string[] = [];
-    if (direct > 0) parts.push(`${direct} direct`);
+    if (connected > 0) parts.push(`${connected} connected`);
+    if (pending > 0) parts.push(`${pending} pending`);
     if (inTopic > 0) parts.push(`${inTopic} in topic`);
-    setStatus(parts.join(" · "), "connected");
+    setStatus(parts.join(" · "), connected > 0 ? "connected" : "ready");
   }
 
-  // Update badge
-  if (direct > 0) {
-    membersBadge.textContent = String(direct);
+  if (connected > 0) {
+    membersBadge.textContent = String(connected);
     membersBadge.style.display = "";
   } else {
     membersBadge.style.display = "none";
@@ -141,18 +180,37 @@ function updateStatusFromPeers() {
 // Members list rendering
 // ---------------------------------------------------------------------------
 
+const STATUS_RANK: Record<PeerStatus, number> = {
+  self: 0,
+  connected: 1,
+  handshaking: 2,
+  connecting: 3,
+  reconnecting: 4,
+  in_topic: 5,
+  nearby: 6,
+  draining: 7,
+  stale: 8,
+  dead: 9,
+  unknown: 10,
+};
+
+const STATUS_LABEL: Record<PeerStatus, string> = {
+  self: "you",
+  connected: "Connected",
+  handshaking: "Handshaking…",
+  connecting: "Connecting…",
+  reconnecting: "Reconnecting…",
+  in_topic: "In topic",
+  nearby: "Nearby",
+  draining: "Draining",
+  stale: "Stale",
+  dead: "Unreachable",
+  unknown: "—",
+};
+
 function renderMembers() {
   const sorted = Array.from(peers.values()).sort((a, b) => {
-    const rank = (s: string) => {
-      switch (s) {
-        case "self": return 0;
-        case "direct": return 1;
-        case "in_topic": return 2;
-        case "stale": return 3;
-        default: return 4;
-      }
-    };
-    const r = rank(a.status) - rank(b.status);
+    const r = (STATUS_RANK[a.status] ?? 99) - (STATUS_RANK[b.status] ?? 99);
     if (r !== 0) return r;
     return (a.nickname ?? a.id).localeCompare(b.nickname ?? b.id);
   });
@@ -168,11 +226,16 @@ function renderMembers() {
     row.className = "member-row";
     row.dataset.peerId = peer.id;
 
+    const dimmed = peer.status === "stale" || peer.status === "dead";
+    const statusLabel = STATUS_LABEL[peer.status] ?? peer.status;
+    const failureBadge = peer.ble_failures > 0
+      ? ` · ${peer.ble_failures} fail${peer.ble_failures === 1 ? "" : "s"}`
+      : "";
     row.innerHTML = `
       <div class="member-dot ${peer.status}"></div>
       <div class="member-info">
-        <div class="member-name ${peer.status === "stale" ? "stale" : ""}">${escapeHtml(name)}</div>
-        <div class="member-id">${escapeHtml(shortId)}</div>
+        <div class="member-name ${dimmed ? "stale" : ""}">${escapeHtml(name)}</div>
+        <div class="member-id">${escapeHtml(statusLabel)}${escapeHtml(failureBadge)} · ${escapeHtml(shortId)}</div>
       </div>
     `;
 
@@ -186,20 +249,38 @@ function renderMembers() {
 
       const detail = document.createElement("div");
       detail.className = "member-detail expanded";
+      const phaseLine = debugCheckbox.checked && peer.ble_phase
+        ? `<div class="member-detail-phase">BLE: ${escapeHtml(peer.ble_phase)}${peer.ble_failures > 0 ? ` · ${peer.ble_failures} failure${peer.ble_failures === 1 ? "" : "s"}` : ""}</div>`
+        : "";
       detail.innerHTML = `
         <div class="member-detail-id">${escapeHtml(peer.id)}</div>
-        <button class="member-detail-copy">Copy ID</button>
+        ${phaseLine}
+        <div class="member-detail-actions">
+          <button class="member-detail-copy">Copy ID</button>
+          <button class="member-detail-remove">Remove</button>
+        </div>
       `;
-      detail.querySelector("button")!.addEventListener("click", async (e) => {
+      const copyBtn = detail.querySelector(".member-detail-copy") as HTMLButtonElement;
+      copyBtn.addEventListener("click", async (e) => {
         e.stopPropagation();
         try {
           await navigator.clipboard.writeText(peer.id);
-          (e.target as HTMLButtonElement).textContent = "Copied!";
+          copyBtn.textContent = "Copied!";
           setTimeout(() => {
-            (e.target as HTMLButtonElement).textContent = "Copy ID";
+            copyBtn.textContent = "Copy ID";
           }, 1500);
         } catch {
           // ignore
+        }
+      });
+      const removeBtn = detail.querySelector(".member-detail-remove") as HTMLButtonElement;
+      removeBtn.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        if (!confirm(`Remove ${peer.nickname ?? shortId}?`)) return;
+        try {
+          await invoke("remove_peer", { idStr: peer.id });
+        } catch (err) {
+          console.error("remove_peer failed", err);
         }
       });
       row.after(detail);
@@ -209,6 +290,33 @@ function renderMembers() {
   }
 
   membersCount.textContent = String(sorted.length);
+}
+
+function renderBlePeers() {
+  if (!debugCheckbox.checked || blePeers.size === 0) {
+    blePeersSection.style.display = "none";
+    blePeersList.innerHTML = "";
+    return;
+  }
+  blePeersSection.style.display = "";
+
+  const sorted = Array.from(blePeers.values()).sort((a, b) =>
+    a.device_id.localeCompare(b.device_id),
+  );
+
+  blePeersList.innerHTML = "";
+  for (const peer of sorted) {
+    const row = document.createElement("div");
+    row.className = "ble-peer-row";
+    const failureBadge = peer.consecutive_failures > 0
+      ? ` · ${peer.consecutive_failures} fail${peer.consecutive_failures === 1 ? "" : "s"}`
+      : "";
+    row.innerHTML = `
+      <div class="ble-peer-id" title="${escapeHtml(peer.device_id)}">${escapeHtml(peer.device_id)}</div>
+      <div class="ble-peer-phase">${escapeHtml(peer.phase)}${escapeHtml(failureBadge)}</div>
+    `;
+    blePeersList.appendChild(row);
+  }
 }
 
 function escapeHtml(s: string): string {
@@ -366,6 +474,8 @@ async function initNode() {
       id: myId,
       nickname: myNickname,
       status: "self",
+      ble_phase: null,
+      ble_failures: 0,
       last_seen_secs_ago: 0,
     });
     renderMembers();
@@ -730,6 +840,19 @@ debugCheckbox.addEventListener("change", async () => {
     console.error("Failed to set debug", e);
     debugCheckbox.checked = false;
   }
+  renderBlePeers();
+});
+
+listen("ble-peer-updated", (event: any) => {
+  const payload = event.payload as BlePeerDebugUI;
+  blePeers.set(payload.device_id, payload);
+  renderBlePeers();
+});
+
+listen("ble-peer-removed", (event: any) => {
+  const payload = event.payload as { device_id: string };
+  blePeers.delete(payload.device_id);
+  renderBlePeers();
 });
 
 listen("debug-log", (event: any) => {
@@ -785,9 +908,23 @@ listen("image-send-error", (event: any) => {
 
 const bwTx = document.getElementById("bw-tx")!;
 const bwRx = document.getElementById("bw-rx")!;
+const bwRtx = document.getElementById("bw-rtx")!;
+const bwTrunc = document.getElementById("bw-trunc")!;
+
+let rtxTotal = 0;
+let truncTotal = 0;
 
 listen("bandwidth", (event: any) => {
-  const { tx_kbps, rx_kbps } = event.payload as { tx_kbps: number; rx_kbps: number };
+  const { tx_kbps, rx_kbps, retransmits, truncations } = event.payload as {
+    tx_kbps: number;
+    rx_kbps: number;
+    retransmits: number;
+    truncations: number;
+  };
   bwTx.textContent = tx_kbps < 10 ? tx_kbps.toFixed(1) : Math.round(tx_kbps).toString();
   bwRx.textContent = rx_kbps < 10 ? rx_kbps.toFixed(1) : Math.round(rx_kbps).toString();
+  rtxTotal += retransmits ?? 0;
+  truncTotal += truncations ?? 0;
+  bwRtx.textContent = rtxTotal.toString();
+  bwTrunc.textContent = truncTotal.toString();
 });

@@ -1,0 +1,203 @@
+//! Translates `blew` events into `PeerCommand`s on the registry inbox.
+
+use std::sync::Arc;
+
+use blew::central::CentralEvent;
+use blew::peripheral::PeripheralEvent;
+use blew::{Central, Peripheral};
+use bytes::Bytes;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::transport::peer::{KEY_PREFIX_LEN, KeyPrefix, PeerCommand};
+use crate::transport::routing::{DiscoveryUpdate, TransportRouting};
+
+/// Extract the 12-byte key prefix from a list of advertised service UUIDs.
+///
+/// Returns `Some(prefix)` if any UUID starts with the iroh magic prefix
+/// `69 72 6f 00`, indicating an iroh-ble peer. The remaining 12 bytes of
+/// that UUID carry the first 12 bytes of the peer's Ed25519 public key.
+pub fn extract_prefix_from_services(services: &[Uuid]) -> Option<KeyPrefix> {
+    for svc in services {
+        let bytes = svc.as_bytes();
+        if bytes[0..4] == [0x69, 0x72, 0x6f, 0x00] {
+            let mut out = [0u8; KEY_PREFIX_LEN];
+            out.copy_from_slice(&bytes[4..16]);
+            return Some(out);
+        }
+    }
+    None
+}
+
+/// Drive the central event stream, translating each event into a `PeerCommand`
+/// and forwarding it to `inbox`. Returns when the stream ends or `inbox` is
+/// closed.
+pub async fn run_central_events(
+    central: Arc<Central>,
+    routing: Arc<TransportRouting>,
+    inbox: mpsc::Sender<PeerCommand>,
+) {
+    use tokio_stream::StreamExt as _;
+    let mut events = central.events();
+    while let Some(ev) = events.next().await {
+        let cmd = match ev {
+            CentralEvent::DeviceDiscovered(device) => {
+                let Some(prefix) = extract_prefix_from_services(&device.services) else {
+                    continue;
+                };
+                let rssi = device.rssi;
+                match routing.note_discovery(prefix, device.id.clone()) {
+                    DiscoveryUpdate::Unchanged => {}
+                    DiscoveryUpdate::New => {
+                        tracing::debug!(
+                            device = %device.id,
+                            ?prefix,
+                            rssi,
+                            "central DeviceDiscovered (iroh peer)"
+                        );
+                    }
+                    DiscoveryUpdate::Replaced { previous } => {
+                        tracing::debug!(
+                            device = %device.id,
+                            previous = %previous,
+                            ?prefix,
+                            rssi,
+                            "central DeviceDiscovered: prefix flipped to new DeviceId, evicting previous"
+                        );
+                        routing.forget_device(&previous);
+                        if inbox
+                            .send(PeerCommand::Forget {
+                                device_id: previous,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+                PeerCommand::Advertised {
+                    prefix,
+                    device,
+                    rssi,
+                }
+            }
+            CentralEvent::DeviceConnected { device_id } => {
+                tracing::debug!(device = %device_id, "central DeviceConnected");
+                PeerCommand::CentralConnected { device_id }
+            }
+            CentralEvent::DeviceDisconnected { device_id, cause } => {
+                tracing::debug!(device = %device_id, ?cause, "central DeviceDisconnected");
+                PeerCommand::CentralDisconnected { device_id, cause }
+            }
+            CentralEvent::CharacteristicNotification {
+                device_id,
+                char_uuid: _,
+                value,
+            } => {
+                tracing::debug!(
+                    device = %device_id,
+                    len = value.len(),
+                    "central CharacteristicNotification received (P2C)"
+                );
+                PeerCommand::InboundGattFragment {
+                    device_id,
+                    source: crate::transport::peer::FragmentSource::CentralReceivedP2c,
+                    bytes: value,
+                }
+            }
+            CentralEvent::AdapterStateChanged { powered } => {
+                PeerCommand::AdapterStateChanged { powered }
+            }
+            CentralEvent::Restored { devices } => PeerCommand::RestoreFromAdapter { devices },
+        };
+        if inbox.send(cmd).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Drive the peripheral event stream, translating each event into a
+/// `PeerCommand` and forwarding it to `inbox`. Returns when the stream ends or
+/// `inbox` is closed.
+pub async fn run_peripheral_events(
+    peripheral: Arc<Peripheral>,
+    _routing: Arc<TransportRouting>,
+    inbox: mpsc::Sender<PeerCommand>,
+) {
+    use tokio_stream::StreamExt as _;
+    let mut events = peripheral.events();
+    while let Some(ev) = events.next().await {
+        let cmd = match ev {
+            PeripheralEvent::AdapterStateChanged { powered } => {
+                PeerCommand::AdapterStateChanged { powered }
+            }
+            PeripheralEvent::WriteRequest {
+                client_id,
+                char_uuid: _,
+                value,
+                responder,
+                ..
+            } => {
+                if let Some(r) = responder {
+                    r.success();
+                }
+                tracing::debug!(
+                    device = %client_id,
+                    len = value.len(),
+                    "peripheral WriteRequest received (C2P)"
+                );
+                PeerCommand::InboundGattFragment {
+                    device_id: client_id,
+                    source: crate::transport::peer::FragmentSource::PeripheralReceivedC2p,
+                    bytes: Bytes::from(value),
+                }
+            }
+            PeripheralEvent::SubscriptionChanged {
+                client_id,
+                char_uuid,
+                subscribed,
+            } => {
+                tracing::debug!(
+                    device = %client_id,
+                    char = %char_uuid,
+                    subscribed,
+                    "peripheral SubscriptionChanged"
+                );
+                continue;
+            }
+            PeripheralEvent::ReadRequest { responder, .. } => {
+                responder.respond(Vec::new());
+                continue;
+            }
+        };
+        if inbox.send(cmd).await.is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::uuid;
+
+    #[test]
+    fn extract_prefix_happy_path() {
+        // UUID with iroh magic prefix + 12 key bytes (0x01..=0x0c)
+        let svc = uuid!("69726f00-0102-0304-0506-070809100b0c");
+        let prefix = extract_prefix_from_services(&[svc]).unwrap();
+        assert_eq!(prefix, svc.as_bytes()[4..16]);
+    }
+
+    #[test]
+    fn extract_prefix_no_match() {
+        let svc = uuid!("12345678-1234-1234-1234-123456789abc");
+        assert!(extract_prefix_from_services(&[svc]).is_none());
+    }
+
+    #[test]
+    fn extract_prefix_empty() {
+        assert!(extract_prefix_from_services(&[]).is_none());
+    }
+}

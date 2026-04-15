@@ -2,24 +2,45 @@
 
 ## What this is
 
-A Rust crate providing BLE (Bluetooth Low Energy) as a custom transport for the [iroh](https://github.com/n0-computer/iroh) peer-to-peer networking stack. Devices act as both central (scanner/client) and peripheral (advertiser/server) simultaneously to discover and connect to each other over BLE.
+A Rust crate providing BLE (Bluetooth Low Energy) as a custom transport for the [iroh](https://github.com/n0-computer/iroh) peer-to-peer networking stack. Every node acts as **both** central (scanner/client) and peripheral (advertiser/server) simultaneously so peers can discover and dial each other symmetrically.
 
-Uses [blew](https://github.com/mcginty/blew) (git dependency) for cross-platform BLE.
+Built on [blew](https://github.com/mcginty/blew) (git dependency) for cross-platform BLE. Wraps a state-machine "registry" that owns per-peer lifecycle, an action "driver" that talks to blew, and a Selective-Repeat ARQ "reliable" channel that fragments QUIC datagrams across GATT writes/notifications.
 
 ## Commands
 
-Uses [mise](https://mise.jdx.dev) for task management. Run `mise tasks` for the full list.
+Uses [mise](https://mise.jdx.dev) for task management. `mise tasks` lists everything.
 
 ```sh
-mise run build                           # build all crates
-mise run test                            # run all tests (nextest)
-mise run lint                            # clippy
-mise run fmt                             # format
-mise run fmt:check                       # check formatting
-mise run deny                            # license/vulnerability audit
-cargo run --example iroh_ble -p iroh-ble-transport            # echo/speed test (listener)
-cargo run --example iroh_ble -p iroh-ble-transport -- <id>    # echo/speed test (dialer)
+mise run build           # cargo build --workspace
+mise run check           # cargo check --workspace (no codegen)
+mise run test            # cargo nextest run --workspace
+mise run lint            # clippy (depends on fmt:check)
+mise run fmt             # cargo fmt --all
+mise run fmt:check       # cargo fmt --all -- --check
+mise run verify          # fmt + lint + test (pre-commit gate)
+mise run deny            # license/vulnerability audit
+mise run ci:check-ios    # cargo check for aarch64-apple-ios
+mise run ci:check-android # cargo ndk check for arm64-v8a
+
+# Chat demo
+mise run chat:dev                # desktop dev server
+mise run chat:dev:ios            # iOS device dev server
+mise run chat:dev:android        # Android device dev server
+mise run chat:tui                # terminal chat client
+mise run chat:deploy:android:all # build APK + install/launch on every connected adb device
+mise run chat:deploy:ios:all     # build + install/launch on every connected iPhone
+mise run chat:deploy:mobile:all  # both at once
+mise run chat:logs:android       # tail logcat from all connected android devices
+mise run chat:uninstall:mobile:all
+
+# Examples
+cargo run --example iroh_ble -p iroh-ble-transport            # echo + 48 KB speed test (listener)
+cargo run --example iroh_ble -p iroh-ble-transport -- <id>    # echo + 48 KB speed test (dialer)
+cargo run --example central -p iroh-ble-transport             # bare central (scan + GATT client)
+cargo run --example peripheral -p iroh-ble-transport          # bare peripheral (advertise + serve)
 ```
+
+`cargo nextest run --workspace` runs all tests; the `iroh-ble-transport` crate has a `testing` feature that exposes `transport::test_util` for in-process mock-driver integration tests.
 
 ## Style
 
@@ -32,24 +53,38 @@ cargo run --example iroh_ble -p iroh-ble-transport -- <id>    # echo/speed test 
 
 | Crate | Role |
 |-------|------|
-| `blew` (git: mcginty/blew) | Both central and peripheral BLE roles |
-| `iroh 0.97` with `unstable-custom-transports` | QUIC endpoint, custom transport trait |
+| `blew` (git: mcginty/blew) | Cross-platform BLE — central, peripheral, GATT, L2CAP CoC |
+| `iroh 0.97` (`unstable-custom-transports`) | QUIC endpoint, custom transport trait |
 | `iroh-base 0.97` | `EndpointId`, `CustomAddr`, `TransportAddr` |
 | `tokio 1` | Async runtime |
+| `arc-swap` | Lock-free snapshot publication of registry state |
+| `parking_lot` | Sync mutexes inside the registry/routing tables |
 
 ## Module structure
 
 ```
-crates/iroh-ble/src/
-├── lib.rs                   # Re-exports from blew + error module
+crates/iroh-ble-transport/src/
+├── lib.rs                   # Re-exports from blew + transport
 ├── error.rs                 # BleError, BleResult, From<BlewError>
 └── transport/
-    ├── mod.rs               # BleTransport: iroh CustomTransport implementation
-    ├── l2cap.rs             # L2CAP framing, identity exchange, I/O task spawning
-    └── reliable.rs          # Selective Repeat ARQ sliding-window protocol
+    ├── mod.rs               # Module tree + re-exports
+    ├── transport.rs         # BleTransport: iroh CustomTransport entry point
+    ├── interface.rs         # BleInterface trait — blew abstraction the driver consumes
+    ├── driver.rs            # Action executor: PeerAction → BleInterface calls → PeerCommand follow-ups
+    ├── registry.rs          # Pure state machine (PeerEntry/PeerPhase) + actor loop
+    ├── peer.rs              # PeerEntry, PeerPhase, PeerCommand, PeerAction, ChannelHandle
+    ├── routing.rs           # TransportRouting: Token ↔ peer-identity, KeyPrefix → DeviceId
+    ├── events.rs            # blew event pumps (run_central_events, run_peripheral_events)
+    ├── pipe.rs              # Per-peer data pipe: ReliableChannel ↔ inbox/outbox channels
+    ├── reliable.rs          # Selective-Repeat ARQ sliding-window protocol + fragment canary
+    ├── mtu.rs               # MTU resolution (resolve_chunk_size, MIN_SANE_MTU floor)
+    ├── l2cap.rs             # L2CAP framing helpers (currently dormant — see below)
+    ├── store.rs             # PeerStore trait + InMemoryPeerStore
+    ├── watchdog.rs          # 250 ms PeerCommand::Tick pump
+    └── test_util.rs         # `testing` feature: in-process mock BleInterface
 ```
 
-`iroh-ble` re-exports blew types (`Central`, `Peripheral`, `DeviceId`, `CentralEvent`, `PeripheralEvent`, etc.) from `lib.rs`. The transport holds `Arc<Central>` and `Arc<Peripheral>` directly and spawns two event handler tasks — one for central events (discovery, notifications) and one for peripheral events (read/write requests with RAII responders).
+`iroh-ble-transport` re-exports useful blew types (`Central`, `Peripheral`, `DeviceId`, `CentralEvent`, `PeripheralEvent`, etc.) from `lib.rs` so downstream consumers don't depend on blew directly.
 
 ## Transport architecture
 
@@ -60,59 +95,99 @@ crates/iroh-ble/src/
 Each node advertises a GATT service whose UUID encodes the first 12 bytes of its 32-byte Ed25519 public key:
 
 ```
-69726F00-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+69726f00-XXXX-XXXX-XXXX-XXXXXXXXXXXX        (KeyPrefix UUID, used in advertising)
 ```
 
-Peers identify each other from advertising packets without connecting. The key prefix in the advertising UUID is matched against the `discovered` map to resolve `EndpointId` → `DeviceId`.
+Peers identify each other from advertising packets without connecting. The 12-byte `KeyPrefix` is matched against a `discovered: HashMap<KeyPrefix, DeviceId>` map maintained by `TransportRouting`.
 
-### Addressing
+### Addressing (token-based)
 
-The transport uses `DeviceId` (BLE device address string) as the `CustomAddr` data — not `EndpointId`. QUIC's connection IDs handle endpoint identity internally, so the transport only needs a stable per-peer routing key. This eliminates the need for identity exchange on the GATT data path entirely.
+The transport hands iroh **8-byte opaque tokens** as `CustomAddr` payloads, *not* `DeviceId` strings. `TransportRouting` mints tokens in two flavours:
 
-`AddressLookup::resolve()` maps `EndpointId` → key prefix (first 12 bytes) → `DeviceId` (via the `discovered` map) → `CustomAddr(device_key)`.
+- **Prefix-keyed** (preferred): minted from the 12-byte `KeyPrefix`. `TokenOrigin::Prefix(prefix)` → `discovered[prefix]` is consulted **live** at every send, so a peer rotating its MAC (e.g. Android randomization on app restart) is followed transparently — iroh's cached address keeps working.
+- **Device-keyed** (fallback): minted from a `DeviceId` when an inbound peripheral connection arrives before scan has noted the advertisement. Stable only for the lifetime of that `DeviceId`.
+
+`BleAddressLookup::resolve(EndpointId)` waits until the prefix shows up in `discovered`, then returns `CustomAddr(prefix_token)`. Token `0` is reserved as a `local_addr` sentinel.
 
 ### GATT service layout
 
 ```
 Service: 69726f01-8e45-4c2c-b3a5-331f3098b5c2  (IROH_SERVICE_UUID)
-├── 69726f02 — C2P (WRITE_WITHOUT_RESPONSE | NOTIFY): central→peripheral data + ACKs
-├── 69726f03 — P2C (WRITE_WITHOUT_RESPONSE | NOTIFY): peripheral→central data + ACKs
-├── 69726f04 — PSM (READ, optional): 2-byte LE L2CAP PSM. Present only when the peripheral's `l2cap_listener()` succeeded at startup.
-└── 69726f05 — VERSION (READ): 1-byte protocol version. Central reads this after connecting to verify wire compatibility.
+├── 69726f02 — C2P    (WRITE_WITHOUT_RESPONSE | NOTIFY): central→peripheral data + ACKs
+├── 69726f03 — P2C    (WRITE_WITHOUT_RESPONSE | NOTIFY): peripheral→central data + ACKs
+├── 69726f04 — PSM    (READ): 2-byte LE L2CAP PSM, present only when the peripheral's `l2cap_listener()` succeeded
+└── 69726f05 — VERSION (READ): 1-byte protocol version, read by central after connect to verify wire compatibility
 ```
 
 - Central writes to C2P; peripheral sends data via P2C notifications.
-- Both characteristics carry data AND acknowledgements (piggybacked or pure ACK).
+- Both characteristics carry data **and** acknowledgements (piggybacked or pure ACK).
 
 ### Connection handshake (GATT path)
 
-1. Central connects, subscribes to P2C notifications.
-2. Central creates `ReliableChannel`, sends first datagram on C2P.
-3. Peripheral creates `ReliableChannel` eagerly on first incoming fragment.
-4. Both sides are now ready for QUIC datagrams. No identity exchange needed.
+1. Central connects (registry transitions `Discovered → Connecting → Handshaking → Connected`).
+2. Driver opens GATT: subscribes to P2C, optionally reads PSM/VERSION.
+3. Registry emits `StartDataPipe` → `pipe.rs` spins up a `ReliableChannel` and the per-peer outbound/inbound mpsc channels.
+4. Both sides are ready for QUIC datagrams. **No identity exchange on the data path** — QUIC's connection IDs handle endpoint identity.
 
 ### Connection handshake (L2CAP path)
 
-1. Central reads PSM characteristic, opens L2CAP CoC.
-2. Central writes its 32-byte EndpointId (raw, no header) — needed because L2CAP accept doesn't expose the remote DeviceId.
-3. Peripheral reads identity, maps it to a DeviceId via the `discovered` map, both sides start length-prefixed datagram I/O.
+Currently **dormant**. `l2cap.rs` contains length-prefixed `[u16 LE][payload]` framing helpers and an `OpenL2cap` action exists in `peer.rs` / `driver.rs`, but the registry never issues `OpenL2cap` today — every peer rides the GATT path. Wiring L2CAP back in is on the roadmap; the framing primitives are kept ready so the path can be lit up without rewriting them. There is no pre-handshake identity exchange on this path either: the I/O task is told the peer's `DeviceId` up front by the caller (this avoids the old "L2CAP accept doesn't expose remote DeviceId" problem at the cost of the accept-side path needing some other tagging strategy).
 
-### Per-peer state
+### Per-peer state machine
 
-Each peer gets a `PeerChannel` with:
-- An `Arc<ReliableChannel>` for the reliable protocol
-- A background send loop task
-- A datagram delivery task (routes completed datagrams → iroh `incoming_tx`)
+`registry.rs` is pure data — no I/O, no tokio. The actor loop in `Registry::run` reads `PeerCommand`s off an mpsc inbox, calls `Registry::handle` (synchronous), and dispatches the resulting `PeerAction`s to `Driver::execute`.
 
-### Scan pausing
+`PeerEntry` carries a `PeerPhase`:
 
-Scanning is paused when any active connection exists (reduces radio contention during transfers) and resumed when all connections disconnect.
+```
+Unknown → Discovered → Connecting → Handshaking → Connected
+                                                      │
+                                                      ▼
+                                                   Draining ──→ Dead
+                                                      │
+                                                      ▼
+                                                Reconnecting ──→ Connecting
+                                                                    │
+                                                                    ▼
+                                                                 Restoring
+```
+
+Key constants (registry.rs):
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `MAX_CONNECT_ATTEMPTS` | 15 | Retries before transitioning to `Dead { MaxRetries }` |
+| `DRAINING_TIMEOUT` | 5 s | How long to wait in `Draining` for a clean teardown |
+| `RESTORING_TIMEOUT` | 120 s | Max time after adapter-restore before giving up |
+| `DEAD_GC_TTL` | 60 s | How long a `Dead` entry sticks around for dedup |
+
+The transport itself is **passive**: once a peer ends up in `Dead`, the registry will not auto-retry. Reconnect policy lives in the application (see chat-app `reconnect_tick`).
+
+### Routing table (`TransportRouting`)
+
+Owns two pieces of state above the per-peer state machine:
+
+1. `Token ↔ peer-identity` — the iroh-facing `CustomAddr` allocation.
+2. `KeyPrefix → DeviceId` — the live indirection that lets prefix-keyed tokens follow MAC rotation.
+
+`TransportRouting::note_discovery(prefix, device)` is called from `run_central_events` whenever an advertisement parses cleanly. `device_for_token(token)` is what the `BleSender` consults at every send — so updates to the `discovered` map are picked up immediately.
+
+### Per-peer data pipe
+
+`pipe.rs` owns the runtime side of a connected peer:
+
+- An `Arc<ReliableChannel>` for the ARQ protocol
+- A background send loop draining the outbound mpsc → ReliableChannel
+- A datagram delivery task routing reassembled datagrams → `incoming_tx` (which feeds iroh)
+- An MTU resolver (`resolve_chunk_size`) that asks blew for the negotiated ATT MTU at startup, falls back if it never reaches `MIN_SANE_MTU=24`
 
 ### QUIC configuration (BlePreset)
 
 - `initial_mtu(1200)`, `mtu_discovery_config(None)` — fixed MTU, no discovery
 - `max_idle_timeout(300s)`, `keep_alive_interval(5s)` — long timeouts for slow BLE
 - `default_path_max_idle_timeout(6s)`, `default_path_keep_alive_interval(4s)`
+
+The chat-app override (`max_idle_timeout(15s)`) is set on the iroh `Endpoint` builder so iroh tears down stalled connections closer to the BLE-level disconnect detection window.
 
 ## Reliable transport protocol (`src/transport/reliable.rs`)
 
@@ -129,6 +204,10 @@ Byte 1:
   Bits 0-3: ACK_SEQ  — cumulative ACK (all seqs up to this received)
   Bit  4:   ACK      — ACK_SEQ field is valid
   Bits 5-7: reserved
+
+Trailer:
+  1-byte FRAGMENT_CANARY (0x5A) appended to every fragment; receiver validates and strips.
+  Mismatch → `truncations` counter increments and the fragment is dropped.
 ```
 
 **Key parameters:**
@@ -136,13 +215,17 @@ Byte 1:
 | Constant | Value | Purpose |
 |----------|-------|---------|
 | `WINDOW_SIZE` | 6 | Max in-flight un-ACKed fragments |
-| `INTER_FRAME_GAP` | 3ms | Delay between fragment sends (prevents BLE buffer overflow) |
-| `ACK_TIMEOUT` | 300ms | Retransmit timeout (BLE RTT is ~120-200ms) |
-| `ACK_TIMEOUT_MAX` | 5s | Max timeout after exponential backoff |
-| `MAX_RETRIES` | 15 | Retransmits before declaring link dead |
-| `DEFAULT_CHUNK_SIZE` | 512 | Max GATT write/notify size (bytes) |
+| `INTER_FRAME_GAP` | 3 ms | Delay between fragment sends (prevents BLE buffer overflow) |
+| `ACK_TIMEOUT` | 300 ms | Retransmit timeout (BLE RTT is ~120-200 ms) |
+| `ACK_TIMEOUT_MAX` | 5 s | Max timeout after exponential backoff |
+| `ACK_DELAY` | 15 ms | Delayed-ACK window for piggybacking |
+| `LINK_DEAD_DEADLINE` | 6 s | Total time without progress before declaring the link dead |
 | `MAX_DATAGRAM_SIZE` | 1472 | Max reassembled datagram |
 | `SEQ_MODULUS` | 16 | Sequence number space (4-bit) |
+| `SEND_QUEUE_CAPACITY` | 32 | Outbound mpsc capacity |
+| `FRAGMENT_CANARY` | 0x5A | Per-fragment integrity sentinel |
+
+Chunk size is **not** a fixed constant — it is resolved per peer at handshake time from the negotiated ATT MTU via `mtu::resolve_chunk_size`, with `MIN_SANE_MTU=24` as the floor and `DEFAULT_FALLBACK_MTU=512` if MTU never reaches the floor inside `MTU_READY_DEADLINE=1s`.
 
 **Protocol behaviour:**
 
@@ -150,53 +233,63 @@ Byte 1:
 - Receiver buffers out-of-order fragments within the window (`recv_buf`).
 - Cumulative ACKs: "I have received everything up to seq X contiguously."
 - On timeout: retransmits only the **oldest un-ACKed fragment** (selective, not Go-Back-N).
-- ACKs are piggybacked on outgoing data; pure ACKs sent only when no data is available.
-- `retransmit_counter` (shared `Arc<AtomicU64>`) is incremented per retransmit for health monitoring.
+- ACKs are piggybacked on outgoing data; pure ACKs sent only when no data is available within `ACK_DELAY`.
+- A shared `Arc<AtomicU64> retransmit_counter` is incremented per retransmit for health monitoring.
+- A shared `Arc<AtomicU64> truncation_counter` is incremented whenever the fragment canary is missing/wrong.
 
 **Important invariant:** `WINDOW_SIZE` must be < `SEQ_MODULUS / 2` (i.e. < 8) for correct modular window arithmetic.
 
-## Health check
+## Telemetry
 
-Logged every 10 seconds:
+The transport exposes two snapshot APIs:
 
-```
-discoveries, iroh_peers, lagged_events, discovered_peers,
-peer_channels, active_connections, retransmits (per 10s interval),
-tx_kbps, rx_kbps
-```
+- `BleTransport::metrics() -> BleMetricsSnapshot` — `tx_bytes`, `rx_bytes`, `retransmits`, `truncations` (cumulative atomics).
+- `BleTransport::snapshot_peers() -> Vec<BlePeerInfo>` — current `(device_id, phase, consecutive_failures)` for every peer in the registry. Backed by an `arc_swap::ArcSwap<SnapshotMaps>` that the registry republishes on every state change.
 
-`retransmits` resets to zero each 10-second health interval. High retransmits (>10/interval) indicate BLE radio congestion or link quality issues.
+The chat app polls these from `bandwidth_tick` (1 s) and `transport_state_tick` (1 s) and forwards diffs to the frontend as `bandwidth` and `ble-peer-updated`/`ble-peer-removed` Tauri events.
 
 ## Known limitations / open issues
 
-- **No out-of-order ACK (SACK)**: Receiver sends cumulative ACKs only; no selective acknowledgement of individual out-of-order fragments beyond buffering.
-- **L2CAP preferred, GATT fallback**: The transport prefers L2CAP CoC when both peers support it (Apple, Linux, Android), and falls back to GATT write-without-response + notifications otherwise.
-- **Same-machine BLE**: BLE discovery does not work between two processes on the same macOS machine (CoreBluetooth limitation). Always test on separate devices.
+- **L2CAP path dormant**: GATT-only in practice. L2CAP framing primitives, driver actions, and PSM characteristic still exist but the registry never selects the L2CAP path. Re-enabling it is a known follow-up.
+- **No out-of-order ACK (SACK)**: Receiver sends cumulative ACKs only; out-of-order fragments are buffered but never explicitly acknowledged.
+- **Same-machine BLE on macOS**: BLE discovery does not work between two processes on the same macOS host (CoreBluetooth limitation). Always test on separate devices.
+- **`mock_integration.rs` is broken**: needs repair against post-refactor `PeerCommand`/`PeerAction` shapes (tracked as a follow-up task).
 
 ## demos/iroh-ble-chat
 
-A Tauri 2 cross-platform chat app (`demos/iroh-ble-chat`). Desktop + iOS + Android.
+A Tauri 2 cross-platform chat app (`demos/iroh-ble-chat`). Desktop + iOS + Android. Uses **iroh-gossip** over `BleTransport` for fan-out instead of point-to-point streams.
 
-**Architecture:** `src-tauri/src/lib.rs` creates a `BleTransport` + iroh `Endpoint`, then accepts/connects peers. Chat messages use `iroh-ble-chat-protocol` (postcard-serialized `ChatMsg` over QUIC bi-streams).
+**Architecture:** `src-tauri/src/lib.rs` builds a `BleTransport`, mounts it on an iroh `Endpoint`, and starts an `iroh-gossip` `Router`. Chat messages are postcard-serialized `ChatMsg` values from the `iroh-ble-chat-protocol` crate (`demos/protocol`), broadcast through gossip. Image transfers stream over plain QUIC bi-streams (`IMAGE_ALPN`).
 
-**Tauri commands:** `start_node`, `connect_peer`, `send_message`, `get_node_id`. Connection handshake runs in a background task (BLE can take 10-30s).
+**Tauri commands:** `start_node`, `get_node_id`, `set_nickname`, `add_peer`, `remove_peer`, `get_peers`, `send_message`, `send_image`, `set_debug`.
 
-**Android integration:** Uses `tauri-plugin-blew` (from blew repo) for BLE setup. The plugin is registered conditionally via `#[cfg(target_os = "android")]`.
+**Background tasks (spawned in `start_node`):**
+- `gossip_event_pump` — drains gossip events, updates `PeerState`, emits `peer-updated`
+- `bandwidth_tick` (1 s) — polls `BleTransport::metrics()`, emits `bandwidth`
+- `stale_tick` (30 s) — flips peers to `GossipStatus::Stale` after 120 s without a sighting
+- `transport_state_tick` (1 s) — diffs `snapshot_peers()`, emits `ble-peer-updated` / `ble-peer-removed`
+- `reconnect_tick` (10 s) — for every known peer not currently `GossipStatus::Direct`, calls `sender.join_peers([peer_id])`. **This is where reconnect policy lives** — the transport itself is passive.
 
-**Frontend:** Vanilla TypeScript + Vite. Listens to `chat-msg` and `connection-status` Tauri events.
+**Frontend events:** `peer-updated`, `peer-removed`, `topic-joined`, `chat-msg`, `bandwidth`, `ble-peer-updated`, `ble-peer-removed`, image-stream events.
+
+**Android integration:** Uses `tauri-plugin-blew` (from blew repo) for BLE setup. Registered conditionally via `#[cfg(target_os = "android")]`.
+
+**Frontend:** Vanilla TypeScript + Vite (`demos/iroh-ble-chat/src/main.ts`).
 
 ## demos/chat-tui
 
-A terminal UI chat demo (`demos/chat-tui`). Uses `iroh-ble-chat-protocol` over `BleTransport`.
+Terminal UI chat demo (`demos/chat-tui`). Uses `iroh-ble-chat-protocol` over `BleTransport`. Run with `mise run chat:tui`.
 
-## Example
+## Example crate
 
 ```sh
 # Listener (machine A):
-cargo run --example iroh_ble
+cargo run --example iroh_ble -p iroh-ble-transport
 
 # Dialer (machine B):
-cargo run --example iroh_ble -- <endpoint-id-from-A>
+cargo run --example iroh_ble -p iroh-ble-transport -- <endpoint-id-from-A>
 ```
 
-Runs an echo test + 48KB speed test. Secret key is cached in `~/.cache/iroh-ble-example/private.key`.
+Runs an echo test + 48 KB speed test. Secret key is cached in `~/.cache/iroh-ble-example/private.key`.
+
+`central` and `peripheral` examples exercise just the blew side without the iroh transport, useful for triaging whether a regression is in the radio layer or the transport.

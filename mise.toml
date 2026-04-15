@@ -15,6 +15,9 @@ java = "temurin-17"
 ktlint = "latest"
 android-sdk = "latest"
 
+[env]
+CARGO_TERM_COLOR = "always"
+
 [tasks.build]
 description = "Build all crates"
 run = "cargo build"
@@ -48,6 +51,10 @@ run = "cargo fmt --all -- --check"
 [tasks.deny]
 description = "Check dependencies for license and vulnerability issues"
 run = "cargo deny check"
+
+[tasks.verify]
+description = "Pre-commit gate: fmt + lint + test"
+depends = ["fmt", "lint", "test"]
 
 # --- Chat app tasks ---------------------------------------------------
 
@@ -123,6 +130,53 @@ depends = ["chat:uninstall:android:all", "chat:uninstall:ios:all"]
 [tasks."chat:tui"]
 description = "Run the terminal chat UI"
 run = "cargo run -p iroh-ble-chat-tui"
+
+[tasks."chat:logs:android"]
+description = "Tail logcat from all connected Android devices, filtered to iroh/blew/chat"
+run = """
+DEVICES=$(adb devices 2>/dev/null | grep -w 'device$' | awk '{print $1}')
+if [ -z "$DEVICES" ]; then
+  echo "No Android devices connected."
+  exit 0
+fi
+PIDS=""
+for dev in $DEVICES; do
+  echo "==> Tailing $dev (Ctrl-C to stop)..."
+  adb -s "$dev" logcat -v brief -T 200 \
+    RustStdoutStderr:V iroh_ble_transport:V iroh_ble_chat:V blew:V iroh_gossip:V '*:S' \
+    | sed -u "s/^/[$dev] /" &
+  PIDS="$PIDS $!"
+done
+trap "kill $PIDS 2>/dev/null" EXIT INT TERM
+wait
+"""
+
+[tasks."chat:logs:android:save"]
+description = "Capture ~30s of logcat from each connected Android into /tmp/android<N>.log"
+run = """
+DEVICES=$(adb devices 2>/dev/null | grep -w 'device$' | awk '{print $1}')
+if [ -z "$DEVICES" ]; then
+  echo "No Android devices connected."
+  exit 0
+fi
+N=0
+PIDS=""
+for dev in $DEVICES; do
+  N=$((N + 1))
+  OUT="/tmp/android${N}.log"
+  echo "==> $dev → $OUT"
+  : > "$OUT"
+  adb -s "$dev" logcat -v brief -T 200 \
+    RustStdoutStderr:V iroh_ble_transport:V iroh_ble_chat:V blew:V iroh_gossip:V '*:S' \
+    > "$OUT" &
+  PIDS="$PIDS $!"
+done
+echo "Capturing for 30 seconds..."
+sleep 30
+kill $PIDS 2>/dev/null || true
+wait 2>/dev/null || true
+echo "Done. Logs in /tmp/android*.log"
+"""
 
 # --- CI ---------------------------------------------------------------
 

@@ -37,47 +37,6 @@ async fn mock_l2cap_full_round_trip() {
 }
 
 #[tokio::test]
-async fn l2cap_identity_exchange_between_central_and_peripheral() {
-    use blew::central::backend::CentralBackend;
-    use blew::peripheral::backend::PeripheralBackend;
-    use blew::types::DeviceId;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_stream::StreamExt;
-
-    let (central_ep, periph_ep) = MockLink::pair();
-    let (psm, mut listener) = periph_ep.peripheral.l2cap_listener().await.unwrap();
-
-    let device_id = DeviceId::from("mock-peripheral");
-    let open_fut = central_ep.central.open_l2cap_channel(&device_id, psm);
-    let accept_fut = listener.next();
-    let (central_side, accepted) = tokio::join!(open_fut, accept_fut);
-    let central_side = central_side.unwrap();
-    let periph_side = accepted.unwrap().unwrap();
-
-    let (mut c_rd, mut c_wr) = tokio::io::split(central_side);
-    let (mut p_rd, mut p_wr) = tokio::io::split(periph_side);
-
-    let central_id = [0xAA_u8; 32];
-    let peripheral_id = [0xBB_u8; 32];
-
-    let fut_c = async {
-        c_wr.write_all(&central_id).await.unwrap();
-        let mut buf = [0_u8; 32];
-        c_rd.read_exact(&mut buf).await.unwrap();
-        buf
-    };
-    let fut_p = async {
-        p_wr.write_all(&peripheral_id).await.unwrap();
-        let mut buf = [0_u8; 32];
-        p_rd.read_exact(&mut buf).await.unwrap();
-        buf
-    };
-    let (c_got, p_got) = tokio::join!(fut_c, fut_p);
-    assert_eq!(c_got, peripheral_id);
-    assert_eq!(p_got, central_id);
-}
-
-#[tokio::test]
 async fn l2cap_open_error_policy_forces_fallback() {
     use blew::central::backend::CentralBackend;
     use blew::peripheral::backend::PeripheralBackend;
