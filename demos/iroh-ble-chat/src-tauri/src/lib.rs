@@ -519,7 +519,7 @@ async fn reconnect_tick(state: Arc<Mutex<AppState>>) {
         if let Err(e) = sender.join_peers(targets).await {
             tracing::debug!("reconnect_tick join_peers failed: {e}");
         } else {
-            tracing::debug!("reconnect_tick nudged {count} peer(s)");
+            tracing::trace!("reconnect_tick nudged {count} peer(s)");
         }
     }
 }
