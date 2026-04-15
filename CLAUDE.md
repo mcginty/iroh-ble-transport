@@ -48,6 +48,7 @@ cargo run --example peripheral -p iroh-ble-transport          # bare peripheral 
 - Don't add features, refactor, or "improve" code beyond what was asked.
 - Clippy pedantic is enabled (`pedantic = "warn"` in blew). Fix warnings, don't suppress them unless there's a good reason.
 - Test with nextest: `cargo nextest run --workspace`.
+- **Commit attribution**: when an AI assistant helps write a commit, use an `Assisted-by:` trailer instead of `Co-Authored-by:`, following the [Linux kernel guidance](https://docs.kernel.org/process/ai.html). Format: `Assisted-by: AGENT_NAME:MODEL_VERSION [TOOL1] [TOOL2]` — e.g. `Assisted-by: Claude:claude-opus-4-6`. Only list specialized analysis tools (coccinelle, sparse, clippy, etc.); skip basic dev tools like git/cargo/editors.
 
 ## Key dependencies
 
@@ -250,10 +251,29 @@ The chat app polls these from `bandwidth_tick` (1 s) and `transport_state_tick` 
 
 ## Known limitations / open issues
 
-- **L2CAP path dormant**: GATT-only in practice. L2CAP framing primitives, driver actions, and PSM characteristic still exist but the registry never selects the L2CAP path. Re-enabling it is a known follow-up.
+- **L2CAP path dormant**: GATT-only in practice. L2CAP framing primitives, driver actions, and PSM characteristic still exist but the registry never selects the L2CAP path. Re-enabling it is a known follow-up — see "L2CAP revival follow-up" below.
 - **No out-of-order ACK (SACK)**: Receiver sends cumulative ACKs only; out-of-order fragments are buffered but never explicitly acknowledged.
 - **Same-machine BLE on macOS**: BLE discovery does not work between two processes on the same macOS host (CoreBluetooth limitation). Always test on separate devices.
-- **`mock_integration.rs` is broken**: needs repair against post-refactor `PeerCommand`/`PeerAction` shapes (tracked as a follow-up task).
+
+## L2CAP revival follow-up
+
+Stub — needs a proper spec before implementation. Capturing what we know:
+
+**What already exists:**
+- `transport/l2cap.rs` — `[u16 LE length][payload]` framing helpers, `spawn_l2cap_io_tasks`, `MAX_DATAGRAM_SIZE` matched to the GATT path. `#![allow(dead_code)]` today.
+- `peer.rs` defines an `OpenL2cap` action; `driver.rs` has the matching execute arm. The registry never emits it.
+- PSM characteristic (`69726f04`) is published by the peripheral whenever `blew::Peripheral::l2cap_listener` succeeds; central reads it after GATT connect but does nothing with the value.
+- `tests/l2cap_mock.rs` exercises the mock peripheral's PSM advertisement and policy-driven failure injection.
+
+**Known blockers / open questions:**
+- **Accept-side identity tagging**: `blew::Peripheral::l2cap_listener` does not expose a remote `DeviceId` on accept (see comment at `l2cap.rs:13`). The dialer side is fine — caller passes the `DeviceId` in — but the listener side has no way to associate an inbound L2CAP stream with a peer in the registry. Options: (a) extend blew's accept API upstream; (b) require a tiny in-band identity preamble on the L2CAP stream before it counts as established.
+- **Path selection policy**: when do we prefer L2CAP over GATT? On every Connected peer if PSM is present? Only above some MTU floor? Fall back to GATT on L2CAP failure? Needs a decision before wiring `OpenL2cap` into the registry.
+- **State-machine interaction**: where does L2CAP setup live in the phase graph? A new `OpeningL2cap` sub-phase between `Connected` and a hypothetical `ConnectedL2cap`, or a parallel pipe that swaps in once ready? Affects pipe.rs and the ReliableChannel ownership.
+- **ReliableChannel reuse**: L2CAP is stream-oriented and reliable already, so the SR-ARQ layer is unnecessary on that path. The pipe layer needs a way to bypass `ReliableChannel` for L2CAP and feed datagrams straight through the framed reader/writer.
+- **Backpressure / MTU**: confirm `MAX_DATAGRAM_SIZE = 1472` is right for L2CAP CoC on all platforms; check whether iroh's `initial_mtu(1200)` needs revisiting if L2CAP can carry larger.
+- **Teardown semantics**: how does an L2CAP failure interact with the GATT subscription? Today both characteristics are the canary for liveness. If L2CAP is the data path, do we still need C2P/P2C subscribed for keepalive, or do we tear down on L2CAP-only signals?
+
+**Suggested first step:** brainstorm a spec covering accept-side identity, path selection, and where in the phase graph L2CAP setup lands. Then write a plan and revive `OpenL2cap` end-to-end behind a feature flag so the GATT path stays the default until L2CAP is proven on real hardware.
 
 ## demos/iroh-ble-chat
 
