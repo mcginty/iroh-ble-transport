@@ -46,23 +46,27 @@ pub async fn run_data_pipe(
         let channel = Arc::clone(&channel);
         let iface = Arc::clone(&iface);
         let device_id = device_id.clone();
-        tokio::spawn(async move {
-            channel
-                .run_send_loop(move |bytes| {
-                    let iface = Arc::clone(&iface);
-                    let device_id = device_id.clone();
-                    let role = role;
-                    async move {
-                        let buf = Bytes::from(bytes);
-                        let result = match role {
-                            ConnectRole::Central => iface.write_c2p(&device_id, buf).await,
-                            ConnectRole::Peripheral => iface.notify_p2c(&device_id, buf).await,
-                        };
-                        result.map_err(|e| format!("{e}"))
-                    }
-                })
-                .await
-        })
+        let span = tracing::info_span!("ble_pipe", device = %device_id);
+        tokio::spawn(tracing::Instrument::instrument(
+            async move {
+                channel
+                    .run_send_loop(move |bytes| {
+                        let iface = Arc::clone(&iface);
+                        let device_id = device_id.clone();
+                        let role = role;
+                        async move {
+                            let buf = Bytes::from(bytes);
+                            let result = match role {
+                                ConnectRole::Central => iface.write_c2p(&device_id, buf).await,
+                                ConnectRole::Peripheral => iface.notify_p2c(&device_id, buf).await,
+                            };
+                            result.map_err(|e| format!("{e}"))
+                        }
+                    })
+                    .await
+            },
+            span,
+        ))
     };
 
     tokio::pin!(send_loop_handle);

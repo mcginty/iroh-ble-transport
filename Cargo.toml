@@ -13,4 +13,3 @@ tag-message = "{{crate_name}}: release {{version}}"
 pre-release-commit-message = "{{crate_name}}: release {{version}}"
 push = false
 publish = false
-

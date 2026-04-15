@@ -291,18 +291,17 @@ impl BleInterface for BlewDriver {
 
     async fn notify_p2c(
         &self,
-        _device_id: &blew::DeviceId,
+        device_id: &blew::DeviceId,
         bytes: Bytes,
     ) -> crate::error::BleResult<()> {
-        // notify_characteristic broadcasts to all subscribers; device_id is ignored.
         let len = bytes.len();
         let result = self
             .peripheral
-            .notify_characteristic(P2C_CHAR_UUID, bytes.to_vec())
+            .notify_characteristic(device_id, P2C_CHAR_UUID, bytes.to_vec())
             .await;
         match &result {
-            Ok(()) => tracing::trace!(len, "notify_p2c ok"),
-            Err(e) => tracing::warn!(len, err = %e, "notify_p2c err"),
+            Ok(()) => tracing::trace!(device = %device_id, len, "notify_p2c ok"),
+            Err(e) => tracing::warn!(device = %device_id, len, err = %e, "notify_p2c err"),
         }
         result?;
         Ok(())
