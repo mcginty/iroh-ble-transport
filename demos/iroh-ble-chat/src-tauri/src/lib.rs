@@ -324,6 +324,12 @@ async fn gossip_event_pump(
                 let ui = peer.to_ui();
                 let _ = app.emit("peer-updated", &ui);
 
+                let mut known = load_known_peers(&st.cache_dir);
+                if !known.contains(&peer_id) {
+                    known.push(peer_id);
+                    save_known_peers(&st.cache_dir, &known);
+                }
+
                 if !topic_joined {
                     topic_joined = true;
                     let active = st
