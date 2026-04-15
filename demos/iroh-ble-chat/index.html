@@ -6,11 +6,7 @@
             name="viewport"
             content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
         />
-        <title>Iroh BLE Chat</title>
-        <link
-            href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;800&display=swap"
-            rel="stylesheet"
-        />
+        <title>BlewChat</title>
         <link rel="stylesheet" href="/src/styles.css" />
     </head>
     <body>
@@ -18,13 +14,13 @@
             <!-- Header -->
             <header class="app-header">
                 <div class="header-left">
-                    <div class="logo">⬡</div>
+                    <div class="logo" aria-hidden="true">⬡</div>
                     <div class="header-text">
-                        <span class="app-title">Iroh BLE</span>
+                        <span class="app-title">BlewChat</span>
                         <span
                             id="connection-status"
                             class="status-pill starting"
-                            >Starting...</span
+                            >Starting…</span
                         >
                     </div>
                 </div>
@@ -35,10 +31,6 @@
                     <div class="bw-row"><span class="bw-arrow">&#x2702;</span><span id="bw-trunc">0</span> <span class="bw-unit">trunc</span></div>
                 </div>
                 <div class="header-actions">
-                    <label class="debug-toggle" title="Show BLE/gossip debug events">
-                        <input type="checkbox" id="debug-checkbox" checked />
-                        <span class="debug-label">Debug</span>
-                    </label>
                     <button
                         id="members-toggle-btn"
                         class="icon-btn members-toggle"
@@ -114,8 +106,9 @@
                 <!-- Messages -->
                 <main id="chat-messages" class="messages">
                     <div class="welcome">
-                        <div class="welcome-icon">📡</div>
-                        <p>Starting node…<br />This only takes a moment.</p>
+                        <div class="welcome-icon" aria-hidden="true">⬡</div>
+                        <p class="welcome-title">BlewChat</p>
+                        <p>Warming up the radio…<br />This only takes a moment.</p>
                     </div>
                 </main>
 
@@ -129,11 +122,17 @@
                     <div id="members-list" class="members-list">
                         <!-- Populated by JS -->
                     </div>
-                    <div id="ble-peers-section" class="ble-peers-section" style="display:none">
-                        <div class="ble-peers-header">BLE peers</div>
-                        <div id="ble-peers-list" class="ble-peers-list">
-                            <!-- Populated by JS -->
+                    <div class="sidebar-footer">
+                        <div id="ble-peers-section" class="ble-peers-section" style="display:none">
+                            <div class="ble-peers-header">BLE peers</div>
+                            <div id="ble-peers-list" class="ble-peers-list">
+                                <!-- Populated by JS -->
+                            </div>
                         </div>
+                        <label class="debug-toggle sidebar-debug" title="Show BLE/gossip debug events">
+                            <input type="checkbox" id="debug-checkbox" checked />
+                            <span class="debug-label">Debug events</span>
+                        </label>
                     </div>
                 </aside>
             </div>
@@ -155,8 +154,11 @@
                     </button>
                     <input
                         id="msg-input"
-                        placeholder="Message..."
+                        placeholder="Message…"
                         autocomplete="off"
+                        autocapitalize="sentences"
+                        enterkeyhint="send"
+                        inputmode="text"
                         disabled
                     />
                     <button

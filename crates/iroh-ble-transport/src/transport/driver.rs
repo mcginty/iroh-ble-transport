@@ -156,7 +156,7 @@ impl<I: BleInterface> Driver<I> {
             }
 
             PeerAction::EmitMetric(ev) => {
-                tracing::debug!(metric = %ev, "peer metric");
+                tracing::trace!(metric = %ev, "peer metric");
             }
 
             PeerAction::StartDataPipe { device_id, role } => {
