@@ -255,6 +255,18 @@ async fn start_node(
 
     let known_peers = load_known_peers(&st.cache_dir);
 
+    let own_id_pre = st.own_id();
+    for peer_id in &known_peers {
+        if *peer_id == own_id_pre {
+            continue;
+        }
+        let peer = st
+            .peers
+            .entry(*peer_id)
+            .or_insert_with(|| new_peer_entry(*peer_id));
+        let _ = app.emit("peer-updated", &peer.to_ui());
+    }
+
     let topic = gossip
         .subscribe(chat_topic_id(), known_peers.clone())
         .await
