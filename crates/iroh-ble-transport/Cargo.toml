@@ -13,7 +13,7 @@ categories = ["network-programming"]
 testing = []
 
 [dependencies]
-blew = "0.1.0-alpha.5"
+blew = "0.1.0-alpha.7"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"
