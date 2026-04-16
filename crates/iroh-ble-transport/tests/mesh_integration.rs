@@ -347,3 +347,112 @@ async fn one_peer_flapping_does_not_disturb_others() {
         "A's tx_gen for C must not shift when the unrelated B edge flaps"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn adapter_off_on_one_node_does_not_evict_others() {
+    use iroh_ble_transport::transport::registry::PhaseKind;
+
+    let fabric = MockFabric::new();
+    let a = spawn_node(&fabric, DeviceId::from("a"), L2capPolicy::Disabled);
+    let mut b = spawn_node(&fabric, DeviceId::from("b"), L2capPolicy::Disabled);
+    let mut c = spawn_node(&fabric, DeviceId::from("c"), L2capPolicy::Disabled);
+
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(8);
+    let waker = waker_from_channel(waker_tx);
+
+    // Bring all three into a fully-connected triangle: A<->B and A<->C via
+    // A's sends; B<->C via B's send to C.
+    for (from_inbox, peer, prefix_byte, payload) in [
+        (&a.inbox_tx, &b.device_id, 0xB1_u8, &b"a-to-b"[..]),
+        (&a.inbox_tx, &c.device_id, 0xC1_u8, &b"a-to-c"[..]),
+        (&b.inbox_tx, &c.device_id, 0xC2_u8, &b"b-to-c"[..]),
+    ] {
+        from_inbox
+            .send(PeerCommand::Advertised {
+                prefix: prefix_for(prefix_byte),
+                device: ble_device(peer),
+                rssi: None,
+            })
+            .await
+            .unwrap();
+        from_inbox
+            .send(PeerCommand::SendDatagram {
+                device_id: peer.clone(),
+                tx_gen: 0,
+                datagram: Bytes::copy_from_slice(payload),
+                waker: waker.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Drain all three receiving datagrams to confirm the triangle is live.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), b.incoming_rx.recv())
+        .await
+        .expect("B never got A's datagram");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), c.incoming_rx.recv())
+        .await
+        .expect("C never got A's datagram");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), c.incoming_rx.recv())
+        .await
+        .expect("C never got B's datagram");
+
+    // Sanity: B's view of C is Connected before we touch A.
+    let pre = b.snapshots.load();
+    assert_eq!(
+        pre.peer_states
+            .get(&c.device_id)
+            .expect("B has no C")
+            .phase_kind,
+        PhaseKind::Connected,
+    );
+    drop(pre);
+
+    // Flip A's adapter off.
+    a.inbox_tx
+        .send(PeerCommand::AdapterStateChanged { powered: false })
+        .await
+        .unwrap();
+
+    // Give A's registry a moment to process the adapter-off drain.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // A's entries for B and C must have drained out of Connected.
+    let a_snap = a.snapshots.load();
+    for peer in [&b.device_id, &c.device_id] {
+        let state = a_snap
+            .peer_states
+            .get(peer)
+            .unwrap_or_else(|| panic!("A has no entry for {peer}"));
+        assert_ne!(
+            state.phase_kind,
+            PhaseKind::Connected,
+            "A's entry for {peer} should not be Connected after adapter-off, found {:?}",
+            state.phase_kind,
+        );
+    }
+    drop(a_snap);
+
+    // B's and C's view of each other stays Connected — nobody's adapter
+    // toggled but A's.
+    let b_snap = b.snapshots.load();
+    let c_snap = c.snapshots.load();
+    assert_eq!(
+        b_snap
+            .peer_states
+            .get(&c.device_id)
+            .expect("B has no C")
+            .phase_kind,
+        PhaseKind::Connected,
+        "B's view of C should be untouched by A's adapter toggle",
+    );
+    assert_eq!(
+        c_snap
+            .peer_states
+            .get(&b.device_id)
+            .expect("C has no B")
+            .phase_kind,
+        PhaseKind::Connected,
+        "C's view of B should be untouched by A's adapter toggle",
+    );
+}
