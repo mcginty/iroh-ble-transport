@@ -615,30 +615,35 @@ async fn transport_state_tick(
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let snapshot = transport.snapshot_peers();
 
-        let path_by_device: HashMap<String, Option<ConnectPath>> = snapshot
+        let info_by_device: HashMap<String, &BlePeerInfo> = snapshot
             .iter()
-            .map(|info| (info.device_id.to_string(), info.connect_path))
+            .map(|info| (info.device_id.to_string(), info))
             .collect();
 
         {
             let mut st = state.lock().await;
-            let mut changed = false;
             for peer in st.peers.values_mut() {
-                let new_path = transport
+                let info = transport
                     .device_for_endpoint(&peer.id)
-                    .and_then(|did| path_by_device.get(&did.to_string()).copied().flatten())
-                    .map(|p| match p {
-                        ConnectPath::Gatt => "gatt".to_string(),
-                        ConnectPath::L2cap => "l2cap".to_string(),
-                    });
-                if peer.ble_path != new_path {
+                    .and_then(|did| info_by_device.get(&did.to_string()).copied());
+
+                let new_phase = info.map(|i| i.phase);
+                let new_failures = info.map_or(0, |i| i.consecutive_failures);
+                let new_path = info.and_then(|i| i.connect_path).map(|p| match p {
+                    ConnectPath::Gatt => "gatt".to_string(),
+                    ConnectPath::L2cap => "l2cap".to_string(),
+                });
+
+                if peer.ble_phase != new_phase
+                    || peer.ble_failures != new_failures
+                    || peer.ble_path != new_path
+                {
+                    peer.ble_phase = new_phase;
+                    peer.ble_failures = new_failures;
                     peer.ble_path = new_path;
-                    changed = true;
                     let _ = app.emit("peer-updated", &peer.to_ui());
                 }
             }
-            drop(st);
-            let _ = changed;
         }
 
         let mut current: HashMap<String, BlePeerDebugUI> = HashMap::with_capacity(snapshot.len());
