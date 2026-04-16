@@ -42,8 +42,8 @@ struct Inner {
     is_powered: bool,
     connect_delay: Option<Duration>,
     next_channel_id: u64,
-    on_c2p_write: Option<Box<dyn Fn(Bytes) + Send + Sync>>,
-    on_p2c_notify: Option<Box<dyn Fn(Bytes) + Send + Sync>>,
+    on_c2p_write: Option<Box<dyn Fn(DeviceId, Bytes) + Send + Sync>>,
+    on_p2c_notify: Option<Box<dyn Fn(DeviceId, Bytes) + Send + Sync>>,
     psm_responses: VecDeque<Option<u16>>,
     version_responses: VecDeque<Option<u8>>,
     mtu_responses: VecDeque<u16>,
@@ -142,11 +142,11 @@ impl MockBleInterface {
         self.inner.lock().unwrap().connect_delay = Some(delay);
     }
 
-    pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(Bytes) + Send + Sync>) {
+    pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
         self.inner.lock().unwrap().on_c2p_write = Some(hook);
     }
 
-    pub fn set_on_p2c_notify(&self, hook: Box<dyn Fn(Bytes) + Send + Sync>) {
+    pub fn set_on_p2c_notify(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
         self.inner.lock().unwrap().on_p2c_notify = Some(hook);
     }
 
@@ -242,7 +242,7 @@ impl BleInterface for MockBleInterface {
         }
         let hook = self.inner.lock().unwrap().on_c2p_write.take();
         if let Some(h) = hook.as_ref() {
-            h(bytes);
+            h(device_id.clone(), bytes);
         }
         if let Some(h) = hook {
             self.inner.lock().unwrap().on_c2p_write = Some(h);
@@ -268,7 +268,7 @@ impl BleInterface for MockBleInterface {
         }
         let hook = self.inner.lock().unwrap().on_p2c_notify.take();
         if let Some(h) = hook.as_ref() {
-            h(bytes);
+            h(device_id.clone(), bytes);
         }
         if let Some(h) = hook {
             self.inner.lock().unwrap().on_p2c_notify = Some(h);
@@ -383,7 +383,7 @@ impl MockFabricPair {
         {
             let inbox = peripheral_inbox.clone();
             let from = central_as_device.clone();
-            central.set_on_c2p_write(Box::new(move |bytes| {
+            central.set_on_c2p_write(Box::new(move |_target, bytes| {
                 let cmd = crate::transport::peer::PeerCommand::InboundGattFragment {
                     device_id: from.clone(),
                     source: crate::transport::peer::FragmentSource::PeripheralReceivedC2p,
@@ -395,7 +395,7 @@ impl MockFabricPair {
         {
             let inbox = central_inbox.clone();
             let from = peripheral_as_device.clone();
-            peripheral.set_on_p2c_notify(Box::new(move |bytes| {
+            peripheral.set_on_p2c_notify(Box::new(move |_target, bytes| {
                 let cmd = crate::transport::peer::PeerCommand::InboundGattFragment {
                     device_id: from.clone(),
                     source: crate::transport::peer::FragmentSource::CentralReceivedP2c,
@@ -475,7 +475,7 @@ mod tests {
         let mock = MockBleInterface::new();
         let captured = Arc::new(Mutex::new(Vec::<Bytes>::new()));
         let sink = Arc::clone(&captured);
-        mock.set_on_c2p_write(Box::new(move |b| {
+        mock.set_on_c2p_write(Box::new(move |_target, b| {
             sink.lock().unwrap().push(b);
         }));
         mock.write_c2p(&DeviceId::from("peer-x"), Bytes::from_static(b"payload"))
@@ -491,7 +491,7 @@ mod tests {
         let mock = MockBleInterface::new();
         let captured = Arc::new(Mutex::new(Vec::<Bytes>::new()));
         let sink = Arc::clone(&captured);
-        mock.set_on_p2c_notify(Box::new(move |b| {
+        mock.set_on_p2c_notify(Box::new(move |_target, b| {
             sink.lock().unwrap().push(b);
         }));
         mock.notify_p2c(&DeviceId::from("peer-y"), Bytes::from_static(b"notify"))
