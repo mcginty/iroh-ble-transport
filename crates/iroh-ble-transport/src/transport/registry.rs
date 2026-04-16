@@ -707,6 +707,70 @@ impl Registry {
                     )));
                 }
             }
+            PeerCommand::InboundL2capChannel { device_id, channel } => {
+                use std::collections::hash_map::Entry;
+                match self.peers.entry(device_id.clone()) {
+                    Entry::Vacant(v) => {
+                        let mut e = PeerEntry::new(device_id.clone());
+                        e.role = crate::transport::peer::ConnectRole::Peripheral;
+                        e.tx_gen = 1;
+                        e.l2cap_channel = Some(channel);
+                        e.phase = PeerPhase::Connected {
+                            since: now,
+                            channel: crate::transport::peer::ChannelHandle {
+                                id: 0,
+                                path: crate::transport::peer::ConnectPath::L2cap,
+                            },
+                            tx_gen: 1,
+                        };
+                        v.insert(e);
+                        actions.push(PeerAction::StartDataPipe {
+                            device_id: device_id.clone(),
+                            role: crate::transport::peer::ConnectRole::Peripheral,
+                            path: crate::transport::peer::ConnectPath::L2cap,
+                        });
+                    }
+                    Entry::Occupied(o) => {
+                        let entry = o.into_mut();
+                        if entry.pipe.is_some() {
+                            let existing_path = match &entry.phase {
+                                PeerPhase::Connected { channel, .. } => Some(channel.path),
+                                _ => None,
+                            };
+                            match existing_path {
+                                Some(crate::transport::peer::ConnectPath::L2cap) => {
+                                    actions.push(PeerAction::EmitMetric(
+                                        "l2cap_duplicate_accept".into(),
+                                    ));
+                                }
+                                _ => {
+                                    actions.push(PeerAction::EmitMetric(
+                                        "l2cap_late_accept_after_gatt".into(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            entry.l2cap_channel = Some(channel);
+                            entry.tx_gen += 1;
+                            let tx_gen = entry.tx_gen;
+                            entry.phase = PeerPhase::Connected {
+                                since: now,
+                                channel: crate::transport::peer::ChannelHandle {
+                                    id: 0,
+                                    path: crate::transport::peer::ConnectPath::L2cap,
+                                },
+                                tx_gen,
+                            };
+                            let role = entry.role;
+                            actions.push(PeerAction::StartDataPipe {
+                                device_id: device_id.clone(),
+                                role,
+                                path: crate::transport::peer::ConnectPath::L2cap,
+                            });
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         actions
@@ -2488,5 +2552,91 @@ mod tests {
             reg.peer(&device_id).unwrap().phase,
             PeerPhase::Handshaking { .. }
         ));
+    }
+
+    #[test]
+    fn inbound_l2cap_channel_creates_peripheral_entry_with_l2cap_path() {
+        use crate::transport::peer::{ConnectPath, ConnectRole};
+
+        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-l2cap-inbound");
+        let (ch_a, _ch_b) = blew::L2capChannel::pair(8192);
+        let actions = reg.handle(PeerCommand::InboundL2capChannel {
+            device_id: device_id.clone(),
+            channel: ch_a,
+        });
+
+        let entry = reg.peer(&device_id).unwrap();
+        assert_eq!(entry.role, ConnectRole::Peripheral);
+        assert_eq!(entry.tx_gen, 1);
+        assert!(entry.l2cap_channel.is_some());
+        match &entry.phase {
+            PeerPhase::Connected { channel, tx_gen, .. } => {
+                assert_eq!(channel.path, ConnectPath::L2cap);
+                assert_eq!(*tx_gen, 1);
+            }
+            other => panic!("expected Connected(L2cap), got {other:?}"),
+        }
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::StartDataPipe {
+                    role: ConnectRole::Peripheral,
+                    path: ConnectPath::L2cap,
+                    device_id: d,
+                } if *d == device_id
+            )),
+            "expected StartDataPipe(L2cap, Peripheral); got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn inbound_l2cap_channel_dropped_when_gatt_pipe_exists() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PendingSend, PipeHandles};
+
+        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-l2cap-dup");
+
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(4);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.tx_gen = 3;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 3,
+            };
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+            });
+            e
+        });
+
+        let (ch, _other) = blew::L2capChannel::pair(8192);
+        let actions = reg.handle(PeerCommand::InboundL2capChannel {
+            device_id: device_id.clone(),
+            channel: ch,
+        });
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::EmitMetric(s) if s == "l2cap_late_accept_after_gatt"
+            )),
+            "expected l2cap_late_accept_after_gatt metric; got {actions:?}"
+        );
+        match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Connected { channel, tx_gen, .. } => {
+                assert_eq!(channel.path, ConnectPath::Gatt, "path unchanged");
+                assert_eq!(*tx_gen, 3, "tx_gen unchanged");
+            }
+            other => panic!("expected Connected(Gatt) unchanged, got {other:?}"),
+        }
     }
 }
