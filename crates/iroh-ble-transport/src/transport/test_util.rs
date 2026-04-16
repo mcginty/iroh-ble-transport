@@ -40,6 +40,7 @@ struct Inner {
     next_channel_id: u64,
     on_c2p_write: Option<Box<dyn Fn(Bytes) + Send + Sync>>,
     on_p2c_notify: Option<Box<dyn Fn(Bytes) + Send + Sync>>,
+    psm_responses: VecDeque<Option<u16>>,
     mtu_responses: VecDeque<u16>,
     mtu_default: u16,
 }
@@ -73,6 +74,7 @@ impl MockBleInterface {
                 next_channel_id: 1,
                 on_c2p_write: None,
                 on_p2c_notify: None,
+                psm_responses: VecDeque::new(),
                 mtu_responses: VecDeque::new(),
                 mtu_default: 512,
             })),
@@ -124,6 +126,10 @@ impl MockBleInterface {
     /// Fallback returned by `mtu()` when no queued responses remain.
     pub fn set_mtu_default(&self, value: u16) {
         self.inner.lock().unwrap().mtu_default = value;
+    }
+
+    pub fn seed_psm(&self, psm: Option<u16>) {
+        self.inner.lock().unwrap().psm_responses.push_back(psm);
     }
 
     pub fn assert_called(&self, kind: &CallKind) {
@@ -209,12 +215,9 @@ impl BleInterface for MockBleInterface {
     }
 
     async fn read_psm(&self, device_id: &DeviceId) -> BleResult<Option<u16>> {
-        self.inner
-            .lock()
-            .unwrap()
-            .calls
-            .push(CallKind::ReadPsm(device_id.clone()));
-        Ok(None)
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(CallKind::ReadPsm(device_id.clone()));
+        Ok(inner.psm_responses.pop_front().flatten())
     }
 
     async fn open_l2cap(&self, device_id: &DeviceId, psm: u16) -> BleResult<L2capChannel> {

@@ -28,7 +28,7 @@ async fn mock_l2cap_full_round_trip() {
     let accept_fut = listener.next();
     let (central_side, accepted) = tokio::join!(open_fut, accept_fut);
     let mut central_side = central_side.unwrap();
-    let mut periph_side = accepted.unwrap().unwrap();
+    let (_accepted_device_id, mut periph_side) = accepted.unwrap().unwrap();
 
     central_side.write_all(b"hello").await.unwrap();
     let mut buf = [0_u8; 5];
