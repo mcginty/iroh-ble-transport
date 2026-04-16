@@ -729,6 +729,184 @@ async fn connect_failure_retries_on_next_tick() {
     .expect("peer did not reach Connected or Handshaking after retry");
 }
 
+#[tokio::test]
+async fn l2cap_prefer_succeeds_and_connects_via_l2cap() {
+    use iroh_ble_transport::transport::registry::PhaseKind;
+
+    let iface = Arc::new(MockBleInterface::new());
+    let device_id = blew::DeviceId::from("dev-l2cap-ok");
+
+    // Seed successful GATT connect.
+    iface.on_connect(
+        device_id.clone(),
+        Ok(ChannelHandle {
+            id: 20,
+            path: ConnectPath::Gatt,
+        }),
+    );
+    // Seed PSM response.
+    iface.seed_psm(Some(128));
+    // Seed L2CAP open success.
+    let (l2cap_channel, _other) = blew::L2capChannel::pair(8192);
+    iface.on_open_l2cap(device_id.clone(), 128, Ok(l2cap_channel));
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+    );
+    let reg = Registry::new(L2capPolicy::PreferL2cap);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(rx, driver, snap_for_actor).await;
+    });
+
+    let prefix: KeyPrefix = [0xCCu8; KEY_PREFIX_LEN];
+    tx.send(PeerCommand::Advertised {
+        prefix,
+        device: blew::BleDevice {
+            id: device_id.clone(),
+            name: None,
+            rssi: None,
+            services: vec![],
+        },
+        rssi: None,
+    })
+    .await
+    .unwrap();
+
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
+    let waker = waker_from_channel(waker_tx);
+    tx.send(PeerCommand::SendDatagram {
+        device_id: device_id.clone(),
+        tx_gen: 0,
+        datagram: bytes::Bytes::from_static(b"l2cap-ping"),
+        waker,
+    })
+    .await
+    .unwrap();
+
+    // Wait for the OpenL2cap call to the mock.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if iface
+                .calls()
+                .iter()
+                .any(|c| matches!(c, CallKind::OpenL2cap(_, 128)))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("expected OpenL2cap(_, 128) call");
+
+    // Wait for peer to reach Connected via L2CAP path.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let maps = snapshots.load();
+            if let Some(state) = maps.peer_states.get(&device_id) {
+                if state.phase_kind == PhaseKind::Connected
+                    && state.connect_path == Some(ConnectPath::L2cap)
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer did not reach Connected with L2CAP path");
+}
+
+#[tokio::test]
+async fn l2cap_prefer_fallback_to_gatt_on_failure() {
+    use iroh_ble_transport::error::BleError;
+    use iroh_ble_transport::transport::registry::PhaseKind;
+
+    let iface = Arc::new(MockBleInterface::new());
+    let device_id = blew::DeviceId::from("dev-l2cap-fallback");
+
+    // Seed successful GATT connect.
+    iface.on_connect(
+        device_id.clone(),
+        Ok(ChannelHandle {
+            id: 30,
+            path: ConnectPath::Gatt,
+        }),
+    );
+    // Seed PSM response.
+    iface.seed_psm(Some(128));
+    // Seed L2CAP open failure.
+    iface.on_open_l2cap(device_id.clone(), 128, Err(BleError::Unsupported));
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+    );
+    let reg = Registry::new(L2capPolicy::PreferL2cap);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(rx, driver, snap_for_actor).await;
+    });
+
+    let prefix: KeyPrefix = [0xDDu8; KEY_PREFIX_LEN];
+    tx.send(PeerCommand::Advertised {
+        prefix,
+        device: blew::BleDevice {
+            id: device_id.clone(),
+            name: None,
+            rssi: None,
+            services: vec![],
+        },
+        rssi: None,
+    })
+    .await
+    .unwrap();
+
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
+    let waker = waker_from_channel(waker_tx);
+    tx.send(PeerCommand::SendDatagram {
+        device_id: device_id.clone(),
+        tx_gen: 0,
+        datagram: bytes::Bytes::from_static(b"gatt-fallback"),
+        waker,
+    })
+    .await
+    .unwrap();
+
+    // Wait for peer to reach Connected via GATT (L2CAP fallback).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let maps = snapshots.load();
+            if let Some(state) = maps.peer_states.get(&device_id) {
+                if state.phase_kind == PhaseKind::Connected
+                    && state.connect_path == Some(ConnectPath::Gatt)
+                {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer did not reach Connected with GATT fallback path");
+}
+
 enum CallKindMatcher {
     Connect,
     Disconnect,
