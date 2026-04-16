@@ -34,12 +34,19 @@
     ],
     "android": {
       "autoIncrementVersionCode": true
+    },
+    "iOS": {
+      "bundleVersion": "49"
     }
   },
   "plugins": {
     "deep-link": {
       "mobile": [
-        { "scheme": ["iroh-ble-chat"] }
+        {
+          "scheme": [
+            "iroh-ble-chat"
+          ]
+        }
       ]
     }
   }
