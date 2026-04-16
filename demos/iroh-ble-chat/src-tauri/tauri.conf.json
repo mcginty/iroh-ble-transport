@@ -1,7 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "iroh-ble-chat",
-  "version": "0.1.0",
   "identifier": "org.jakebot.iroh-ble-chat",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -31,7 +30,10 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "android": {
+      "autoIncrementVersionCode": true
+    }
   },
   "plugins": {
     "deep-link": {
