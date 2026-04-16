@@ -179,7 +179,13 @@ impl Registry {
                                 }
                                 Err(tokio::sync::mpsc::error::TrySendError::Closed(send)) => {
                                     entry.pipe = None;
+                                    let waker = send.waker.clone();
                                     entry.pending_sends.push_back(send);
+                                    actions.push(PeerAction::AckSend {
+                                        tx_gen,
+                                        waker,
+                                        result: Ok(()),
+                                    });
                                 }
                             }
                         } else {
@@ -2002,13 +2008,66 @@ mod tests {
             waker: noop_waker(),
         });
 
-        assert!(actions.is_empty());
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::AckSend { result: Ok(()), .. }))
+        );
         assert!(reg.peer(&device_id).unwrap().pipe.is_none());
         assert_eq!(reg.peer(&device_id).unwrap().pending_sends.len(), 1);
         assert_eq!(
             &reg.peer(&device_id).unwrap().pending_sends[0].datagram[..],
             b"fallback"
         );
+    }
+
+    #[tokio::test]
+    async fn send_datagram_pipe_closed_acks_and_buffers() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PendingSend, PipeHandles};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-52");
+        {
+            let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(4);
+            let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+            reg.peers.insert(device_id.clone(), {
+                let mut e = PeerEntry::new(device_id.clone());
+                e.tx_gen = 7;
+                e.phase = PeerPhase::Connected {
+                    since: std::time::Instant::now(),
+                    channel: ChannelHandle {
+                        id: 3,
+                        path: ConnectPath::Gatt,
+                    },
+                    tx_gen: 7,
+                };
+                e.pipe = Some(PipeHandles {
+                    outbound_tx,
+                    inbound_tx,
+                });
+                e
+            });
+        }
+
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            tx_gen: 7,
+            datagram: bytes::Bytes::from_static(b"closed"),
+            waker: noop_waker(),
+        });
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::AckSend { result: Ok(()), .. })),
+            "expected AckSend(Ok) when pipe is closed"
+        );
+        assert_eq!(reg.peer(&device_id).unwrap().pending_sends.len(), 1);
+        assert_eq!(
+            &reg.peer(&device_id).unwrap().pending_sends[0].datagram[..],
+            b"closed"
+        );
+        assert!(reg.peer(&device_id).unwrap().pipe.is_none());
     }
 
     #[test]
