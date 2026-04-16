@@ -9,8 +9,8 @@ use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{ChannelHandle, ConnectPath, KEY_PREFIX_LEN, KeyPrefix, PeerCommand},
     registry::{Registry, SnapshotMaps},
-    transport::L2capPolicy,
     test_util::{CallKind, MockBleInterface},
+    transport::L2capPolicy,
 };
 use tokio::sync::mpsc;
 

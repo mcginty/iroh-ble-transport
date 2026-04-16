@@ -191,10 +191,11 @@ pub async fn run_peripheral_events(
 }
 
 pub async fn run_l2cap_accept(
-    mut listener: impl tokio_stream::Stream<Item = blew::error::BlewResult<(blew::DeviceId, blew::L2capChannel)>>
-        + Send
-        + Unpin
-        + 'static,
+    mut listener: impl tokio_stream::Stream<
+        Item = blew::error::BlewResult<(blew::DeviceId, blew::L2capChannel)>,
+    > + Send
+    + Unpin
+    + 'static,
     inbox: mpsc::Sender<PeerCommand>,
 ) {
     use tokio_stream::StreamExt as _;

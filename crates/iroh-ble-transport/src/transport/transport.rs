@@ -40,29 +40,16 @@ const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2
 
 const KEY_UUID_PREFIX: [u8; 4] = [0x69, 0x72, 0x6f, 0x00];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum L2capPolicy {
     Disabled,
+    #[default]
     PreferL2cap,
 }
 
-impl Default for L2capPolicy {
-    fn default() -> Self {
-        Self::PreferL2cap
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct BleTransportConfig {
     pub l2cap_policy: L2capPolicy,
-}
-
-impl Default for BleTransportConfig {
-    fn default() -> Self {
-        Self {
-            l2cap_policy: L2capPolicy::default(),
-        }
-    }
 }
 
 fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {

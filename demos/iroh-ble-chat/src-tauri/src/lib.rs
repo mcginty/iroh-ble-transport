@@ -9,7 +9,9 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_ble_transport::transport::BleTransport;
-use iroh_ble_transport::{BlePeerInfo, BlePeerPhase, Central, CentralConfig, ConnectPath, Peripheral};
+use iroh_ble_transport::{
+    BlePeerInfo, BlePeerPhase, Central, CentralConfig, ConnectPath, Peripheral,
+};
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
 use n0_future::StreamExt;
@@ -584,10 +586,13 @@ impl BlePeerDebugUI {
             device_id: info.device_id.to_string(),
             phase: ble_phase_str(info.phase).to_string(),
             consecutive_failures: info.consecutive_failures,
-            path: info.connect_path.map(|p| match p {
-                ConnectPath::Gatt => "gatt",
-                ConnectPath::L2cap => "l2cap",
-            }.to_string()),
+            path: info.connect_path.map(|p| {
+                match p {
+                    ConnectPath::Gatt => "gatt",
+                    ConnectPath::L2cap => "l2cap",
+                }
+                .to_string()
+            }),
         }
     }
 }

@@ -457,7 +457,9 @@ impl Registry {
             }
             PeerCommand::Tick(tick_now) => {
                 enum TickAction {
-                    StartConnect { attempt: u32 },
+                    StartConnect {
+                        attempt: u32,
+                    },
                     DrainingToDead,
                     RestoringToDead,
                     HandshakingL2capTimeout {
@@ -551,9 +553,8 @@ impl Registry {
                                 path: crate::transport::peer::ConnectPath::Gatt,
                                 l2cap_channel: None,
                             });
-                            actions.push(PeerAction::EmitMetric(
-                                "l2cap_handshaking_timeout".into(),
-                            ));
+                            actions
+                                .push(PeerAction::EmitMetric("l2cap_handshaking_timeout".into()));
                         }
                     }
                 }
@@ -2410,14 +2411,19 @@ mod tests {
 
         let entry = reg.peer(&device_id).unwrap();
         match &entry.phase {
-            PeerPhase::Connected { channel, tx_gen, .. } => {
+            PeerPhase::Connected {
+                channel, tx_gen, ..
+            } => {
                 assert_eq!(channel.path, ConnectPath::L2cap);
                 assert_eq!(channel.id, 42);
                 assert_eq!(*tx_gen, 2);
             }
             other => panic!("expected Connected(L2cap), got {other:?}"),
         }
-        assert!(entry.l2cap_channel.is_none(), "l2cap_channel should be taken into StartDataPipe");
+        assert!(
+            entry.l2cap_channel.is_none(),
+            "l2cap_channel should be taken into StartDataPipe"
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -2459,7 +2465,9 @@ mod tests {
 
         let entry = reg.peer(&device_id).unwrap();
         match &entry.phase {
-            PeerPhase::Connected { channel, tx_gen, .. } => {
+            PeerPhase::Connected {
+                channel, tx_gen, ..
+            } => {
                 assert_eq!(channel.path, ConnectPath::Gatt);
                 assert_eq!(*tx_gen, 2);
             }
@@ -2511,7 +2519,9 @@ mod tests {
 
         let entry = reg.peer(&device_id).unwrap();
         match &entry.phase {
-            PeerPhase::Connected { channel, tx_gen, .. } => {
+            PeerPhase::Connected {
+                channel, tx_gen, ..
+            } => {
                 assert_eq!(channel.path, ConnectPath::Gatt);
                 assert_eq!(*tx_gen, 2);
             }
@@ -2579,9 +2589,14 @@ mod tests {
         let entry = reg.peer(&device_id).unwrap();
         assert_eq!(entry.role, ConnectRole::Peripheral);
         assert_eq!(entry.tx_gen, 1);
-        assert!(entry.l2cap_channel.is_none(), "l2cap_channel should be taken into StartDataPipe");
+        assert!(
+            entry.l2cap_channel.is_none(),
+            "l2cap_channel should be taken into StartDataPipe"
+        );
         match &entry.phase {
-            PeerPhase::Connected { channel, tx_gen, .. } => {
+            PeerPhase::Connected {
+                channel, tx_gen, ..
+            } => {
                 assert_eq!(channel.path, ConnectPath::L2cap);
                 assert_eq!(*tx_gen, 1);
             }
@@ -2643,7 +2658,9 @@ mod tests {
             "expected l2cap_late_accept_after_gatt metric; got {actions:?}"
         );
         match &reg.peer(&device_id).unwrap().phase {
-            PeerPhase::Connected { channel, tx_gen, .. } => {
+            PeerPhase::Connected {
+                channel, tx_gen, ..
+            } => {
                 assert_eq!(channel.path, ConnectPath::Gatt, "path unchanged");
                 assert_eq!(*tx_gen, 3, "tx_gen unchanged");
             }
