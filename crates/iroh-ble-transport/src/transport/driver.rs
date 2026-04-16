@@ -77,29 +77,22 @@ impl<I: BleInterface> Driver<I> {
                 let inbox = self.inbox.clone();
                 let dev_for_msg = device_id.clone();
                 tokio::spawn(async move {
-                    let psm = match iface.read_psm(&device_id).await {
-                        Ok(Some(psm)) => psm,
-                        Ok(None) => {
-                            let _ = inbox
-                                .send(PeerCommand::OpenL2capFailed {
-                                    device_id: dev_for_msg,
-                                    error: "no psm advertised".into(),
-                                })
-                                .await;
-                            return;
-                        }
-                        Err(e) => {
-                            let _ = inbox
-                                .send(PeerCommand::OpenL2capFailed {
-                                    device_id: dev_for_msg,
-                                    error: format!("read_psm: {e}"),
-                                })
-                                .await;
-                            return;
-                        }
-                    };
-                    match iface.open_l2cap(&device_id, psm).await {
-                        Ok(channel) => {
+                    const L2CAP_SELECT_TIMEOUT: std::time::Duration =
+                        std::time::Duration::from_millis(1500);
+                    let result = tokio::time::timeout(L2CAP_SELECT_TIMEOUT, async {
+                        let psm = match iface.read_psm(&device_id).await {
+                            Ok(Some(psm)) => psm,
+                            Ok(None) => return Err("no psm advertised".to_string()),
+                            Err(e) => return Err(format!("read_psm: {e}")),
+                        };
+                        iface
+                            .open_l2cap(&device_id, psm)
+                            .await
+                            .map_err(|e| format!("{e}"))
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(channel)) => {
                             let _ = inbox
                                 .send(PeerCommand::OpenL2capSucceeded {
                                     device_id: dev_for_msg,
@@ -107,11 +100,19 @@ impl<I: BleInterface> Driver<I> {
                                 })
                                 .await;
                         }
-                        Err(e) => {
+                        Ok(Err(error)) => {
                             let _ = inbox
                                 .send(PeerCommand::OpenL2capFailed {
                                     device_id: dev_for_msg,
-                                    error: format!("{e}"),
+                                    error,
+                                })
+                                .await;
+                        }
+                        Err(_elapsed) => {
+                            let _ = inbox
+                                .send(PeerCommand::OpenL2capFailed {
+                                    device_id: dev_for_msg,
+                                    error: "l2cap select timeout".into(),
                                 })
                                 .await;
                         }
@@ -159,7 +160,12 @@ impl<I: BleInterface> Driver<I> {
                 tracing::trace!(metric = %ev, "peer metric");
             }
 
-            PeerAction::StartDataPipe { device_id, role, path } => {
+            PeerAction::StartDataPipe {
+                device_id,
+                role,
+                path,
+                l2cap_channel,
+            } => {
                 tracing::debug!(device = %device_id, ?role, ?path, "StartDataPipe");
                 let (outbound_tx, outbound_rx) =
                     mpsc::channel::<crate::transport::peer::PendingSend>(32);
@@ -175,6 +181,8 @@ impl<I: BleInterface> Driver<I> {
                         iface,
                         device_id,
                         role,
+                        path,
+                        l2cap_channel,
                         outbound_rx,
                         inbound_rx,
                         incoming_tx,
@@ -409,6 +417,7 @@ mod tests {
                 device_id: blew::DeviceId::from("start-pipe"),
                 role: ConnectRole::Central,
                 path: ConnectPath::Gatt,
+                l2cap_channel: None,
             })
             .await;
 

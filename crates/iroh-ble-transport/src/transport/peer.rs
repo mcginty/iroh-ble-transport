@@ -263,6 +263,7 @@ pub enum PeerAction {
         device_id: DeviceId,
         role: ConnectRole,
         path: ConnectPath,
+        l2cap_channel: Option<L2capChannel>,
     },
     EmitMetric(String),
 }
@@ -314,6 +315,7 @@ mod tests {
             device_id: DeviceId::from("x"),
             role: ConnectRole::Central,
             path: ConnectPath::Gatt,
+            l2cap_channel: None,
         };
     }
 }

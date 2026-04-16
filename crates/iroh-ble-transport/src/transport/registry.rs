@@ -262,6 +262,7 @@ impl Registry {
                                 device_id: device_id.clone(),
                                 role,
                                 path: crate::transport::peer::ConnectPath::Gatt,
+                                l2cap_channel: None,
                             });
                         }
                     }
@@ -324,6 +325,7 @@ impl Registry {
                         device_id: device_id.clone(),
                         role: crate::transport::peer::ConnectRole::Peripheral,
                         path: crate::transport::peer::ConnectPath::Gatt,
+                        l2cap_channel: None,
                     });
                     return actions;
                 }
@@ -347,6 +349,7 @@ impl Registry {
                         device_id: device_id.clone(),
                         role,
                         path: crate::transport::peer::ConnectPath::Gatt,
+                        l2cap_channel: None,
                     });
                     return actions;
                 }
@@ -387,6 +390,7 @@ impl Registry {
                     device_id: device_id.clone(),
                     role: crate::transport::peer::ConnectRole::Peripheral,
                     path: crate::transport::peer::ConnectPath::Gatt,
+                    l2cap_channel: None,
                 });
             }
             PeerCommand::CentralDisconnected { device_id, cause } => {
@@ -545,6 +549,7 @@ impl Registry {
                                 device_id: device_id.clone(),
                                 role,
                                 path: crate::transport::peer::ConnectPath::Gatt,
+                                l2cap_channel: None,
                             });
                             actions.push(PeerAction::EmitMetric(
                                 "l2cap_handshaking_timeout".into(),
@@ -678,6 +683,7 @@ impl Registry {
                         device_id: device_id.clone(),
                         role,
                         path: crate::transport::peer::ConnectPath::L2cap,
+                        l2cap_channel: entry.l2cap_channel.take(),
                     });
                 }
             }
@@ -701,6 +707,7 @@ impl Registry {
                         device_id: device_id.clone(),
                         role,
                         path: crate::transport::peer::ConnectPath::Gatt,
+                        l2cap_channel: None,
                     });
                     actions.push(PeerAction::EmitMetric(format!(
                         "l2cap_fallback_to_gatt:{error}"
@@ -723,11 +730,12 @@ impl Registry {
                             },
                             tx_gen: 1,
                         };
-                        v.insert(e);
+                        let inserted = v.insert(e);
                         actions.push(PeerAction::StartDataPipe {
                             device_id: device_id.clone(),
                             role: crate::transport::peer::ConnectRole::Peripheral,
                             path: crate::transport::peer::ConnectPath::L2cap,
+                            l2cap_channel: inserted.l2cap_channel.take(),
                         });
                     }
                     Entry::Occupied(o) => {
@@ -766,6 +774,7 @@ impl Registry {
                                 device_id: device_id.clone(),
                                 role,
                                 path: crate::transport::peer::ConnectPath::L2cap,
+                                l2cap_channel: entry.l2cap_channel.take(),
                             });
                         }
                     }
@@ -2408,16 +2417,17 @@ mod tests {
             }
             other => panic!("expected Connected(L2cap), got {other:?}"),
         }
-        assert!(entry.l2cap_channel.is_some());
+        assert!(entry.l2cap_channel.is_none(), "l2cap_channel should be taken into StartDataPipe");
         assert!(
             actions.iter().any(|a| matches!(
                 a,
                 PeerAction::StartDataPipe {
                     path: ConnectPath::L2cap,
+                    l2cap_channel: Some(_),
                     ..
                 }
             )),
-            "expected StartDataPipe(L2cap); got {actions:?}"
+            "expected StartDataPipe(L2cap) with channel; got {actions:?}"
         );
     }
 
@@ -2569,7 +2579,7 @@ mod tests {
         let entry = reg.peer(&device_id).unwrap();
         assert_eq!(entry.role, ConnectRole::Peripheral);
         assert_eq!(entry.tx_gen, 1);
-        assert!(entry.l2cap_channel.is_some());
+        assert!(entry.l2cap_channel.is_none(), "l2cap_channel should be taken into StartDataPipe");
         match &entry.phase {
             PeerPhase::Connected { channel, tx_gen, .. } => {
                 assert_eq!(channel.path, ConnectPath::L2cap);
@@ -2583,10 +2593,11 @@ mod tests {
                 PeerAction::StartDataPipe {
                     role: ConnectRole::Peripheral,
                     path: ConnectPath::L2cap,
+                    l2cap_channel: Some(_),
                     device_id: d,
                 } if *d == device_id
             )),
-            "expected StartDataPipe(L2cap, Peripheral); got {actions:?}"
+            "expected StartDataPipe(L2cap, Peripheral) with channel; got {actions:?}"
         );
     }
 
