@@ -52,9 +52,13 @@ run = "cargo fmt --all -- --check"
 description = "Check dependencies for license and vulnerability issues"
 run = "cargo deny check"
 
+[tasks."chat:typecheck"]
+description = "Type-check the chat app frontend (TypeScript)"
+run = "cd demos/iroh-ble-chat && pnpm install --frozen-lockfile && npx tsc --noEmit"
+
 [tasks.verify]
-description = "Pre-commit gate: fmt + lint + test + deny"
-depends = ["fmt", "lint", "test", "deny"]
+description = "Pre-commit gate: fmt + lint + test + deny + frontend typecheck"
+depends = ["fmt", "lint", "test", "deny", "chat:typecheck"]
 
 [tasks.clean]
 description = "Clean all build artifacts (Cargo, frontend, Android, iOS)"
