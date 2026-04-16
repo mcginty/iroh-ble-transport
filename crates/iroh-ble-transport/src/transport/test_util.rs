@@ -35,6 +35,9 @@ struct Inner {
     connect_queue: VecDeque<(DeviceId, BleResult<ChannelHandle>)>,
     /// Per-device FIFO queue of pre-seeded L2CAP channels; see `connect_queue` for invariant.
     open_l2cap_queue: VecDeque<(DeviceId, u16, BleResult<L2capChannel>)>,
+    disconnect_queue: VecDeque<(DeviceId, BleResult<()>)>,
+    write_c2p_queue: VecDeque<(DeviceId, BleResult<()>)>,
+    notify_p2c_queue: VecDeque<(DeviceId, BleResult<()>)>,
     is_powered: bool,
     connect_delay: Option<Duration>,
     next_channel_id: u64,
@@ -69,6 +72,9 @@ impl MockBleInterface {
                 calls: Vec::new(),
                 connect_queue: VecDeque::new(),
                 open_l2cap_queue: VecDeque::new(),
+                disconnect_queue: VecDeque::new(),
+                write_c2p_queue: VecDeque::new(),
+                notify_p2c_queue: VecDeque::new(),
                 is_powered: true,
                 connect_delay: None,
                 next_channel_id: 1,
@@ -90,6 +96,30 @@ impl MockBleInterface {
             .lock()
             .unwrap()
             .connect_queue
+            .push_back((device_id, result));
+    }
+
+    pub fn on_disconnect(&self, device_id: DeviceId, result: BleResult<()>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .disconnect_queue
+            .push_back((device_id, result));
+    }
+
+    pub fn on_write_c2p(&self, device_id: DeviceId, result: BleResult<()>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .write_c2p_queue
+            .push_back((device_id, result));
+    }
+
+    pub fn on_notify_p2c(&self, device_id: DeviceId, result: BleResult<()>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .notify_p2c_queue
             .push_back((device_id, result));
     }
 
@@ -170,21 +200,31 @@ impl BleInterface for MockBleInterface {
     }
 
     async fn disconnect(&self, device_id: &DeviceId) -> BleResult<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .calls
-            .push(CallKind::Disconnect(device_id.clone()));
-        Ok(())
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(CallKind::Disconnect(device_id.clone()));
+        inner
+            .disconnect_queue
+            .iter()
+            .position(|(id, _)| id == device_id)
+            .map(|pos| inner.disconnect_queue.remove(pos).unwrap().1)
+            .unwrap_or(Ok(()))
     }
 
     async fn write_c2p(&self, device_id: &DeviceId, bytes: Bytes) -> BleResult<()> {
-        {
+        let seeded = {
             let mut inner = self.inner.lock().unwrap();
             inner.calls.push(CallKind::WriteC2p {
                 device_id: device_id.clone(),
                 bytes: bytes.clone(),
             });
+            inner
+                .write_c2p_queue
+                .iter()
+                .position(|(id, _)| id == device_id)
+                .map(|pos| inner.write_c2p_queue.remove(pos).unwrap().1)
+        };
+        if let Some(result) = seeded {
+            return result;
         }
         let hook = self.inner.lock().unwrap().on_c2p_write.take();
         if let Some(h) = hook.as_ref() {
@@ -197,12 +237,20 @@ impl BleInterface for MockBleInterface {
     }
 
     async fn notify_p2c(&self, device_id: &DeviceId, bytes: Bytes) -> BleResult<()> {
-        {
+        let seeded = {
             let mut inner = self.inner.lock().unwrap();
             inner.calls.push(CallKind::NotifyP2c {
                 device_id: device_id.clone(),
                 bytes: bytes.clone(),
             });
+            inner
+                .notify_p2c_queue
+                .iter()
+                .position(|(id, _)| id == device_id)
+                .map(|pos| inner.notify_p2c_queue.remove(pos).unwrap().1)
+        };
+        if let Some(result) = seeded {
+            return result;
         }
         let hook = self.inner.lock().unwrap().on_p2c_notify.take();
         if let Some(h) = hook.as_ref() {
@@ -462,5 +510,31 @@ mod tests {
             }
             other => panic!("expected InboundGattFragment, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn mock_seeded_connect_failure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mock = MockBleInterface::new();
+        let device = DeviceId::from("fail-dev");
+        mock.on_connect(device.clone(), Err(crate::error::BleError::AdapterOff));
+        let result = rt.block_on(mock.connect(&device));
+        assert!(matches!(result, Err(crate::error::BleError::AdapterOff)));
+    }
+
+    #[test]
+    fn mock_seeded_disconnect_failure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mock = MockBleInterface::new();
+        let device = DeviceId::from("fail-dev");
+        mock.on_disconnect(device.clone(), Err(crate::error::BleError::NotConnected));
+        let result = rt.block_on(mock.disconnect(&device));
+        assert!(matches!(result, Err(crate::error::BleError::NotConnected)));
     }
 }
