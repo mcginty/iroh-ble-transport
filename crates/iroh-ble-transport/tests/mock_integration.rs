@@ -625,6 +625,110 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     wait_for_call_count(&iface, CallKindMatcher::Connect, 2, Duration::from_secs(5)).await;
 }
 
+#[tokio::test]
+async fn connect_failure_retries_on_next_tick() {
+    use iroh_ble_transport::error::BleError;
+    use iroh_ble_transport::transport::registry::PhaseKind;
+
+    let iface = Arc::new(MockBleInterface::new());
+    let device_id = blew::DeviceId::from("dev-retry");
+
+    // First connect fails, second succeeds.
+    iface.on_connect(device_id.clone(), Err(BleError::AdapterOff));
+    iface.on_connect(
+        device_id.clone(),
+        Ok(ChannelHandle {
+            id: 10,
+            path: ConnectPath::Gatt,
+        }),
+    );
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+    );
+    let reg = Registry::new(L2capPolicy::Disabled);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(rx, driver, snap_for_actor).await;
+    });
+
+    let prefix: KeyPrefix = [9u8; KEY_PREFIX_LEN];
+    tx.send(PeerCommand::Advertised {
+        prefix,
+        device: blew::BleDevice {
+            id: device_id.clone(),
+            name: None,
+            rssi: None,
+            services: vec![],
+        },
+        rssi: None,
+    })
+    .await
+    .unwrap();
+
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
+    let waker = waker_from_channel(waker_tx);
+    tx.send(PeerCommand::SendDatagram {
+        device_id: device_id.clone(),
+        tx_gen: 0,
+        datagram: bytes::Bytes::from_static(b"retry-ping"),
+        waker,
+    })
+    .await
+    .unwrap();
+
+    // Wait for the first connect call (which fails).
+    wait_for_call_count(&iface, CallKindMatcher::Connect, 1, Duration::from_secs(5)).await;
+
+    // Peer should be in Reconnecting after the failed connect.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let maps = snapshots.load();
+            if let Some(state) = maps.peer_states.get(&device_id) {
+                if state.phase_kind == PhaseKind::Reconnecting {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer did not reach Reconnecting after first connect failure");
+
+    // Send a Tick with a future instant to bypass the backoff and trigger retry.
+    let future = std::time::Instant::now() + Duration::from_secs(120);
+    tx.send(PeerCommand::Tick(future)).await.unwrap();
+
+    // Wait for the second connect call (succeeds).
+    wait_for_call_count(&iface, CallKindMatcher::Connect, 2, Duration::from_secs(5)).await;
+
+    // Peer should reach Connected or Handshaking.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let maps = snapshots.load();
+            if let Some(state) = maps.peer_states.get(&device_id) {
+                if matches!(
+                    state.phase_kind,
+                    PhaseKind::Connected | PhaseKind::Handshaking
+                ) {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer did not reach Connected or Handshaking after retry");
+}
+
 enum CallKindMatcher {
     Connect,
     Disconnect,
