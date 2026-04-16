@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Xcode Cloud ci_post_clone script
-# Installs mise + toolchain and builds the frontend. The Rust static
-# library (libapp.a) is compiled by the Xcode build phase via
-# `tauri ios xcode-script`, which sources .xcode.env for PATH setup.
+# Installs mise + toolchain, builds the frontend, and cross-compiles
+# the Rust static library (libapp.a) so that Xcode Cloud's native
+# xcodebuild archive step only needs to link it.
 
 echo "==> Waiting for network/DNS readiness"
 for i in $(seq 1 30); do
@@ -44,7 +44,18 @@ pnpm build
 echo "==> Copying frontend dist into Xcode assets"
 cp -r "$CHAT_DIR/dist" "$CHAT_DIR/src-tauri/gen/apple/assets"
 
+echo "==> Building Rust static library for iOS"
+cd "$CHAT_DIR/src-tauri"
+export IPHONEOS_DEPLOYMENT_TARGET=16.0
+cargo build --release --target aarch64-apple-ios --lib --features tauri/custom-protocol
+
+echo "==> Copying libapp.a into Externals"
+EXTERNALS="$CI_PRIMARY_REPOSITORY_PATH/demos/iroh-ble-chat/src-tauri/gen/apple/Externals/arm64/release"
+mkdir -p "$EXTERNALS"
+cp "$CI_PRIMARY_REPOSITORY_PATH/target/aarch64-apple-ios/release/libiroh_ble_chat_lib.a" "$EXTERNALS/libapp.a"
+
 echo "==> Done. Toolchain versions:"
 rustc --version
 node --version
 pnpm --version
+ls -lh "$EXTERNALS/libapp.a"
