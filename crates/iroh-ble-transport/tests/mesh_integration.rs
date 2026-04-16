@@ -348,14 +348,6 @@ async fn one_peer_flapping_does_not_disturb_others() {
     );
 }
 
-// Captures a real registry isolation bug, not yet fixed. In
-// `handle_inbound_gatt_fragment` the "any other phase" branch re-promotes
-// `Restoring` entries back to `Connected` when an inbound fragment arrives.
-// After A flips its adapter off, B's and C's still-live pipes inject ACKs
-// into A's inbox and flip A's B/C entries back to `Connected`, defeating
-// the adapter-off drain. Remove `#[ignore]` once the registry stops
-// overriding `Restoring` from the inbound-fragment path.
-#[ignore = "known bug: Restoring entries are re-promoted by inbound fragments"]
 #[tokio::test(flavor = "multi_thread")]
 async fn adapter_off_on_one_node_does_not_evict_others() {
     use iroh_ble_transport::transport::registry::PhaseKind;

@@ -511,11 +511,19 @@ impl Registry {
             return;
         }
 
+        // Adapter is off on our side; peers whose pipes are still draining
+        // will keep injecting ACKs. Drop them instead of re-promoting the
+        // entry — `AdapterStateChanged { powered: true }` is the only legal
+        // path out of `Restoring`.
+        if matches!(entry.phase, PeerPhase::Restoring { .. }) {
+            return;
+        }
+
         // Any other phase (Discovered / Connecting / Reconnecting /
-        // Restoring / Draining / Dead / Unknown): the peer is actively
-        // writing to us, which is the strongest liveness signal we
-        // have. Override the stale phase and rebuild as a fresh
-        // peripheral Connected so the new pipe can be spun up.
+        // Draining / Dead / Unknown): the peer is actively writing to us,
+        // which is the strongest liveness signal we have. Override the
+        // stale phase and rebuild as a fresh peripheral Connected so the
+        // new pipe can be spun up.
         entry.pipe = None;
         entry.role = crate::transport::peer::ConnectRole::Peripheral;
         entry.tx_gen += 1;
