@@ -9,6 +9,7 @@ use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{ChannelHandle, ConnectPath, KEY_PREFIX_LEN, KeyPrefix, PeerCommand},
     registry::{Registry, SnapshotMaps},
+    transport::L2capPolicy,
     test_util::{CallKind, MockBleInterface},
 };
 use tokio::sync::mpsc;
@@ -40,7 +41,7 @@ async fn advertised_then_send_triggers_connect_and_ack() {
         retransmits,
         truncations,
     );
-    let reg = Registry::new();
+    let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor).await;
@@ -134,7 +135,7 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
         retransmits,
         truncations,
     );
-    let reg = Registry::new();
+    let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor).await;
@@ -239,7 +240,7 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         retransmits,
         truncations,
     );
-    let reg = Registry::new();
+    let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor).await;
@@ -323,8 +324,8 @@ async fn full_round_trip_over_mock_gatt() {
         p_truncations,
     );
 
-    let central_reg = Registry::new();
-    let peripheral_reg = Registry::new();
+    let central_reg = Registry::new(L2capPolicy::Disabled);
+    let peripheral_reg = Registry::new(L2capPolicy::Disabled);
     let cs = central_snapshots.clone();
     let ps = peripheral_snapshots.clone();
     tokio::spawn(async move {
@@ -403,8 +404,8 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         p_truncations,
     );
 
-    let central_reg = Registry::new();
-    let peripheral_reg = Registry::new();
+    let central_reg = Registry::new(L2capPolicy::Disabled);
+    let peripheral_reg = Registry::new(L2capPolicy::Disabled);
     let cs = central_snapshots.clone();
     let ps = peripheral_snapshots.clone();
     tokio::spawn(async move {
@@ -540,7 +541,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
         retransmits,
         truncations,
     );
-    let reg = Registry::new();
+    let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor).await;

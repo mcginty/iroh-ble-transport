@@ -14,8 +14,6 @@
 //! id on accept, so the accept-side path needs a separate strategy for
 //! tagging incoming frames before it can be wired into the driver.
 
-#![allow(dead_code)]
-
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

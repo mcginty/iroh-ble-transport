@@ -48,6 +48,7 @@ pub struct PeerEntry {
     pub role: ConnectRole,
     pub pipe: Option<PipeHandles>,
     pub rx_backlog: VecDeque<Bytes>,
+    pub l2cap_channel: Option<L2capChannel>,
 }
 
 impl PeerEntry {
@@ -64,6 +65,7 @@ impl PeerEntry {
             role: ConnectRole::Central,
             pipe: None,
             rx_backlog: VecDeque::new(),
+            l2cap_channel: None,
         }
     }
 }
@@ -129,6 +131,7 @@ pub enum PeerPhase {
     Handshaking {
         since: Instant,
         channel: ChannelHandle,
+        l2cap_deadline: Option<Instant>,
     },
     Connected {
         since: Instant,
@@ -259,6 +262,7 @@ pub enum PeerAction {
     StartDataPipe {
         device_id: DeviceId,
         role: ConnectRole,
+        path: ConnectPath,
     },
     EmitMetric(String),
 }
@@ -309,6 +313,7 @@ mod tests {
         let _act = PeerAction::StartDataPipe {
             device_id: DeviceId::from("x"),
             role: ConnectRole::Central,
+            path: ConnectPath::Gatt,
         };
     }
 }

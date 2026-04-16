@@ -40,6 +40,31 @@ const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2
 
 const KEY_UUID_PREFIX: [u8; 4] = [0x69, 0x72, 0x6f, 0x00];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L2capPolicy {
+    Disabled,
+    PreferL2cap,
+}
+
+impl Default for L2capPolicy {
+    fn default() -> Self {
+        Self::PreferL2cap
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BleTransportConfig {
+    pub l2cap_policy: L2capPolicy,
+}
+
+impl Default for BleTransportConfig {
+    fn default() -> Self {
+        Self {
+            l2cap_policy: L2capPolicy::default(),
+        }
+    }
+}
+
 fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
     let key = endpoint_id.as_bytes();
     let mut bytes = [0u8; 16];
@@ -183,7 +208,7 @@ impl BleTransport {
             Arc::clone(&truncations),
         );
 
-        let registry = Registry::new();
+        let registry = Registry::new(L2capPolicy::default());
         let snap_for_actor = Arc::clone(&snapshots);
         tokio::spawn(async move {
             registry.run(inbox_rx, driver, snap_for_actor).await;

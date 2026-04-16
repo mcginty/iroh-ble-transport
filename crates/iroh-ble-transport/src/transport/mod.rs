@@ -19,6 +19,6 @@ pub mod watchdog;
 pub mod test_util;
 
 pub use driver::IncomingPacket;
-pub use peer::{KEY_PREFIX_LEN, KeyPrefix};
+pub use peer::{ConnectPath, KEY_PREFIX_LEN, KeyPrefix};
 pub use store::{InMemoryPeerStore, PeerSnapshot, PeerStore};
-pub use transport::{BlePeerInfo, BlePeerPhase, BleTransport};
+pub use transport::{BleTransportConfig, BlePeerInfo, BlePeerPhase, BleTransport, L2capPolicy};

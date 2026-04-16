@@ -6,6 +6,9 @@ members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+blew = { path = "../../blew/crates/blew" }
+
 [workspace.metadata.release]
 consolidate-commits = false
 tag-message = "{{crate_name}}: release {{version}}"

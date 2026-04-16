@@ -159,8 +159,8 @@ impl<I: BleInterface> Driver<I> {
                 tracing::trace!(metric = %ev, "peer metric");
             }
 
-            PeerAction::StartDataPipe { device_id, role } => {
-                tracing::debug!(device = %device_id, ?role, "StartDataPipe");
+            PeerAction::StartDataPipe { device_id, role, path } => {
+                tracing::debug!(device = %device_id, ?role, ?path, "StartDataPipe");
                 let (outbound_tx, outbound_rx) =
                     mpsc::channel::<crate::transport::peer::PendingSend>(32);
                 let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(64);
@@ -391,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn start_data_pipe_spawns_pipe_and_emits_data_pipe_ready() {
-        use crate::transport::peer::ConnectRole;
+        use crate::transport::peer::{ConnectPath, ConnectRole};
 
         let iface = Arc::new(MockBleInterface::new());
         let (tx, mut rx) = mpsc::channel(16);
@@ -408,6 +408,7 @@ mod tests {
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("start-pipe"),
                 role: ConnectRole::Central,
+                path: ConnectPath::Gatt,
             })
             .await;
 

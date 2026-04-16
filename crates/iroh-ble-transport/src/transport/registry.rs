@@ -15,6 +15,7 @@ use crate::transport::driver::Driver;
 use crate::transport::interface::BleInterface;
 #[allow(unused_imports)]
 use crate::transport::peer::{PeerAction, PeerCommand, PeerEntry, PeerPhase};
+use crate::transport::transport::L2capPolicy;
 
 const MAX_CONNECT_ATTEMPTS: u32 = 15;
 const DRAINING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -24,17 +25,19 @@ const DEAD_GC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 #[derive(Debug)]
 pub struct Registry {
     peers: HashMap<DeviceId, PeerEntry>,
+    l2cap_policy: L2capPolicy,
 }
 
 impl Registry {
-    pub fn new() -> Self {
+    pub fn new(l2cap_policy: L2capPolicy) -> Self {
         Self {
             peers: HashMap::new(),
+            l2cap_policy,
         }
     }
 
     pub fn new_for_test() -> Self {
-        Self::new()
+        Self::new(L2capPolicy::Disabled)
     }
 
     pub fn handle(&mut self, cmd: PeerCommand) -> Vec<PeerAction> {
@@ -244,6 +247,7 @@ impl Registry {
                     actions.push(PeerAction::StartDataPipe {
                         device_id: device_id.clone(),
                         role,
+                        path: crate::transport::peer::ConnectPath::Gatt,
                     });
                 }
             }
@@ -303,6 +307,7 @@ impl Registry {
                     actions.push(PeerAction::StartDataPipe {
                         device_id: device_id.clone(),
                         role: crate::transport::peer::ConnectRole::Peripheral,
+                        path: crate::transport::peer::ConnectPath::Gatt,
                     });
                     return actions;
                 }
@@ -325,6 +330,7 @@ impl Registry {
                     actions.push(PeerAction::StartDataPipe {
                         device_id: device_id.clone(),
                         role,
+                        path: crate::transport::peer::ConnectPath::Gatt,
                     });
                     return actions;
                 }
@@ -364,6 +370,7 @@ impl Registry {
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
                     role: crate::transport::peer::ConnectRole::Peripheral,
+                    path: crate::transport::peer::ConnectPath::Gatt,
                 });
             }
             PeerCommand::CentralDisconnected { device_id, cause } => {
@@ -630,12 +637,17 @@ impl Registry {
     pub(crate) fn publish_snapshot(&self, target: &ArcSwap<SnapshotMaps>) {
         let mut maps = SnapshotMaps::default();
         for (device_id, entry) in &self.peers {
+            let connect_path = match &entry.phase {
+                PeerPhase::Connected { channel, .. } => Some(channel.path),
+                _ => None,
+            };
             maps.peer_states.insert(
                 device_id.clone(),
                 PeerStateSummary {
                     phase_kind: PhaseKind::from(&entry.phase),
                     tx_gen: entry.tx_gen,
                     consecutive_failures: entry.consecutive_failures,
+                    connect_path,
                 },
             );
         }
@@ -664,7 +676,7 @@ impl Registry {
 
 impl Default for Registry {
     fn default() -> Self {
-        Self::new()
+        Self::new(L2capPolicy::default())
     }
 }
 
@@ -684,6 +696,7 @@ pub struct PeerStateSummary {
     pub phase_kind: PhaseKind,
     pub tx_gen: u64,
     pub consecutive_failures: u32,
+    pub connect_path: Option<crate::transport::peer::ConnectPath>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -905,6 +918,7 @@ mod tests {
                     id: 1,
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
+                l2cap_deadline: None,
             };
             e
         });
@@ -1373,6 +1387,7 @@ mod tests {
                     id: 99,
                     path: crate::transport::peer::ConnectPath::L2cap,
                 },
+                l2cap_deadline: None,
             };
             e
         });
@@ -1624,6 +1639,7 @@ mod tests {
                     id: 1,
                     path: ConnectPath::Gatt,
                 },
+                l2cap_deadline: None,
             };
             e
         });
