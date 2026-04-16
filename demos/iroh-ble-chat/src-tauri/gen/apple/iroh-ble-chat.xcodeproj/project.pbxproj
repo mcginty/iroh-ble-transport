@@ -410,7 +410,7 @@
 					"$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 					"$(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "org.jakebot.iroh-ble-chat";
+				PRODUCT_BUNDLE_IDENTIFIER = org.jakebot.iroh-ble-chat;
 				PRODUCT_NAME = "iroh-ble-chat";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -452,7 +452,7 @@
 					"$(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)",
 					"$(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = "org.jakebot.iroh-ble-chat";
+				PRODUCT_BUNDLE_IDENTIFIER = org.jakebot.iroh-ble-chat;
 				PRODUCT_NAME = "iroh-ble-chat";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
