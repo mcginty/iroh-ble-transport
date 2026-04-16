@@ -512,11 +512,11 @@ async fn version_match_lets_data_pipe_start() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_round_trip_over_mock_gatt() {
-    use iroh_ble_transport::transport::test_util::MockFabric;
+    use iroh_ble_transport::transport::test_util::MockFabricPair;
 
     let (central_inbox_tx, central_inbox_rx) = mpsc::channel::<PeerCommand>(256);
     let (peripheral_inbox_tx, peripheral_inbox_rx) = mpsc::channel::<PeerCommand>(256);
-    let fabric = MockFabric::new(central_inbox_tx.clone(), peripheral_inbox_tx.clone());
+    let fabric = MockFabricPair::new(central_inbox_tx.clone(), peripheral_inbox_tx.clone());
 
     let (central_incoming_tx, _central_incoming_rx) = mpsc::channel::<IncomingPacket>(64);
     let (peripheral_incoming_tx, mut peripheral_incoming_rx) = mpsc::channel::<IncomingPacket>(64);
@@ -606,11 +606,11 @@ async fn full_round_trip_over_mock_gatt() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mock_fabric_handles_bidirectional_traffic() {
-    use iroh_ble_transport::transport::test_util::MockFabric;
+    use iroh_ble_transport::transport::test_util::MockFabricPair;
 
     let (central_inbox_tx, central_inbox_rx) = mpsc::channel::<PeerCommand>(256);
     let (peripheral_inbox_tx, peripheral_inbox_rx) = mpsc::channel::<PeerCommand>(256);
-    let fabric = MockFabric::new(central_inbox_tx.clone(), peripheral_inbox_tx.clone());
+    let fabric = MockFabricPair::new(central_inbox_tx.clone(), peripheral_inbox_tx.clone());
 
     let (central_incoming_tx, mut central_incoming_rx) = mpsc::channel::<IncomingPacket>(64);
     let (peripheral_incoming_tx, mut peripheral_incoming_rx) = mpsc::channel::<IncomingPacket>(64);

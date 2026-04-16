@@ -360,15 +360,17 @@ impl BleInterface for MockBleInterface {
 }
 
 /// Pairs two `MockBleInterface` instances so that writes on one side appear
-/// as inbound fragments on the other side's registry inbox.
-pub struct MockFabric {
+/// as inbound fragments on the other side's registry inbox. The N=2 special
+/// case of the more general `MockFabric`; preserved so the existing suite
+/// of pairwise integration tests doesn't churn.
+pub struct MockFabricPair {
     pub central: Arc<MockBleInterface>,
     pub peripheral: Arc<MockBleInterface>,
     pub central_as_device: DeviceId,
     pub peripheral_as_device: DeviceId,
 }
 
-impl MockFabric {
+impl MockFabricPair {
     pub fn new(
         central_inbox: tokio::sync::mpsc::Sender<crate::transport::peer::PeerCommand>,
         peripheral_inbox: tokio::sync::mpsc::Sender<crate::transport::peer::PeerCommand>,
@@ -507,7 +509,7 @@ mod tests {
         let (central_inbox, _central_rx) = tokio::sync::mpsc::channel::<PeerCommand>(16);
         let (peripheral_inbox, mut peripheral_rx) = tokio::sync::mpsc::channel::<PeerCommand>(16);
 
-        let fabric = MockFabric::new(central_inbox, peripheral_inbox);
+        let fabric = MockFabricPair::new(central_inbox, peripheral_inbox);
         fabric
             .central
             .write_c2p(&fabric.peripheral_as_device, Bytes::from_static(b"hello"))
