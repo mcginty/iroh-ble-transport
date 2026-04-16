@@ -53,8 +53,25 @@ description = "Check dependencies for license and vulnerability issues"
 run = "cargo deny check"
 
 [tasks.verify]
-description = "Pre-commit gate: fmt + lint + test"
-depends = ["fmt", "lint", "test"]
+description = "Pre-commit gate: fmt + lint + test + deny"
+depends = ["fmt", "lint", "test", "deny"]
+
+[tasks.clean]
+description = "Clean all build artifacts (Cargo, frontend, Android, iOS)"
+run = """
+echo "==> Cleaning Cargo target..."
+cargo clean
+echo "==> Cleaning frontend..."
+rm -rf demos/iroh-ble-chat/dist
+rm -rf demos/iroh-ble-chat/node_modules/.vite
+echo "==> Cleaning Android build artifacts..."
+rm -rf demos/iroh-ble-chat/src-tauri/gen/android/app/build
+rm -rf demos/iroh-ble-chat/src-tauri/gen/android/build
+rm -rf demos/iroh-ble-chat/src-tauri/gen/android/.gradle
+echo "==> Cleaning iOS build artifacts..."
+rm -rf demos/iroh-ble-chat/src-tauri/gen/apple/build
+echo "==> Done."
+"""
 
 # --- Chat app tasks ---------------------------------------------------
 
@@ -74,7 +91,6 @@ run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri ios dev --open"
 description = "Run the chat app on Android device"
 run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri android dev --open"
 
-
 [tasks."chat:deploy:android:all"]
 description = "Build debug APK and deploy+launch on all connected Android devices"
 dir = "demos/iroh-ble-chat"
@@ -88,6 +104,11 @@ file = "scripts/deploy-ios-all.sh"
 [tasks."chat:deploy:mobile:all"]
 description = "Build and deploy to all connected Android + iOS devices"
 depends = ["chat:deploy:android:all", "chat:deploy:ios:all"]
+
+[tasks."chat:release:ios"]
+description = "Build release iOS IPA for TestFlight"
+dir = "demos/iroh-ble-chat"
+run = "pnpm tauri ios build --export-method release-testing"
 
 [tasks."chat:uninstall:android:all"]
 description = "Uninstall iroh-ble-chat from all connected Android devices"
