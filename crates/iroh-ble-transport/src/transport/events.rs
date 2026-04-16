@@ -209,8 +209,8 @@ pub async fn run_l2cap_accept(
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "L2CAP accept error");
-                break;
+                tracing::warn!(error = %e, "L2CAP accept error, continuing");
+                continue;
             }
         }
     }

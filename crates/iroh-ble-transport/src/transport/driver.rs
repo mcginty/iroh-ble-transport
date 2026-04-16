@@ -77,20 +77,19 @@ impl<I: BleInterface> Driver<I> {
                 let inbox = self.inbox.clone();
                 let dev_for_msg = device_id.clone();
                 tokio::spawn(async move {
-                    const L2CAP_SELECT_TIMEOUT: std::time::Duration =
-                        std::time::Duration::from_millis(1500);
-                    let result = tokio::time::timeout(L2CAP_SELECT_TIMEOUT, async {
-                        let psm = match iface.read_psm(&device_id).await {
-                            Ok(Some(psm)) => psm,
-                            Ok(None) => return Err("no psm advertised".to_string()),
-                            Err(e) => return Err(format!("read_psm: {e}")),
-                        };
-                        iface
-                            .open_l2cap(&device_id, psm)
-                            .await
-                            .map_err(|e| format!("{e}"))
-                    })
-                    .await;
+                    let result =
+                        tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
+                            let psm = match iface.read_psm(&device_id).await {
+                                Ok(Some(psm)) => psm,
+                                Ok(None) => return Err("no psm advertised".to_string()),
+                                Err(e) => return Err(format!("read_psm: {e}")),
+                            };
+                            iface
+                                .open_l2cap(&device_id, psm)
+                                .await
+                                .map_err(|e| format!("{e}"))
+                        })
+                        .await;
                     match result {
                         Ok(Ok(channel)) => {
                             let _ = inbox

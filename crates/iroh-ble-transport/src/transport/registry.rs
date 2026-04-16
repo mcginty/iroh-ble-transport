@@ -21,7 +21,7 @@ const MAX_CONNECT_ATTEMPTS: u32 = 15;
 const DRAINING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const RESTORING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEAD_GC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
-const L2CAP_SELECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+pub(crate) const L2CAP_SELECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 const HANDSHAKING_L2CAP_WALL: std::time::Duration = std::time::Duration::from_millis(2000);
 
 #[derive(Debug)]
