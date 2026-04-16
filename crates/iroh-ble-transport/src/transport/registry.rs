@@ -2758,8 +2758,16 @@ mod tests {
 
         let first = outbound_rx.recv().await.expect("first item");
         let second = outbound_rx.recv().await.expect("second item");
-        assert_eq!(&first.datagram[..], b"old", "old (pre-buffered) must arrive first");
-        assert_eq!(&second.datagram[..], b"new", "new datagram must arrive second");
+        assert_eq!(
+            &first.datagram[..],
+            b"old",
+            "old (pre-buffered) must arrive first"
+        );
+        assert_eq!(
+            &second.datagram[..],
+            b"new",
+            "new datagram must arrive second"
+        );
         assert_eq!(reg.peer(&device_id).unwrap().pending_sends.len(), 0);
     }
 
@@ -2836,10 +2844,17 @@ mod tests {
             device_id: device_id.clone(),
             channel: ch,
         });
-        assert!(actions.iter().any(|a| matches!(a, PeerAction::OpenL2cap { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::OpenL2cap { .. }))
+        );
         assert!(matches!(
             reg.peer(&device_id).unwrap().phase,
-            PeerPhase::Handshaking { l2cap_deadline: Some(_), .. }
+            PeerPhase::Handshaking {
+                l2cap_deadline: Some(_),
+                ..
+            }
         ));
     }
 
@@ -2866,7 +2881,10 @@ mod tests {
         });
         assert!(actions.iter().any(|a| matches!(
             a,
-            PeerAction::StartDataPipe { path: crate::transport::peer::ConnectPath::L2cap, .. }
+            PeerAction::StartDataPipe {
+                path: crate::transport::peer::ConnectPath::L2cap,
+                ..
+            }
         )));
         match &reg.peer(&device_id).unwrap().phase {
             PeerPhase::Connected { channel, .. } => {
@@ -2898,9 +2916,16 @@ mod tests {
         });
         assert!(actions.iter().any(|a| matches!(
             a,
-            PeerAction::StartDataPipe { path: crate::transport::peer::ConnectPath::Gatt, .. }
+            PeerAction::StartDataPipe {
+                path: crate::transport::peer::ConnectPath::Gatt,
+                ..
+            }
         )));
-        assert!(actions.iter().any(|a| matches!(a, PeerAction::EmitMetric(s) if s.contains("l2cap_fallback"))));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::EmitMetric(s) if s.contains("l2cap_fallback")))
+        );
         match &reg.peer(&device_id).unwrap().phase {
             PeerPhase::Connected { channel, .. } => {
                 assert_eq!(channel.path, crate::transport::peer::ConnectPath::Gatt);
@@ -2929,9 +2954,14 @@ mod tests {
         let actions = reg.handle(PeerCommand::Tick(std::time::Instant::now()));
         assert!(actions.iter().any(|a| matches!(
             a,
-            PeerAction::StartDataPipe { path: crate::transport::peer::ConnectPath::Gatt, .. }
+            PeerAction::StartDataPipe {
+                path: crate::transport::peer::ConnectPath::Gatt,
+                ..
+            }
         )));
-        assert!(actions.iter().any(|a| matches!(a, PeerAction::EmitMetric(s) if s.contains("l2cap_handshaking_timeout"))));
+        assert!(actions.iter().any(
+            |a| matches!(a, PeerAction::EmitMetric(s) if s.contains("l2cap_handshaking_timeout"))
+        ));
         match &reg.peer(&device_id).unwrap().phase {
             PeerPhase::Connected { channel, .. } => {
                 assert_eq!(channel.path, crate::transport::peer::ConnectPath::Gatt);
@@ -2957,7 +2987,11 @@ mod tests {
             source: crate::transport::peer::FragmentSource::PeripheralReceivedC2p,
             bytes: bytes::Bytes::from_static(b"hello"),
         });
-        assert!(actions.iter().any(|a| matches!(a, PeerAction::StartDataPipe { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartDataPipe { .. }))
+        );
         let entry = reg.peer(&device_id).unwrap();
         assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
         assert_eq!(entry.role, crate::transport::peer::ConnectRole::Peripheral);
@@ -2980,11 +3014,12 @@ mod tests {
                 tx_gen: 1,
             };
             for i in 0..3u64 {
-                e.pending_sends.push_back(crate::transport::peer::PendingSend {
-                    tx_gen: 1,
-                    datagram: bytes::Bytes::from(vec![i as u8]),
-                    waker: noop_waker(),
-                });
+                e.pending_sends
+                    .push_back(crate::transport::peer::PendingSend {
+                        tx_gen: 1,
+                        datagram: bytes::Bytes::from(vec![i as u8]),
+                        waker: noop_waker(),
+                    });
             }
             e
         });
@@ -2994,12 +3029,20 @@ mod tests {
         });
         let broken_pipe_count = actions
             .iter()
-            .filter(|a| matches!(
-                a,
-                PeerAction::AckSend { result: Err(std::io::ErrorKind::BrokenPipe), .. }
-            ))
+            .filter(|a| {
+                matches!(
+                    a,
+                    PeerAction::AckSend {
+                        result: Err(std::io::ErrorKind::BrokenPipe),
+                        ..
+                    }
+                )
+            })
             .count();
-        assert_eq!(broken_pipe_count, 3, "all 3 pending sends acked with BrokenPipe");
+        assert_eq!(
+            broken_pipe_count, 3,
+            "all 3 pending sends acked with BrokenPipe"
+        );
         assert!(reg.peer(&device_id).unwrap().pending_sends.is_empty());
     }
 }

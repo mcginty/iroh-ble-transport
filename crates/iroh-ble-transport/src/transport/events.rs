@@ -72,7 +72,9 @@ pub async fn run_central_events(
                             .await
                             .is_err()
                         {
-                            tracing::warn!("central event pump: inbox closed during forget, shutting down");
+                            tracing::warn!(
+                                "central event pump: inbox closed during forget, shutting down"
+                            );
                             break;
                         }
                     }
