@@ -153,3 +153,86 @@ async fn triangle_send_fans_out_to_both_peers() {
     assert!(state_b.tx_gen > 0, "A's tx_gen for B should have advanced");
     assert!(state_c.tx_gen > 0, "A's tx_gen for C should have advanced");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn symmetric_connect_converges_to_one_channel() {
+    use iroh_ble_transport::transport::registry::PhaseKind;
+
+    let fabric = MockFabric::new();
+    let a = spawn_node(&fabric, DeviceId::from("a"), L2capPolicy::Disabled);
+    let b = spawn_node(&fabric, DeviceId::from("b"), L2capPolicy::Disabled);
+
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(4);
+    let waker = waker_from_channel(waker_tx);
+
+    tokio::join!(
+        async {
+            a.inbox_tx
+                .send(PeerCommand::Advertised {
+                    prefix: prefix_for(0xB1),
+                    device: ble_device(&b.device_id),
+                    rssi: None,
+                })
+                .await
+                .unwrap();
+            a.inbox_tx
+                .send(PeerCommand::SendDatagram {
+                    device_id: b.device_id.clone(),
+                    tx_gen: 0,
+                    datagram: Bytes::from_static(b"a-to-b"),
+                    waker: waker.clone(),
+                })
+                .await
+                .unwrap();
+        },
+        async {
+            b.inbox_tx
+                .send(PeerCommand::Advertised {
+                    prefix: prefix_for(0xA1),
+                    device: ble_device(&a.device_id),
+                    rssi: None,
+                })
+                .await
+                .unwrap();
+            b.inbox_tx
+                .send(PeerCommand::SendDatagram {
+                    device_id: a.device_id.clone(),
+                    tx_gen: 0,
+                    datagram: Bytes::from_static(b"b-to-a"),
+                    waker: waker.clone(),
+                })
+                .await
+                .unwrap();
+        }
+    );
+
+    let mut a = a;
+    let mut b = b;
+    let got_on_b = tokio::time::timeout(std::time::Duration::from_secs(10), b.incoming_rx.recv())
+        .await
+        .expect("B never received A's datagram")
+        .expect("B incoming closed");
+    let got_on_a = tokio::time::timeout(std::time::Duration::from_secs(10), a.incoming_rx.recv())
+        .await
+        .expect("A never received B's datagram")
+        .expect("A incoming closed");
+    assert_eq!(got_on_b.data.as_ref(), b"a-to-b");
+    assert_eq!(got_on_a.data.as_ref(), b"b-to-a");
+
+    let a_snap = a.snapshots.load();
+    let b_snap = b.snapshots.load();
+    let a_view_of_b = a_snap.peer_states.get(&b.device_id).expect("A has no B");
+    let b_view_of_a = b_snap.peer_states.get(&a.device_id).expect("B has no A");
+    assert_eq!(
+        a_view_of_b.phase_kind,
+        PhaseKind::Connected,
+        "A's view of B ended up in {:?}, expected Connected",
+        a_view_of_b.phase_kind,
+    );
+    assert_eq!(
+        b_view_of_a.phase_kind,
+        PhaseKind::Connected,
+        "B's view of A ended up in {:?}, expected Connected",
+        b_view_of_a.phase_kind,
+    );
+}
