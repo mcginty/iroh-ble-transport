@@ -137,7 +137,7 @@ impl Registry {
                     | PeerPhase::Handshaking { .. }
                     | PeerPhase::Reconnecting { .. }
                     | PeerPhase::Restoring { .. } => SendDecision::Buffer,
-                    _ => SendDecision::Reject,
+                    PeerPhase::Draining { .. } | PeerPhase::Dead { .. } => SendDecision::Reject,
                 };
                 let decision_tag = match &decision {
                     SendDecision::Enqueue => "enqueue",
