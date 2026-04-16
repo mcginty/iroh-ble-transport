@@ -16,9 +16,13 @@ set -euo pipefail
 SHORT_VERSION="${NEW_VERSION%%-*}"
 BUILD_NUMBER="$(git rev-list --count HEAD)"
 
-echo "==> Bumping tauri.conf.json"
-echo "    version                = $SHORT_VERSION"
-echo "    bundle.iOS.bundleVersion = $BUILD_NUMBER"
+echo -en "\033[1;32m     Bumping\033[0m tauri.conf.json (version = $SHORT_VERSION, bundle.iOS.bundleVersion = $BUILD_NUMBER)"
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo -e "\033[1;33m [dry run, no files touched]\033[0m"
+  exit
+fi
+
+echo ""
 
 python3 -c "
 import json, sys
