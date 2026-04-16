@@ -685,6 +685,7 @@ async function initNode() {
       nickname: myNickname,
       status: "self",
       ble_phase: null,
+      ble_path: null,
       ble_failures: 0,
       last_seen_secs_ago: 0,
     });
