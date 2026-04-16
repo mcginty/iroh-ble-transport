@@ -91,7 +91,6 @@ pub enum DisconnectReason {
     AdapterOff,
     Gatt133,
     Timeout,
-    ProtocolError,
     LinkDead,
     Unknown(i32),
 }
