@@ -9,6 +9,7 @@ use tokio::sync::mpsc;
 use crate::transport::interface::BleInterface;
 use crate::transport::peer::{PeerAction, PeerCommand};
 use crate::transport::pipe::run_data_pipe;
+use crate::transport::store::PeerStore;
 
 /// A fully-reassembled datagram delivered up to iroh.
 pub struct IncomingPacket {
@@ -22,6 +23,7 @@ pub struct Driver<I: BleInterface> {
     incoming_tx: mpsc::Sender<IncomingPacket>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
+    store: Arc<dyn PeerStore>,
 }
 
 impl<I: BleInterface> Driver<I> {
@@ -31,6 +33,7 @@ impl<I: BleInterface> Driver<I> {
         incoming_tx: mpsc::Sender<IncomingPacket>,
         retransmit_counter: Arc<AtomicU64>,
         truncation_counter: Arc<AtomicU64>,
+        store: Arc<dyn PeerStore>,
     ) -> Self {
         Self {
             iface,
@@ -38,6 +41,7 @@ impl<I: BleInterface> Driver<I> {
             incoming_tx,
             retransmit_counter,
             truncation_counter,
+            store,
         }
     }
 
@@ -67,6 +71,34 @@ impl<I: BleInterface> Driver<I> {
                                     error: format!("{e}"),
                                 })
                                 .await;
+                        }
+                    }
+                });
+            }
+
+            PeerAction::ReadVersion { device_id } => {
+                let iface = Arc::clone(&self.iface);
+                let inbox = self.inbox.clone();
+                let dev_for_msg = device_id.clone();
+                tokio::spawn(async move {
+                    let want = crate::transport::transport::PROTOCOL_VERSION;
+                    match iface.read_version(&device_id).await {
+                        Ok(Some(got)) if got != want => {
+                            let _ = inbox
+                                .send(PeerCommand::ProtocolVersionMismatch {
+                                    device_id: dev_for_msg,
+                                    got,
+                                    want,
+                                })
+                                .await;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::debug!(
+                                device = %dev_for_msg,
+                                ?e,
+                                "read_version returned error; treating as skip"
+                            );
                         }
                     }
                 });
@@ -151,8 +183,29 @@ impl<I: BleInterface> Driver<I> {
                 });
             }
 
-            PeerAction::PurgeAllForAdapterOff => {
-                // No-op: registry already cleared phase state; blew handles tear-down internally.
+            PeerAction::RestartL2capListener => {
+                let iface = Arc::clone(&self.iface);
+                tokio::spawn(async move {
+                    let _ = iface.restart_l2cap_listener().await;
+                });
+            }
+
+            PeerAction::PutPeerStore { prefix, snapshot } => {
+                let store = Arc::clone(&self.store);
+                tokio::spawn(async move {
+                    if let Err(e) = store.put(prefix, snapshot).await {
+                        tracing::debug!(?e, "PeerStore::put failed");
+                    }
+                });
+            }
+
+            PeerAction::ForgetPeerStore { prefix } => {
+                let store = Arc::clone(&self.store);
+                tokio::spawn(async move {
+                    if let Err(e) = store.forget(prefix).await {
+                        tracing::debug!(?e, "PeerStore::forget failed");
+                    }
+                });
             }
 
             PeerAction::EmitMetric(ev) => {
@@ -213,7 +266,9 @@ use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use blew::central::ScanFilter;
+use blew::gatt::service::GattService;
 use blew::l2cap::types::Psm;
+use blew::peripheral::AdvertisingConfig;
 use blew::{Central, L2capChannel, Peripheral};
 use uuid::{Uuid, uuid};
 
@@ -222,21 +277,34 @@ use crate::transport::peer::{ChannelHandle, ConnectPath};
 const C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
 const PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
+const VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
 
 pub struct BlewDriver {
     central: Arc<Central>,
     peripheral: Arc<Peripheral>,
     next_channel_id: AtomicU64,
     channels_by_device: Mutex<HashMap<blew::DeviceId, ChannelHandle>>,
+    /// Stashed at construction so `rebuild_server` / `restart_advertising` can
+    /// re-register the same service table and advertise with the same config
+    /// after an adapter-off/on cycle wipes platform state.
+    services: Vec<GattService>,
+    advertising_config: AdvertisingConfig,
 }
 
 impl BlewDriver {
-    pub fn new(central: Arc<Central>, peripheral: Arc<Peripheral>) -> Self {
+    pub fn new(
+        central: Arc<Central>,
+        peripheral: Arc<Peripheral>,
+        services: Vec<GattService>,
+        advertising_config: AdvertisingConfig,
+    ) -> Self {
         Self {
             central,
             peripheral,
             next_channel_id: AtomicU64::new(1),
             channels_by_device: Mutex::new(HashMap::new()),
+            services,
+            advertising_config,
         }
     }
 }
@@ -325,6 +393,25 @@ impl BleInterface for BlewDriver {
         Ok(Some(u16::from_le_bytes([bytes[0], bytes[1]])))
     }
 
+    async fn read_version(
+        &self,
+        device_id: &blew::DeviceId,
+    ) -> crate::error::BleResult<Option<u8>> {
+        match self
+            .central
+            .read_characteristic(device_id, VERSION_CHAR_UUID)
+            .await
+        {
+            Ok(bytes) if bytes.is_empty() => Ok(None),
+            Ok(bytes) => Ok(Some(bytes[0])),
+            // Older peers may not publish VERSION; treat as "skip the check".
+            Err(e) => {
+                tracing::debug!(device = %device_id, ?e, "read_version failed; skipping check");
+                Ok(None)
+            }
+        }
+    }
+
     async fn open_l2cap(
         &self,
         device_id: &blew::DeviceId,
@@ -345,17 +432,35 @@ impl BleInterface for BlewDriver {
     }
 
     async fn rebuild_server(&self) -> crate::error::BleResult<()> {
-        tracing::warn!("rebuild_server not supported by blew backend");
+        // Best-effort: adapter-cycle typically wipes the platform's service
+        // table on Android, so re-adding is required; on macOS/iOS this is
+        // often a no-op because CoreBluetooth restores state for us.
+        if let Err(e) = self.peripheral.stop_advertising().await {
+            tracing::debug!(?e, "rebuild_server: stop_advertising ignored");
+        }
+        for service in &self.services {
+            if let Err(e) = self.peripheral.add_service(service).await {
+                tracing::warn!(uuid = %service.uuid, ?e, "rebuild_server: add_service failed");
+            }
+        }
         Ok(())
     }
 
     async fn restart_advertising(&self) -> crate::error::BleResult<()> {
-        tracing::warn!("restart_advertising not supported by blew backend");
+        if let Err(e) = self.peripheral.stop_advertising().await {
+            tracing::debug!(?e, "restart_advertising: stop_advertising ignored");
+        }
+        self.peripheral
+            .start_advertising(&self.advertising_config)
+            .await?;
         Ok(())
     }
 
     async fn restart_l2cap_listener(&self) -> crate::error::BleResult<Option<u16>> {
-        tracing::warn!("restart_l2cap_listener not supported by blew backend");
+        // Re-opening requires plumbing the fresh listener stream back to the
+        // accept supervisor and publishing the new PSM to the peripheral read
+        // responder; neither is wired yet. Log for now.
+        tracing::warn!("restart_l2cap_listener: not yet implemented end-to-end");
         Ok(None)
     }
 
@@ -409,6 +514,7 @@ mod tests {
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
         );
 
         driver
@@ -443,6 +549,7 @@ mod tests {
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
         );
         let device_id = blew::DeviceId::from("x");
         driver

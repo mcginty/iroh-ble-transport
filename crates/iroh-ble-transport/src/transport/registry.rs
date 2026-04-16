@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use atomic_waker::AtomicWaker;
 use blew::DeviceId;
 use tokio::sync::mpsc;
 
@@ -22,7 +23,6 @@ const DRAINING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const RESTORING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEAD_GC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const L2CAP_SELECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
-const HANDSHAKING_L2CAP_WALL: std::time::Duration = std::time::Duration::from_millis(2000);
 
 #[derive(Debug)]
 pub struct Registry {
@@ -47,337 +47,671 @@ impl Registry {
         let mut actions = Vec::new();
         match cmd {
             PeerCommand::Advertised {
-                prefix: _,
+                prefix,
                 device,
                 rssi,
-            } => {
-                let _ = rssi;
-                let device_id = device.id.clone();
-                let entry = self
-                    .peers
-                    .entry(device_id.clone())
-                    .or_insert_with(|| PeerEntry::new(device_id.clone()));
-                entry.last_adv = Some(now);
-                match &entry.phase {
-                    PeerPhase::Unknown => {
-                        if entry.pending_sends.is_empty() {
-                            entry.phase = PeerPhase::Discovered { since: now };
-                        } else {
-                            entry.phase = PeerPhase::Connecting {
-                                attempt: 0,
-                                started: now,
-                                path: crate::transport::peer::ConnectPath::Gatt,
-                            };
-                            actions.push(PeerAction::StartConnect {
-                                device_id: device_id.clone(),
-                                attempt: 0,
-                            });
-                        }
-                    }
-                    PeerPhase::Discovered { .. } if !entry.pending_sends.is_empty() => {
-                        entry.phase = PeerPhase::Connecting {
-                            attempt: 0,
-                            started: now,
-                            path: crate::transport::peer::ConnectPath::Gatt,
-                        };
-                        actions.push(PeerAction::StartConnect {
-                            device_id: device_id.clone(),
-                            attempt: 0,
-                        });
-                    }
-                    PeerPhase::Reconnecting {
-                        attempt, next_at, ..
-                    } if *next_at <= now => {
-                        let attempt = *attempt;
-                        entry.phase = PeerPhase::Connecting {
-                            attempt,
-                            started: now,
-                            path: crate::transport::peer::ConnectPath::Gatt,
-                        };
-                        actions.push(PeerAction::StartConnect {
-                            device_id: device_id.clone(),
-                            attempt,
-                        });
-                    }
-                    _ => {}
-                }
-            }
+            } => self.handle_advertised(&mut actions, now, prefix, device, rssi),
             PeerCommand::SendDatagram {
                 device_id,
                 tx_gen,
                 datagram,
                 waker,
-            } => {
-                let datagram_len = datagram.len();
-                let entry = self
-                    .peers
-                    .entry(device_id.clone())
-                    .or_insert_with(|| PeerEntry::new(device_id.clone()));
-                enum SendDecision {
-                    Enqueue,
-                    Reject,
-                    Buffer,
-                    StartAndEnqueue,
-                }
-                let entry_phase_kind = PhaseKind::from(&entry.phase);
-                let entry_tx_gen = entry.tx_gen;
-                let decision = match &entry.phase {
-                    PeerPhase::Connected {
-                        tx_gen: live_gen, ..
-                    } => {
-                        if tx_gen == *live_gen {
-                            SendDecision::Enqueue
-                        } else {
-                            SendDecision::Reject
-                        }
-                    }
-                    PeerPhase::Discovered { .. } => SendDecision::StartAndEnqueue,
-                    PeerPhase::Unknown
-                    | PeerPhase::Connecting { .. }
-                    | PeerPhase::Handshaking { .. }
-                    | PeerPhase::Reconnecting { .. }
-                    | PeerPhase::Restoring { .. } => SendDecision::Buffer,
-                    PeerPhase::Draining { .. } | PeerPhase::Dead { .. } => SendDecision::Reject,
-                };
-                let decision_tag = match &decision {
-                    SendDecision::Enqueue => "enqueue",
-                    SendDecision::Reject => "reject",
-                    SendDecision::Buffer => "buffer",
-                    SendDecision::StartAndEnqueue => "start_and_enqueue",
-                };
-                tracing::trace!(
-                    device = %device_id,
-                    incoming_tx_gen = tx_gen,
-                    entry_tx_gen,
-                    ?entry_phase_kind,
-                    len = datagram_len,
-                    decision = decision_tag,
-                    "registry SendDatagram"
-                );
-                match decision {
-                    SendDecision::Enqueue => {
-                        if entry.pipe.is_some() && !entry.pending_sends.is_empty() {
-                            // Drain pre-buffered sends first to preserve FIFO ordering.
-                            while let Some(old) = entry.pending_sends.pop_front() {
-                                let pipe = match entry.pipe.as_ref() {
-                                    Some(p) => p,
-                                    None => {
-                                        entry.pending_sends.push_front(old);
-                                        break;
-                                    }
-                                };
-                                match pipe.outbound_tx.try_send(old) {
-                                    Ok(()) => {}
-                                    Err(tokio::sync::mpsc::error::TrySendError::Full(old)) => {
-                                        entry.pending_sends.push_front(old);
-                                        break;
-                                    }
-                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(old)) => {
-                                        entry.pipe = None;
-                                        entry.pending_sends.push_front(old);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(pipe) = entry.pipe.as_ref() {
-                            let send = crate::transport::peer::PendingSend {
-                                tx_gen,
-                                datagram,
-                                waker: waker.clone(),
-                            };
-                            match pipe.outbound_tx.try_send(send) {
-                                Ok(()) => {
-                                    actions.push(PeerAction::AckSend {
-                                        tx_gen,
-                                        waker,
-                                        result: Ok(()),
-                                    });
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    actions.push(PeerAction::AckSend {
-                                        tx_gen,
-                                        waker,
-                                        result: Err(std::io::ErrorKind::WouldBlock),
-                                    });
-                                }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(send)) => {
-                                    entry.pipe = None;
-                                    let waker = send.waker.clone();
-                                    entry.pending_sends.push_back(send);
-                                    actions.push(PeerAction::AckSend {
-                                        tx_gen,
-                                        waker,
-                                        result: Ok(()),
-                                    });
-                                }
-                            }
-                        } else {
-                            entry
-                                .pending_sends
-                                .push_back(crate::transport::peer::PendingSend {
-                                    tx_gen,
-                                    datagram,
-                                    waker,
-                                });
-                        }
-                    }
-                    SendDecision::Reject => {
-                        actions.push(PeerAction::AckSend {
-                            tx_gen,
-                            waker,
-                            result: Err(std::io::ErrorKind::WouldBlock),
-                        });
-                    }
-                    SendDecision::Buffer => {
-                        entry
-                            .pending_sends
-                            .push_back(crate::transport::peer::PendingSend {
-                                tx_gen,
-                                datagram,
-                                waker: waker.clone(),
-                            });
-                        actions.push(PeerAction::AckSend {
-                            tx_gen,
-                            waker,
-                            result: Ok(()),
-                        });
-                    }
-                    SendDecision::StartAndEnqueue => {
-                        entry
-                            .pending_sends
-                            .push_back(crate::transport::peer::PendingSend {
-                                tx_gen,
-                                datagram,
-                                waker,
-                            });
-                        entry.phase = PeerPhase::Connecting {
-                            attempt: 0,
-                            started: now,
-                            path: crate::transport::peer::ConnectPath::Gatt,
-                        };
-                        actions.push(PeerAction::StartConnect {
-                            device_id: device_id.clone(),
-                            attempt: 0,
-                        });
-                    }
-                }
-            }
+            } => self.handle_send_datagram(&mut actions, now, device_id, tx_gen, datagram, waker),
             PeerCommand::ConnectSucceeded { device_id, channel } => {
-                if let Some(entry) = self.peers.get_mut(&device_id)
-                    && matches!(entry.phase, PeerPhase::Connecting { .. })
-                {
-                    entry.consecutive_failures = 0;
-                    match self.l2cap_policy {
-                        L2capPolicy::PreferL2cap => {
-                            entry.phase = PeerPhase::Handshaking {
-                                since: now,
-                                channel,
-                                l2cap_deadline: Some(now + L2CAP_SELECT_TIMEOUT),
-                            };
-                            actions.push(PeerAction::OpenL2cap {
-                                device_id: device_id.clone(),
-                            });
-                        }
-                        L2capPolicy::Disabled => {
-                            entry.tx_gen += 1;
-                            let tx_gen = entry.tx_gen;
-                            entry.phase = PeerPhase::Connected {
-                                since: now,
-                                channel,
-                                tx_gen,
-                            };
-                            let role = entry.role;
-                            actions.push(PeerAction::StartDataPipe {
-                                device_id: device_id.clone(),
-                                role,
-                                path: crate::transport::peer::ConnectPath::Gatt,
-                                l2cap_channel: None,
-                            });
-                        }
-                    }
-                }
+                self.handle_connect_succeeded(&mut actions, now, device_id, channel);
             }
             PeerCommand::ConnectFailed { device_id, error } => {
-                if let Some(entry) = self.peers.get_mut(&device_id) {
-                    let current_attempt =
-                        if let PeerPhase::Connecting { attempt, .. } = &entry.phase {
-                            Some(*attempt)
-                        } else {
-                            None
-                        };
-                    if let Some(attempt) = current_attempt {
-                        let next_attempt = attempt + 1;
-                        entry.consecutive_failures += 1;
-                        actions.push(PeerAction::EmitMetric(format!("connect_failed:{error}")));
-                        if next_attempt >= MAX_CONNECT_ATTEMPTS {
-                            entry.phase = PeerPhase::Dead {
-                                reason: crate::transport::peer::DeadReason::MaxRetries,
-                                at: now,
-                            };
-                        } else {
-                            entry.phase = PeerPhase::Reconnecting {
-                                attempt: next_attempt,
-                                next_at: now + reconnect_backoff(next_attempt),
-                                reason: crate::transport::peer::DisconnectReason::Timeout,
-                            };
-                        }
-                    }
-                }
+                self.handle_connect_failed(&mut actions, now, device_id, &error);
             }
             PeerCommand::InboundGattFragment {
                 device_id,
                 source: _,
                 bytes,
-            } => {
-                use std::collections::hash_map::Entry;
-                let (entry, freshly_inserted) = match self.peers.entry(device_id.clone()) {
-                    Entry::Vacant(v) => {
-                        let mut e = PeerEntry::new(device_id.clone());
-                        e.role = crate::transport::peer::ConnectRole::Peripheral;
-                        e.phase = PeerPhase::Connected {
-                            since: now,
-                            channel: crate::transport::peer::ChannelHandle {
-                                id: 0,
-                                path: crate::transport::peer::ConnectPath::Gatt,
-                            },
-                            tx_gen: 1,
-                        };
-                        e.tx_gen = 1;
-                        (v.insert(e), true)
-                    }
-                    Entry::Occupied(o) => (o.into_mut(), false),
-                };
-                entry.last_rx = Some(now);
-                if freshly_inserted {
-                    entry.rx_backlog.push_back(bytes);
-                    actions.push(PeerAction::StartDataPipe {
-                        device_id: device_id.clone(),
-                        role: crate::transport::peer::ConnectRole::Peripheral,
+            } => self.handle_inbound_gatt_fragment(&mut actions, now, device_id, bytes),
+            PeerCommand::CentralDisconnected { device_id, cause } => {
+                self.handle_central_disconnected(&mut actions, now, device_id, cause);
+            }
+            PeerCommand::AdapterStateChanged { powered } => {
+                self.handle_adapter_state_changed(&mut actions, now, powered);
+            }
+            PeerCommand::RestoreFromAdapter { devices } => {
+                self.handle_restore_from_adapter(&mut actions, now, devices);
+            }
+            PeerCommand::Tick(tick_now) => self.handle_tick(&mut actions, tick_now),
+            PeerCommand::Forget { device_id } => {
+                self.handle_forget(&mut actions, now, device_id);
+            }
+            PeerCommand::Stalled { device_id } => {
+                self.handle_stalled(&mut actions, now, device_id);
+            }
+            PeerCommand::Shutdown => self.handle_shutdown(&mut actions),
+            PeerCommand::DataPipeReady {
+                device_id,
+                outbound_tx,
+                inbound_tx,
+            } => self.handle_data_pipe_ready(device_id, outbound_tx, inbound_tx),
+            PeerCommand::OpenL2capSucceeded {
+                device_id,
+                channel: l2cap_chan,
+            } => self.handle_open_l2cap_succeeded(&mut actions, now, device_id, l2cap_chan),
+            PeerCommand::OpenL2capFailed { device_id, error } => {
+                self.handle_open_l2cap_failed(&mut actions, now, device_id, &error);
+            }
+            PeerCommand::InboundL2capChannel { device_id, channel } => {
+                self.handle_inbound_l2cap_channel(&mut actions, now, device_id, channel);
+            }
+            PeerCommand::CentralConnected { device_id: _ } => {
+                // Informational: blew signals the physical BLE link came up. The
+                // authoritative "Connecting -> Handshaking" transition is driven
+                // by PeerCommand::ConnectSucceeded from the driver once GATT
+                // subscribe + optional PSM read have completed, so we don't act
+                // here. Kept as an explicit arm so the match stays exhaustive.
+            }
+            PeerCommand::ProtocolVersionMismatch {
+                device_id,
+                got,
+                want,
+            } => self.handle_protocol_version_mismatch(&mut actions, now, device_id, got, want),
+        }
+        actions
+    }
+
+    fn handle_advertised(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        prefix: crate::transport::peer::KeyPrefix,
+        device: blew::BleDevice,
+        rssi: Option<i16>,
+    ) {
+        let _ = rssi;
+        let device_id = device.id.clone();
+        let entry = self
+            .peers
+            .entry(device_id.clone())
+            .or_insert_with(|| PeerEntry::new(device_id.clone()));
+        entry.last_adv = Some(now);
+        entry.prefix = Some(prefix);
+        match &entry.phase {
+            PeerPhase::Unknown => {
+                if entry.pending_sends.is_empty() {
+                    entry.phase = PeerPhase::Discovered { since: now };
+                } else {
+                    entry.phase = PeerPhase::Connecting {
+                        attempt: 0,
+                        started: now,
                         path: crate::transport::peer::ConnectPath::Gatt,
-                        l2cap_channel: None,
+                    };
+                    actions.push(PeerAction::StartConnect {
+                        device_id: device_id.clone(),
+                        attempt: 0,
                     });
-                    return actions;
+                }
+            }
+            PeerPhase::Discovered { .. } if !entry.pending_sends.is_empty() => {
+                entry.phase = PeerPhase::Connecting {
+                    attempt: 0,
+                    started: now,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                };
+                actions.push(PeerAction::StartConnect {
+                    device_id: device_id.clone(),
+                    attempt: 0,
+                });
+            }
+            PeerPhase::Reconnecting {
+                attempt, next_at, ..
+            } if *next_at <= now => {
+                let attempt = *attempt;
+                entry.phase = PeerPhase::Connecting {
+                    attempt,
+                    started: now,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                };
+                actions.push(PeerAction::StartConnect {
+                    device_id: device_id.clone(),
+                    attempt,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_send_datagram(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        tx_gen: u64,
+        datagram: bytes::Bytes,
+        waker: std::task::Waker,
+    ) {
+        let datagram_len = datagram.len();
+        let entry = self
+            .peers
+            .entry(device_id.clone())
+            .or_insert_with(|| PeerEntry::new(device_id.clone()));
+        enum SendDecision {
+            Enqueue,
+            Reject,
+            Buffer,
+            StartAndEnqueue,
+        }
+        let entry_phase_kind = PhaseKind::from(&entry.phase);
+        let entry_tx_gen = entry.tx_gen;
+        let decision = match &entry.phase {
+            PeerPhase::Connected {
+                tx_gen: live_gen, ..
+            } => {
+                if tx_gen == *live_gen {
+                    SendDecision::Enqueue
+                } else {
+                    SendDecision::Reject
+                }
+            }
+            PeerPhase::Discovered { .. } => SendDecision::StartAndEnqueue,
+            PeerPhase::Unknown
+            | PeerPhase::Connecting { .. }
+            | PeerPhase::Handshaking { .. }
+            | PeerPhase::Reconnecting { .. }
+            | PeerPhase::Restoring { .. } => SendDecision::Buffer,
+            PeerPhase::Draining { .. } | PeerPhase::Dead { .. } => SendDecision::Reject,
+        };
+        let decision_tag = match &decision {
+            SendDecision::Enqueue => "enqueue",
+            SendDecision::Reject => "reject",
+            SendDecision::Buffer => "buffer",
+            SendDecision::StartAndEnqueue => "start_and_enqueue",
+        };
+        tracing::trace!(
+            device = %device_id,
+            incoming_tx_gen = tx_gen,
+            entry_tx_gen,
+            ?entry_phase_kind,
+            len = datagram_len,
+            decision = decision_tag,
+            "registry SendDatagram"
+        );
+        match decision {
+            SendDecision::Enqueue => {
+                if entry.pipe.is_some() && !entry.pending_sends.is_empty() {
+                    // Drain pre-buffered sends first to preserve FIFO ordering.
+                    while let Some(old) = entry.pending_sends.pop_front() {
+                        let pipe = match entry.pipe.as_ref() {
+                            Some(p) => p,
+                            None => {
+                                entry.pending_sends.push_front(old);
+                                break;
+                            }
+                        };
+                        match pipe.outbound_tx.try_send(old) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(old)) => {
+                                entry.pending_sends.push_front(old);
+                                break;
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(old)) => {
+                                entry.pipe = None;
+                                entry.pending_sends.push_front(old);
+                                break;
+                            }
+                        }
+                    }
                 }
 
-                let promoting = matches!(entry.phase, PeerPhase::Handshaking { .. });
-                if promoting {
-                    let channel = match &entry.phase {
-                        PeerPhase::Handshaking { channel, .. } => channel.clone(),
-                        _ => {
-                            tracing::warn!(device = %device_id, "phase changed unexpectedly during fragment promotion");
-                            return actions;
-                        }
+                if let Some(pipe) = entry.pipe.as_ref() {
+                    let send = crate::transport::peer::PendingSend {
+                        tx_gen,
+                        datagram,
+                        waker: waker.clone(),
                     };
+                    match pipe.outbound_tx.try_send(send) {
+                        Ok(()) => {
+                            actions.push(PeerAction::AckSend {
+                                tx_gen,
+                                waker,
+                                result: Ok(()),
+                            });
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            actions.push(PeerAction::AckSend {
+                                tx_gen,
+                                waker,
+                                result: Err(std::io::ErrorKind::WouldBlock),
+                            });
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(send)) => {
+                            entry.pipe = None;
+                            let waker = send.waker.clone();
+                            entry.pending_sends.push_back(send);
+                            actions.push(PeerAction::AckSend {
+                                tx_gen,
+                                waker,
+                                result: Ok(()),
+                            });
+                        }
+                    }
+                } else {
+                    entry
+                        .pending_sends
+                        .push_back(crate::transport::peer::PendingSend {
+                            tx_gen,
+                            datagram,
+                            waker,
+                        });
+                }
+            }
+            SendDecision::Reject => {
+                actions.push(PeerAction::AckSend {
+                    tx_gen,
+                    waker,
+                    result: Err(std::io::ErrorKind::WouldBlock),
+                });
+            }
+            SendDecision::Buffer => {
+                entry
+                    .pending_sends
+                    .push_back(crate::transport::peer::PendingSend {
+                        tx_gen,
+                        datagram,
+                        waker: waker.clone(),
+                    });
+                actions.push(PeerAction::AckSend {
+                    tx_gen,
+                    waker,
+                    result: Ok(()),
+                });
+            }
+            SendDecision::StartAndEnqueue => {
+                entry
+                    .pending_sends
+                    .push_back(crate::transport::peer::PendingSend {
+                        tx_gen,
+                        datagram,
+                        waker,
+                    });
+                entry.phase = PeerPhase::Connecting {
+                    attempt: 0,
+                    started: now,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                };
+                actions.push(PeerAction::StartConnect {
+                    device_id: device_id.clone(),
+                    attempt: 0,
+                });
+            }
+        }
+    }
+
+    fn handle_connect_succeeded(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        channel: crate::transport::peer::ChannelHandle,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        if !matches!(entry.phase, PeerPhase::Connecting { .. }) {
+            return;
+        }
+        entry.consecutive_failures = 0;
+        // Kick off the VERSION probe in parallel with whatever
+        // path the handshake takes below. A mismatch arriving
+        // after StartDataPipe still Dead-s the peer and closes
+        // the channel; QUIC has not yet exchanged any datagrams
+        // so the momentary pipe is harmless.
+        actions.push(PeerAction::ReadVersion {
+            device_id: device_id.clone(),
+        });
+        match self.l2cap_policy {
+            L2capPolicy::PreferL2cap => {
+                entry.phase = PeerPhase::Handshaking {
+                    since: now,
+                    channel,
+                    l2cap_deadline: Some(now + L2CAP_SELECT_TIMEOUT),
+                };
+                actions.push(PeerAction::OpenL2cap {
+                    device_id: device_id.clone(),
+                });
+            }
+            L2capPolicy::Disabled => {
+                entry.tx_gen += 1;
+                let tx_gen = entry.tx_gen;
+                entry.phase = PeerPhase::Connected {
+                    since: now,
+                    channel,
+                    tx_gen,
+                };
+                let role = entry.role;
+                actions.push(PeerAction::StartDataPipe {
+                    device_id: device_id.clone(),
+                    role,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                    l2cap_channel: None,
+                });
+            }
+        }
+    }
+
+    fn handle_connect_failed(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        error: &str,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        let Some(attempt) = (if let PeerPhase::Connecting { attempt, .. } = &entry.phase {
+            Some(*attempt)
+        } else {
+            None
+        }) else {
+            return;
+        };
+        let next_attempt = attempt + 1;
+        entry.consecutive_failures += 1;
+        actions.push(PeerAction::EmitMetric(format!("connect_failed:{error}")));
+        if next_attempt >= MAX_CONNECT_ATTEMPTS {
+            entry.phase = PeerPhase::Dead {
+                reason: crate::transport::peer::DeadReason::MaxRetries,
+                at: now,
+            };
+            if let Some(prefix) = entry.prefix {
+                actions.push(PeerAction::ForgetPeerStore { prefix });
+            }
+        } else {
+            entry.phase = PeerPhase::Reconnecting {
+                attempt: next_attempt,
+                next_at: now + reconnect_backoff(next_attempt),
+                reason: crate::transport::peer::DisconnectReason::Timeout,
+            };
+        }
+    }
+
+    fn handle_inbound_gatt_fragment(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        bytes: bytes::Bytes,
+    ) {
+        use std::collections::hash_map::Entry;
+        let (entry, freshly_inserted) = match self.peers.entry(device_id.clone()) {
+            Entry::Vacant(v) => {
+                let mut e = PeerEntry::new(device_id.clone());
+                e.role = crate::transport::peer::ConnectRole::Peripheral;
+                e.phase = PeerPhase::Connected {
+                    since: now,
+                    channel: crate::transport::peer::ChannelHandle {
+                        id: 0,
+                        path: crate::transport::peer::ConnectPath::Gatt,
+                    },
+                    tx_gen: 1,
+                };
+                e.tx_gen = 1;
+                (v.insert(e), true)
+            }
+            Entry::Occupied(o) => (o.into_mut(), false),
+        };
+        entry.last_rx = Some(now);
+        if freshly_inserted {
+            entry.rx_backlog.push_back(bytes);
+            actions.push(PeerAction::StartDataPipe {
+                device_id: device_id.clone(),
+                role: crate::transport::peer::ConnectRole::Peripheral,
+                path: crate::transport::peer::ConnectPath::Gatt,
+                l2cap_channel: None,
+            });
+            return;
+        }
+
+        let promoting = matches!(entry.phase, PeerPhase::Handshaking { .. });
+        if promoting {
+            let channel = match &entry.phase {
+                PeerPhase::Handshaking { channel, .. } => channel.clone(),
+                _ => {
+                    tracing::warn!(device = %device_id, "phase changed unexpectedly during fragment promotion");
+                    return;
+                }
+            };
+            entry.tx_gen += 1;
+            let tx_gen = entry.tx_gen;
+            entry.phase = PeerPhase::Connected {
+                since: now,
+                channel,
+                tx_gen,
+            };
+            entry.rx_backlog.push_back(bytes);
+            let role = entry.role;
+            actions.push(PeerAction::StartDataPipe {
+                device_id: device_id.clone(),
+                role,
+                path: crate::transport::peer::ConnectPath::Gatt,
+                l2cap_channel: None,
+            });
+            return;
+        }
+
+        if matches!(entry.phase, PeerPhase::Connected { .. }) {
+            if let Some(pipe) = entry.pipe.as_ref() {
+                if pipe.inbound_tx.try_send(bytes).is_err() {
+                    // Pipe is gone or full; drop. Reliable protocol will retransmit.
+                }
+            } else {
+                const RX_BACKLOG_CAP: usize = 16;
+                if entry.rx_backlog.len() >= RX_BACKLOG_CAP {
+                    entry.rx_backlog.pop_front();
+                }
+                entry.rx_backlog.push_back(bytes);
+            }
+            return;
+        }
+
+        // Any other phase (Discovered / Connecting / Reconnecting /
+        // Restoring / Draining / Dead / Unknown): the peer is actively
+        // writing to us, which is the strongest liveness signal we
+        // have. Override the stale phase and rebuild as a fresh
+        // peripheral Connected so the new pipe can be spun up.
+        entry.pipe = None;
+        entry.role = crate::transport::peer::ConnectRole::Peripheral;
+        entry.tx_gen += 1;
+        entry.phase = PeerPhase::Connected {
+            since: now,
+            channel: crate::transport::peer::ChannelHandle {
+                id: 0,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+            tx_gen: entry.tx_gen,
+        };
+        entry.rx_backlog.push_back(bytes);
+        actions.push(PeerAction::StartDataPipe {
+            device_id: device_id.clone(),
+            role: crate::transport::peer::ConnectRole::Peripheral,
+            path: crate::transport::peer::ConnectPath::Gatt,
+            l2cap_channel: None,
+        });
+    }
+
+    fn handle_central_disconnected(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        cause: blew::DisconnectCause,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        let reason = crate::transport::peer::DisconnectReason::from(cause);
+        let channel = match &entry.phase {
+            PeerPhase::Connected { channel, .. } | PeerPhase::Handshaking { channel, .. } => {
+                Some(channel.clone())
+            }
+            _ => None,
+        };
+        let broken_pipe_acks = Self::drain_to_draining(entry, now, reason.clone());
+        actions.extend(broken_pipe_acks);
+        if let Some(ch) = channel {
+            actions.push(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                channel: ch,
+                reason: reason.clone(),
+            });
+        }
+        if matches!(reason, crate::transport::peer::DisconnectReason::Gatt133) {
+            actions.push(PeerAction::Refresh {
+                device_id: device_id.clone(),
+            });
+        }
+    }
+
+    fn handle_adapter_state_changed(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        powered: bool,
+    ) {
+        if !powered {
+            for entry in self.peers.values_mut() {
+                entry.phase = PeerPhase::Restoring { since: now };
+                entry.pending_sends.clear();
+            }
+        } else {
+            for entry in self.peers.values_mut() {
+                if matches!(entry.phase, PeerPhase::Restoring { .. }) {
+                    entry.phase = PeerPhase::Reconnecting {
+                        attempt: 0,
+                        next_at: now,
+                        reason: crate::transport::peer::DisconnectReason::AdapterOff,
+                    };
+                }
+            }
+            // Platform adapter-cycle wipes the peripheral's GATT table
+            // and advertising state on Android (and sometimes macOS); the
+            // driver re-registers services, restarts the advertiser, and
+            // (if L2CAP is enabled) re-opens the listener so inbound
+            // peers can find us again.
+            actions.push(PeerAction::RebuildGattServer);
+            actions.push(PeerAction::RestartAdvertising);
+            if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
+                actions.push(PeerAction::RestartL2capListener);
+            }
+        }
+    }
+
+    fn handle_restore_from_adapter(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        devices: Vec<blew::BleDevice>,
+    ) {
+        for device in devices {
+            if let Some(entry) = self.peers.get_mut(&device.id) {
+                if matches!(
+                    entry.phase,
+                    PeerPhase::Connected { .. } | PeerPhase::Handshaking { .. }
+                ) {
+                    continue;
+                }
+                entry.phase = PeerPhase::Restoring { since: now };
+            } else {
+                actions.push(PeerAction::EmitMetric(format!(
+                    "restore_unknown_device={}",
+                    device.id.as_str()
+                )));
+            }
+        }
+    }
+
+    fn handle_tick(&mut self, actions: &mut Vec<PeerAction>, tick_now: std::time::Instant) {
+        enum TickAction {
+            StartConnect {
+                attempt: u32,
+            },
+            DrainingToDead,
+            RestoringToDead,
+            HandshakingL2capTimeout {
+                channel: crate::transport::peer::ChannelHandle,
+            },
+        }
+
+        let mut decisions: Vec<(DeviceId, TickAction)> = Vec::new();
+        for (device_id, entry) in &self.peers {
+            let decision = match &entry.phase {
+                PeerPhase::Reconnecting {
+                    attempt, next_at, ..
+                } if *next_at <= tick_now => Some(TickAction::StartConnect { attempt: *attempt }),
+                PeerPhase::Draining { since, .. }
+                    if tick_now.saturating_duration_since(*since) > DRAINING_TIMEOUT =>
+                {
+                    Some(TickAction::DrainingToDead)
+                }
+                PeerPhase::Restoring { since }
+                    if tick_now.saturating_duration_since(*since) > RESTORING_TIMEOUT =>
+                {
+                    Some(TickAction::RestoringToDead)
+                }
+                PeerPhase::Handshaking {
+                    l2cap_deadline: Some(deadline),
+                    channel,
+                    ..
+                } if tick_now >= *deadline => Some(TickAction::HandshakingL2capTimeout {
+                    channel: channel.clone(),
+                }),
+                _ => None,
+            };
+            if let Some(a) = decision {
+                decisions.push((device_id.clone(), a));
+            }
+        }
+
+        for (device_id, action) in decisions {
+            let entry = self
+                .peers
+                .get_mut(&device_id)
+                .expect("device_id was just read from self.peers");
+            match action {
+                TickAction::StartConnect { attempt } => {
+                    entry.phase = PeerPhase::Connecting {
+                        attempt,
+                        started: tick_now,
+                        path: crate::transport::peer::ConnectPath::Gatt,
+                    };
+                    actions.push(PeerAction::StartConnect {
+                        device_id: device_id.clone(),
+                        attempt,
+                    });
+                }
+                TickAction::DrainingToDead => {
+                    // After the drain window, stop trying to rescue
+                    // this DeviceId. Reconnection is driven by fresh
+                    // advertising creating a new entry (common case:
+                    // Android MAC randomization on peer restart) or by
+                    // iroh issuing a new SendDatagram, not by the
+                    // registry's own retry loop.
+                    entry.phase = PeerPhase::Dead {
+                        reason: crate::transport::peer::DeadReason::Forgotten,
+                        at: tick_now,
+                    };
+                }
+                TickAction::RestoringToDead => {
+                    entry.phase = PeerPhase::Dead {
+                        reason: crate::transport::peer::DeadReason::Forgotten,
+                        at: tick_now,
+                    };
+                }
+                TickAction::HandshakingL2capTimeout { channel } => {
                     entry.tx_gen += 1;
                     let tx_gen = entry.tx_gen;
                     entry.phase = PeerPhase::Connected {
-                        since: now,
+                        since: tick_now,
                         channel,
                         tx_gen,
                     };
-                    entry.rx_backlog.push_back(bytes);
                     let role = entry.role;
                     actions.push(PeerAction::StartDataPipe {
                         device_id: device_id.clone(),
@@ -385,335 +719,264 @@ impl Registry {
                         path: crate::transport::peer::ConnectPath::Gatt,
                         l2cap_channel: None,
                     });
-                    return actions;
+                    actions.push(PeerAction::EmitMetric("l2cap_handshaking_timeout".into()));
                 }
+            }
+        }
 
-                if matches!(entry.phase, PeerPhase::Connected { .. }) {
-                    if let Some(pipe) = entry.pipe.as_ref() {
-                        if pipe.inbound_tx.try_send(bytes).is_err() {
-                            // Pipe is gone or full; drop. Reliable protocol will retransmit.
-                        }
-                    } else {
-                        const RX_BACKLOG_CAP: usize = 16;
-                        if entry.rx_backlog.len() >= RX_BACKLOG_CAP {
-                            entry.rx_backlog.pop_front();
-                        }
-                        entry.rx_backlog.push_back(bytes);
-                    }
-                    return actions;
-                }
+        // GC dead peers older than DEAD_GC_TTL
+        self.peers.retain(|_, entry| {
+            !matches!(
+                &entry.phase,
+                PeerPhase::Dead { at, .. } if tick_now.saturating_duration_since(*at) > DEAD_GC_TTL
+            )
+        });
+    }
 
-                // Any other phase (Discovered / Connecting / Reconnecting /
-                // Restoring / Draining / Dead / Unknown): the peer is actively
-                // writing to us, which is the strongest liveness signal we
-                // have. Override the stale phase and rebuild as a fresh
-                // peripheral Connected so the new pipe can be spun up.
-                entry.pipe = None;
-                entry.role = crate::transport::peer::ConnectRole::Peripheral;
-                entry.tx_gen += 1;
-                entry.phase = PeerPhase::Connected {
+    fn handle_forget(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        let channel = match &entry.phase {
+            PeerPhase::Connected { channel, .. } | PeerPhase::Handshaking { channel, .. } => {
+                Some(channel.clone())
+            }
+            _ => None,
+        };
+        let reason = crate::transport::peer::DisconnectReason::LocalClose;
+        entry.pipe = None;
+        for send in entry.pending_sends.drain(..) {
+            actions.push(PeerAction::AckSend {
+                tx_gen: send.tx_gen,
+                waker: send.waker,
+                result: Err(std::io::ErrorKind::ConnectionAborted),
+            });
+        }
+        entry.rx_backlog.clear();
+        entry.phase = PeerPhase::Dead {
+            reason: crate::transport::peer::DeadReason::Forgotten,
+            at: now,
+        };
+        if let Some(ch) = channel {
+            actions.push(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                channel: ch,
+                reason,
+            });
+        }
+    }
+
+    fn handle_stalled(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        let Some(channel) = (if let PeerPhase::Connected { channel, .. } = &entry.phase {
+            Some(channel.clone())
+        } else {
+            None
+        }) else {
+            return;
+        };
+        let reason = crate::transport::peer::DisconnectReason::LinkDead;
+        let broken_pipe_acks = Self::drain_to_draining(entry, now, reason.clone());
+        actions.extend(broken_pipe_acks);
+        actions.push(PeerAction::CloseChannel {
+            device_id: device_id.clone(),
+            channel,
+            reason,
+        });
+    }
+
+    fn handle_shutdown(&mut self, actions: &mut Vec<PeerAction>) {
+        for entry in self.peers.values_mut() {
+            for send in entry.pending_sends.drain(..) {
+                actions.push(PeerAction::AckSend {
+                    tx_gen: send.tx_gen,
+                    waker: send.waker,
+                    result: Err(std::io::ErrorKind::ConnectionAborted),
+                });
+            }
+        }
+    }
+
+    fn handle_data_pipe_ready(
+        &mut self,
+        device_id: DeviceId,
+        outbound_tx: tokio::sync::mpsc::Sender<crate::transport::peer::PendingSend>,
+        inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        // Drain rx_backlog first (preserves arrival order).
+        while let Some(bytes) = entry.rx_backlog.pop_front() {
+            if inbound_tx.try_send(bytes).is_err() {
+                break;
+            }
+        }
+        // Then drain pending_sends in FIFO order.
+        while let Some(send) = entry.pending_sends.pop_front() {
+            if let Err(tokio::sync::mpsc::error::TrySendError::Full(send))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(send)) =
+                outbound_tx.try_send(send)
+            {
+                entry.pending_sends.push_front(send);
+                break;
+            }
+        }
+        entry.pipe = Some(crate::transport::peer::PipeHandles {
+            outbound_tx,
+            inbound_tx,
+        });
+    }
+
+    fn handle_open_l2cap_succeeded(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        l2cap_chan: blew::L2capChannel,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        if !matches!(entry.phase, PeerPhase::Handshaking { .. }) {
+            return;
+        }
+        let gatt_channel = match &entry.phase {
+            PeerPhase::Handshaking { channel, .. } => channel.clone(),
+            _ => {
+                tracing::warn!(device = %device_id, "phase changed unexpectedly during L2CAP success");
+                return;
+            }
+        };
+        let l2cap_handle = crate::transport::peer::ChannelHandle {
+            id: gatt_channel.id,
+            path: crate::transport::peer::ConnectPath::L2cap,
+        };
+        entry.l2cap_channel = Some(l2cap_chan);
+        entry.tx_gen += 1;
+        let tx_gen = entry.tx_gen;
+        entry.phase = PeerPhase::Connected {
+            since: now,
+            channel: l2cap_handle,
+            tx_gen,
+        };
+        let role = entry.role;
+        actions.push(PeerAction::StartDataPipe {
+            device_id: device_id.clone(),
+            role,
+            path: crate::transport::peer::ConnectPath::L2cap,
+            l2cap_channel: entry.l2cap_channel.take(),
+        });
+    }
+
+    fn handle_open_l2cap_failed(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        error: &str,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        if !matches!(entry.phase, PeerPhase::Handshaking { .. }) {
+            return;
+        }
+        let channel = match &entry.phase {
+            PeerPhase::Handshaking { channel, .. } => channel.clone(),
+            _ => {
+                tracing::warn!(device = %device_id, "phase changed unexpectedly during L2CAP failure");
+                return;
+            }
+        };
+        entry.tx_gen += 1;
+        let tx_gen = entry.tx_gen;
+        entry.phase = PeerPhase::Connected {
+            since: now,
+            channel,
+            tx_gen,
+        };
+        let role = entry.role;
+        actions.push(PeerAction::StartDataPipe {
+            device_id: device_id.clone(),
+            role,
+            path: crate::transport::peer::ConnectPath::Gatt,
+            l2cap_channel: None,
+        });
+        actions.push(PeerAction::EmitMetric(format!(
+            "l2cap_fallback_to_gatt:{error}"
+        )));
+    }
+
+    fn handle_inbound_l2cap_channel(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        channel: blew::L2capChannel,
+    ) {
+        use std::collections::hash_map::Entry;
+        match self.peers.entry(device_id.clone()) {
+            Entry::Vacant(v) => {
+                let mut e = PeerEntry::new(device_id.clone());
+                e.role = crate::transport::peer::ConnectRole::Peripheral;
+                e.tx_gen = 1;
+                e.l2cap_channel = Some(channel);
+                e.phase = PeerPhase::Connected {
                     since: now,
                     channel: crate::transport::peer::ChannelHandle {
                         id: 0,
-                        path: crate::transport::peer::ConnectPath::Gatt,
+                        path: crate::transport::peer::ConnectPath::L2cap,
                     },
-                    tx_gen: entry.tx_gen,
+                    tx_gen: 1,
                 };
-                entry.rx_backlog.push_back(bytes);
+                let inserted = v.insert(e);
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
                     role: crate::transport::peer::ConnectRole::Peripheral,
-                    path: crate::transport::peer::ConnectPath::Gatt,
-                    l2cap_channel: None,
+                    path: crate::transport::peer::ConnectPath::L2cap,
+                    l2cap_channel: inserted.l2cap_channel.take(),
                 });
             }
-            PeerCommand::CentralDisconnected { device_id, cause } => {
-                let Some(entry) = self.peers.get_mut(&device_id) else {
-                    return actions;
-                };
-                let reason = crate::transport::peer::DisconnectReason::from(cause);
-                let channel = match &entry.phase {
-                    PeerPhase::Connected { channel, .. }
-                    | PeerPhase::Handshaking { channel, .. } => Some(channel.clone()),
-                    _ => None,
-                };
-                let broken_pipe_acks = Self::drain_to_draining(entry, now, reason.clone());
-                actions.extend(broken_pipe_acks);
-                if let Some(ch) = channel {
-                    actions.push(PeerAction::CloseChannel {
-                        device_id: device_id.clone(),
-                        channel: ch,
-                        reason: reason.clone(),
-                    });
-                }
-                if matches!(reason, crate::transport::peer::DisconnectReason::Gatt133) {
-                    actions.push(PeerAction::Refresh {
-                        device_id: device_id.clone(),
-                    });
-                }
-            }
-            PeerCommand::AdapterStateChanged { powered } => {
-                if !powered {
-                    for entry in self.peers.values_mut() {
-                        entry.phase = PeerPhase::Restoring { since: now };
-                        entry.pending_sends.clear();
-                    }
-                    actions.push(PeerAction::PurgeAllForAdapterOff);
-                } else {
-                    for entry in self.peers.values_mut() {
-                        if matches!(entry.phase, PeerPhase::Restoring { .. }) {
-                            entry.phase = PeerPhase::Reconnecting {
-                                attempt: 0,
-                                next_at: now,
-                                reason: crate::transport::peer::DisconnectReason::AdapterOff,
-                            };
-                        }
-                    }
-                }
-            }
-            PeerCommand::RestoreFromAdapter { devices } => {
-                for device in devices {
-                    if let Some(entry) = self.peers.get_mut(&device.id) {
-                        if matches!(
-                            entry.phase,
-                            PeerPhase::Connected { .. } | PeerPhase::Handshaking { .. }
-                        ) {
-                            continue;
-                        }
-                        entry.phase = PeerPhase::Restoring { since: now };
-                    } else {
-                        actions.push(PeerAction::EmitMetric(format!(
-                            "restore_unknown_device={}",
-                            device.id.as_str()
-                        )));
-                    }
-                }
-            }
-            PeerCommand::Tick(tick_now) => {
-                enum TickAction {
-                    StartConnect {
-                        attempt: u32,
-                    },
-                    DrainingToDead,
-                    RestoringToDead,
-                    HandshakingL2capTimeout {
-                        channel: crate::transport::peer::ChannelHandle,
-                    },
-                }
-
-                let mut decisions: Vec<(DeviceId, TickAction)> = Vec::new();
-                for (device_id, entry) in &self.peers {
-                    let decision = match &entry.phase {
-                        PeerPhase::Reconnecting {
-                            attempt, next_at, ..
-                        } if *next_at <= tick_now => {
-                            Some(TickAction::StartConnect { attempt: *attempt })
-                        }
-                        PeerPhase::Draining { since, .. }
-                            if tick_now.saturating_duration_since(*since) > DRAINING_TIMEOUT =>
-                        {
-                            Some(TickAction::DrainingToDead)
-                        }
-                        PeerPhase::Restoring { since }
-                            if tick_now.saturating_duration_since(*since) > RESTORING_TIMEOUT =>
-                        {
-                            Some(TickAction::RestoringToDead)
-                        }
-                        PeerPhase::Handshaking {
-                            since,
-                            l2cap_deadline: Some(_),
-                            channel,
-                        } if tick_now.saturating_duration_since(*since)
-                            > HANDSHAKING_L2CAP_WALL =>
-                        {
-                            Some(TickAction::HandshakingL2capTimeout {
-                                channel: channel.clone(),
-                            })
-                        }
+            Entry::Occupied(o) => {
+                let entry = o.into_mut();
+                if entry.pipe.is_some() {
+                    let existing_path = match &entry.phase {
+                        PeerPhase::Connected { channel, .. } => Some(channel.path),
                         _ => None,
                     };
-                    if let Some(a) = decision {
-                        decisions.push((device_id.clone(), a));
-                    }
-                }
-
-                for (device_id, action) in decisions {
-                    let entry = self
-                        .peers
-                        .get_mut(&device_id)
-                        .expect("device_id was just read from self.peers");
-                    match action {
-                        TickAction::StartConnect { attempt } => {
-                            entry.phase = PeerPhase::Connecting {
-                                attempt,
-                                started: tick_now,
-                                path: crate::transport::peer::ConnectPath::Gatt,
-                            };
-                            actions.push(PeerAction::StartConnect {
-                                device_id: device_id.clone(),
-                                attempt,
-                            });
+                    match existing_path {
+                        Some(crate::transport::peer::ConnectPath::L2cap) => {
+                            actions.push(PeerAction::EmitMetric("l2cap_duplicate_accept".into()));
                         }
-                        TickAction::DrainingToDead => {
-                            // After the drain window, stop trying to rescue
-                            // this DeviceId. Reconnection is driven by fresh
-                            // advertising creating a new entry (common case:
-                            // Android MAC randomization on peer restart) or by
-                            // iroh issuing a new SendDatagram, not by the
-                            // registry's own retry loop.
-                            entry.phase = PeerPhase::Dead {
-                                reason: crate::transport::peer::DeadReason::Forgotten,
-                                at: tick_now,
-                            };
-                        }
-                        TickAction::RestoringToDead => {
-                            entry.phase = PeerPhase::Dead {
-                                reason: crate::transport::peer::DeadReason::Forgotten,
-                                at: tick_now,
-                            };
-                        }
-                        TickAction::HandshakingL2capTimeout { channel } => {
-                            entry.tx_gen += 1;
-                            let tx_gen = entry.tx_gen;
-                            entry.phase = PeerPhase::Connected {
-                                since: tick_now,
-                                channel,
-                                tx_gen,
-                            };
-                            let role = entry.role;
-                            actions.push(PeerAction::StartDataPipe {
-                                device_id: device_id.clone(),
-                                role,
-                                path: crate::transport::peer::ConnectPath::Gatt,
-                                l2cap_channel: None,
-                            });
-                            actions
-                                .push(PeerAction::EmitMetric("l2cap_handshaking_timeout".into()));
-                        }
-                    }
-                }
-
-                // GC dead peers older than DEAD_GC_TTL
-                self.peers.retain(|_, entry| {
-                    !matches!(
-                        &entry.phase,
-                        PeerPhase::Dead { at, .. } if tick_now.saturating_duration_since(*at) > DEAD_GC_TTL
-                    )
-                });
-            }
-            PeerCommand::Forget { device_id } => {
-                if let Some(entry) = self.peers.get_mut(&device_id) {
-                    let channel = match &entry.phase {
-                        PeerPhase::Connected { channel, .. }
-                        | PeerPhase::Handshaking { channel, .. } => Some(channel.clone()),
-                        _ => None,
-                    };
-                    let reason = crate::transport::peer::DisconnectReason::LocalClose;
-                    entry.pipe = None;
-                    for send in entry.pending_sends.drain(..) {
-                        actions.push(PeerAction::AckSend {
-                            tx_gen: send.tx_gen,
-                            waker: send.waker,
-                            result: Err(std::io::ErrorKind::ConnectionAborted),
-                        });
-                    }
-                    entry.rx_backlog.clear();
-                    entry.phase = PeerPhase::Dead {
-                        reason: crate::transport::peer::DeadReason::Forgotten,
-                        at: now,
-                    };
-                    if let Some(ch) = channel {
-                        actions.push(PeerAction::CloseChannel {
-                            device_id: device_id.clone(),
-                            channel: ch,
-                            reason,
-                        });
-                    }
-                }
-            }
-            PeerCommand::Stalled { device_id } => {
-                if let Some(entry) = self.peers.get_mut(&device_id) {
-                    let channel = if let PeerPhase::Connected { channel, .. } = &entry.phase {
-                        Some(channel.clone())
-                    } else {
-                        None
-                    };
-                    if let Some(channel) = channel {
-                        let reason = crate::transport::peer::DisconnectReason::LinkDead;
-                        let broken_pipe_acks = Self::drain_to_draining(entry, now, reason.clone());
-                        actions.extend(broken_pipe_acks);
-                        actions.push(PeerAction::CloseChannel {
-                            device_id: device_id.clone(),
-                            channel,
-                            reason,
-                        });
-                    }
-                }
-            }
-            PeerCommand::Shutdown => {
-                for entry in self.peers.values_mut() {
-                    for send in entry.pending_sends.drain(..) {
-                        actions.push(PeerAction::AckSend {
-                            tx_gen: send.tx_gen,
-                            waker: send.waker,
-                            result: Err(std::io::ErrorKind::ConnectionAborted),
-                        });
-                    }
-                }
-            }
-            PeerCommand::DataPipeReady {
-                device_id,
-                outbound_tx,
-                inbound_tx,
-            } => {
-                let Some(entry) = self.peers.get_mut(&device_id) else {
-                    return actions;
-                };
-                // Drain rx_backlog first (preserves arrival order).
-                while let Some(bytes) = entry.rx_backlog.pop_front() {
-                    if inbound_tx.try_send(bytes).is_err() {
-                        break;
-                    }
-                }
-                // Then drain pending_sends in FIFO order.
-                while let Some(send) = entry.pending_sends.pop_front() {
-                    if let Err(tokio::sync::mpsc::error::TrySendError::Full(send))
-                    | Err(tokio::sync::mpsc::error::TrySendError::Closed(send)) =
-                        outbound_tx.try_send(send)
-                    {
-                        entry.pending_sends.push_front(send);
-                        break;
-                    }
-                }
-                entry.pipe = Some(crate::transport::peer::PipeHandles {
-                    outbound_tx,
-                    inbound_tx,
-                });
-            }
-            PeerCommand::OpenL2capSucceeded {
-                device_id,
-                channel: l2cap_chan,
-            } => {
-                if let Some(entry) = self.peers.get_mut(&device_id)
-                    && matches!(entry.phase, PeerPhase::Handshaking { .. })
-                {
-                    let gatt_channel = match &entry.phase {
-                        PeerPhase::Handshaking { channel, .. } => channel.clone(),
                         _ => {
-                            tracing::warn!(device = %device_id, "phase changed unexpectedly during L2CAP success");
-                            return actions;
+                            actions.push(PeerAction::EmitMetric(
+                                "l2cap_late_accept_after_gatt".into(),
+                            ));
                         }
-                    };
-                    let l2cap_handle = crate::transport::peer::ChannelHandle {
-                        id: gatt_channel.id,
-                        path: crate::transport::peer::ConnectPath::L2cap,
-                    };
-                    entry.l2cap_channel = Some(l2cap_chan);
+                    }
+                } else {
+                    entry.l2cap_channel = Some(channel);
                     entry.tx_gen += 1;
                     let tx_gen = entry.tx_gen;
                     entry.phase = PeerPhase::Connected {
                         since: now,
-                        channel: l2cap_handle,
+                        channel: crate::transport::peer::ChannelHandle {
+                            id: 0,
+                            path: crate::transport::peer::ConnectPath::L2cap,
+                        },
                         tx_gen,
                     };
                     let role = entry.role;
@@ -725,105 +988,43 @@ impl Registry {
                     });
                 }
             }
-            PeerCommand::OpenL2capFailed { device_id, error } => {
-                if let Some(entry) = self.peers.get_mut(&device_id)
-                    && matches!(entry.phase, PeerPhase::Handshaking { .. })
-                {
-                    let channel = match &entry.phase {
-                        PeerPhase::Handshaking { channel, .. } => channel.clone(),
-                        _ => {
-                            tracing::warn!(device = %device_id, "phase changed unexpectedly during L2CAP failure");
-                            return actions;
-                        }
-                    };
-                    entry.tx_gen += 1;
-                    let tx_gen = entry.tx_gen;
-                    entry.phase = PeerPhase::Connected {
-                        since: now,
-                        channel,
-                        tx_gen,
-                    };
-                    let role = entry.role;
-                    actions.push(PeerAction::StartDataPipe {
-                        device_id: device_id.clone(),
-                        role,
-                        path: crate::transport::peer::ConnectPath::Gatt,
-                        l2cap_channel: None,
-                    });
-                    actions.push(PeerAction::EmitMetric(format!(
-                        "l2cap_fallback_to_gatt:{error}"
-                    )));
-                }
-            }
-            PeerCommand::InboundL2capChannel { device_id, channel } => {
-                use std::collections::hash_map::Entry;
-                match self.peers.entry(device_id.clone()) {
-                    Entry::Vacant(v) => {
-                        let mut e = PeerEntry::new(device_id.clone());
-                        e.role = crate::transport::peer::ConnectRole::Peripheral;
-                        e.tx_gen = 1;
-                        e.l2cap_channel = Some(channel);
-                        e.phase = PeerPhase::Connected {
-                            since: now,
-                            channel: crate::transport::peer::ChannelHandle {
-                                id: 0,
-                                path: crate::transport::peer::ConnectPath::L2cap,
-                            },
-                            tx_gen: 1,
-                        };
-                        let inserted = v.insert(e);
-                        actions.push(PeerAction::StartDataPipe {
-                            device_id: device_id.clone(),
-                            role: crate::transport::peer::ConnectRole::Peripheral,
-                            path: crate::transport::peer::ConnectPath::L2cap,
-                            l2cap_channel: inserted.l2cap_channel.take(),
-                        });
-                    }
-                    Entry::Occupied(o) => {
-                        let entry = o.into_mut();
-                        if entry.pipe.is_some() {
-                            let existing_path = match &entry.phase {
-                                PeerPhase::Connected { channel, .. } => Some(channel.path),
-                                _ => None,
-                            };
-                            match existing_path {
-                                Some(crate::transport::peer::ConnectPath::L2cap) => {
-                                    actions.push(PeerAction::EmitMetric(
-                                        "l2cap_duplicate_accept".into(),
-                                    ));
-                                }
-                                _ => {
-                                    actions.push(PeerAction::EmitMetric(
-                                        "l2cap_late_accept_after_gatt".into(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            entry.l2cap_channel = Some(channel);
-                            entry.tx_gen += 1;
-                            let tx_gen = entry.tx_gen;
-                            entry.phase = PeerPhase::Connected {
-                                since: now,
-                                channel: crate::transport::peer::ChannelHandle {
-                                    id: 0,
-                                    path: crate::transport::peer::ConnectPath::L2cap,
-                                },
-                                tx_gen,
-                            };
-                            let role = entry.role;
-                            actions.push(PeerAction::StartDataPipe {
-                                device_id: device_id.clone(),
-                                role,
-                                path: crate::transport::peer::ConnectPath::L2cap,
-                                l2cap_channel: entry.l2cap_channel.take(),
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
-        actions
+    }
+
+    fn handle_protocol_version_mismatch(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        got: u8,
+        want: u8,
+    ) {
+        let Some(entry) = self.peers.get_mut(&device_id) else {
+            return;
+        };
+        let channel = match &entry.phase {
+            PeerPhase::Handshaking { channel, .. } | PeerPhase::Connected { channel, .. } => {
+                Some(channel.clone())
+            }
+            _ => None,
+        };
+        let broken_pipe_acks = Self::drain_to_draining(
+            entry,
+            now,
+            crate::transport::peer::DisconnectReason::ProtocolMismatch,
+        );
+        actions.extend(broken_pipe_acks);
+        entry.phase = PeerPhase::Dead {
+            reason: crate::transport::peer::DeadReason::ProtocolMismatch { got, want },
+            at: now,
+        };
+        if let Some(ch) = channel {
+            actions.push(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                channel: ch,
+                reason: crate::transport::peer::DisconnectReason::ProtocolMismatch,
+            });
+        }
     }
 
     #[cfg(test)]
@@ -837,12 +1038,22 @@ impl Registry {
         reason: crate::transport::peer::DisconnectReason,
     ) -> Vec<PeerAction> {
         let mut out = Vec::new();
+        let was_connected = matches!(entry.phase, PeerPhase::Connected { .. });
         entry.pipe = None;
         for send in entry.pending_sends.drain(..) {
             out.push(PeerAction::AckSend {
                 tx_gen: send.tx_gen,
                 waker: send.waker,
                 result: Err(std::io::ErrorKind::BrokenPipe),
+            });
+        }
+        if was_connected && let Some(prefix) = entry.prefix {
+            out.push(PeerAction::PutPeerStore {
+                prefix,
+                snapshot: crate::transport::store::PeerSnapshot {
+                    last_device_id: entry.device_id.as_str().to_string(),
+                    last_seen: std::time::SystemTime::now(),
+                },
             });
         }
         entry.phase = PeerPhase::Draining { since: now, reason };
@@ -878,8 +1089,12 @@ impl Registry {
         mut rx: mpsc::Receiver<PeerCommand>,
         driver: Driver<I>,
         snapshots: Arc<ArcSwap<SnapshotMaps>>,
+        inbox_capacity_waker: Arc<AtomicWaker>,
     ) {
         while let Some(cmd) = rx.recv().await {
+            // Wake BleSender::poll_send callers waiting on backpressure — we
+            // just freed a slot in the inbox.
+            inbox_capacity_waker.wake();
             let shutdown = matches!(cmd, PeerCommand::Shutdown);
             let actions = self.handle(cmd);
             for action in actions {
@@ -1313,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_off_moves_all_peers_to_restoring_with_single_purge() {
+    fn adapter_off_moves_all_peers_to_restoring() {
         let mut reg = Registry::new_for_test();
         let now = std::time::Instant::now();
         let mut ids = Vec::new();
@@ -1334,11 +1549,10 @@ mod tests {
             ids.push(device_id);
         }
         let actions = reg.handle(PeerCommand::AdapterStateChanged { powered: false });
-        let purge_count = actions
-            .iter()
-            .filter(|a| matches!(a, PeerAction::PurgeAllForAdapterOff))
-            .count();
-        assert_eq!(purge_count, 1, "exactly one purge action for whole adapter");
+        assert!(
+            actions.is_empty(),
+            "powered=false emits no driver actions; blew tears the stack down on its own, and rebuild/restart fire on powered=true"
+        );
         for device_id in &ids {
             assert!(matches!(
                 reg.peer(device_id).unwrap().phase,
@@ -1391,13 +1605,39 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::AdapterStateChanged { powered: true });
         assert!(
-            actions.is_empty(),
-            "no actions yet; Tick drives Connecting later"
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::RebuildGattServer)),
+            "expected RebuildGattServer on adapter-on"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::RestartAdvertising)),
+            "expected RestartAdvertising on adapter-on"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::RestartL2capListener)),
+            "L2capPolicy::Disabled should not request an L2CAP restart"
         );
         match &reg.peer(&device_id).unwrap().phase {
             PeerPhase::Reconnecting { attempt: 0, .. } => {}
             other => panic!("wrong phase: {other:?}"),
         }
+    }
+
+    #[test]
+    fn adapter_on_with_l2cap_policy_also_restarts_listener() {
+        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let actions = reg.handle(PeerCommand::AdapterStateChanged { powered: true });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::RestartL2capListener)),
+            "PreferL2cap should request an L2CAP listener restart on adapter-on"
+        );
     }
 
     #[test]
@@ -2935,42 +3175,6 @@ mod tests {
     }
 
     #[test]
-    fn handshaking_l2cap_wall_timeout_falls_back_to_gatt() {
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
-        let device_id = blew::DeviceId::from("dev-l2-timeout");
-        let old = std::time::Instant::now() - Duration::from_secs(10);
-        reg.peers.insert(device_id.clone(), {
-            let mut e = PeerEntry::new(device_id.clone());
-            e.phase = PeerPhase::Handshaking {
-                since: old,
-                channel: crate::transport::peer::ChannelHandle {
-                    id: 1,
-                    path: crate::transport::peer::ConnectPath::Gatt,
-                },
-                l2cap_deadline: Some(old + Duration::from_millis(1500)),
-            };
-            e
-        });
-        let actions = reg.handle(PeerCommand::Tick(std::time::Instant::now()));
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PeerAction::StartDataPipe {
-                path: crate::transport::peer::ConnectPath::Gatt,
-                ..
-            }
-        )));
-        assert!(actions.iter().any(
-            |a| matches!(a, PeerAction::EmitMetric(s) if s.contains("l2cap_handshaking_timeout"))
-        ));
-        match &reg.peer(&device_id).unwrap().phase {
-            PeerPhase::Connected { channel, .. } => {
-                assert_eq!(channel.path, crate::transport::peer::ConnectPath::Gatt);
-            }
-            other => panic!("expected Connected Gatt after timeout, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn inbound_fragment_reconstructs_dead_peer_as_peripheral() {
         let mut reg = Registry::new_for_test();
         let device_id = blew::DeviceId::from("dev-resurrect");
@@ -3044,5 +3248,237 @@ mod tests {
             "all 3 pending sends acked with BrokenPipe"
         );
         assert!(reg.peer(&device_id).unwrap().pending_sends.is_empty());
+    }
+
+    #[test]
+    fn connect_succeeded_emits_read_version() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath};
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-readver");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: ChannelHandle {
+                id: 1,
+                path: ConnectPath::Gatt,
+            },
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::ReadVersion { device_id: d } if *d == device_id
+            )),
+            "expected ReadVersion; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn protocol_version_mismatch_from_connected_dead_and_closes_channel() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath};
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-pv");
+        let channel = ChannelHandle {
+            id: 7,
+            path: ConnectPath::Gatt,
+        };
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: channel.clone(),
+                tx_gen: 1,
+            };
+            e
+        });
+        let actions = reg.handle(PeerCommand::ProtocolVersionMismatch {
+            device_id: device_id.clone(),
+            got: 7,
+            want: 1,
+        });
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PeerAction::CloseChannel { device_id: d, .. } if *d == device_id
+        )));
+        match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Dead {
+                reason: crate::transport::peer::DeadReason::ProtocolMismatch { got: 7, want: 1 },
+                ..
+            } => {}
+            other => panic!("wrong phase: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn protocol_version_mismatch_is_noop_for_unknown_peer() {
+        let mut reg = Registry::new_for_test();
+        let actions = reg.handle(PeerCommand::ProtocolVersionMismatch {
+            device_id: blew::DeviceId::from("dev-unknown"),
+            got: 9,
+            want: 1,
+        });
+        assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn connected_to_draining_emits_put_peer_store_when_prefix_known() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-store-put");
+        let prefix: crate::transport::peer::KeyPrefix = [0x77; 12];
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.prefix = Some(prefix);
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+            };
+            e
+        });
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::RemoteClose,
+        });
+        let put = actions.iter().find_map(|a| match a {
+            PeerAction::PutPeerStore {
+                prefix: p,
+                snapshot,
+            } => Some((*p, snapshot.clone())),
+            _ => None,
+        });
+        let (put_prefix, snapshot) = put.expect("expected PutPeerStore");
+        assert_eq!(put_prefix, prefix);
+        assert_eq!(snapshot.last_device_id, device_id.as_str());
+    }
+
+    #[test]
+    fn draining_from_handshaking_does_not_emit_put_peer_store() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-store-handshake-drain");
+        let prefix: crate::transport::peer::KeyPrefix = [0x78; 12];
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.prefix = Some(prefix);
+            e.phase = PeerPhase::Handshaking {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                l2cap_deadline: None,
+            };
+            e
+        });
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id,
+            cause: blew::DisconnectCause::RemoteClose,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::PutPeerStore { .. })),
+            "Handshaking peers have not yet proved themselves — do not persist them; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn connected_to_draining_skips_put_when_prefix_unknown() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-store-no-prefix");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.prefix = None;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+            };
+            e
+        });
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id,
+            cause: blew::DisconnectCause::RemoteClose,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::PutPeerStore { .. })),
+            "prefix-less peers are not persisted; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn max_retries_emits_forget_peer_store() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-forget");
+        let prefix: crate::transport::peer::KeyPrefix = [0x79; 12];
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.prefix = Some(prefix);
+            e.consecutive_failures = 14;
+            e.phase = PeerPhase::Connecting {
+                attempt: 14,
+                started: std::time::Instant::now(),
+                path: crate::transport::peer::ConnectPath::Gatt,
+            };
+            e
+        });
+        let actions = reg.handle(PeerCommand::ConnectFailed {
+            device_id: device_id.clone(),
+            error: "final boom".into(),
+        });
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Dead {
+                reason: crate::transport::peer::DeadReason::MaxRetries,
+                ..
+            }
+        ));
+        let forget = actions.iter().find_map(|a| match a {
+            PeerAction::ForgetPeerStore { prefix: p } => Some(*p),
+            _ => None,
+        });
+        assert_eq!(
+            forget,
+            Some(prefix),
+            "expected ForgetPeerStore; {actions:?}"
+        );
+    }
+
+    #[test]
+    fn advertised_records_prefix_on_peer_entry() {
+        let mut reg = Registry::new_for_test();
+        let device = blew::BleDevice {
+            id: blew::DeviceId::from("dev-prefix"),
+            name: None,
+            rssi: None,
+            services: vec![],
+        };
+        let prefix: crate::transport::peer::KeyPrefix = [0xAB; 12];
+        reg.handle(PeerCommand::Advertised {
+            prefix,
+            device: device.clone(),
+            rssi: None,
+        });
+        assert_eq!(reg.peer(&device.id).unwrap().prefix, Some(prefix));
     }
 }

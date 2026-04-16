@@ -19,6 +19,7 @@ pub enum CallKind {
     WriteC2p { device_id: DeviceId, bytes: Bytes },
     NotifyP2c { device_id: DeviceId, bytes: Bytes },
     ReadPsm(DeviceId),
+    ReadVersion(DeviceId),
     OpenL2cap(DeviceId, u16),
     StartScan,
     StopScan,
@@ -44,6 +45,7 @@ struct Inner {
     on_c2p_write: Option<Box<dyn Fn(Bytes) + Send + Sync>>,
     on_p2c_notify: Option<Box<dyn Fn(Bytes) + Send + Sync>>,
     psm_responses: VecDeque<Option<u16>>,
+    version_responses: VecDeque<Option<u8>>,
     mtu_responses: VecDeque<u16>,
     mtu_default: u16,
 }
@@ -81,6 +83,7 @@ impl MockBleInterface {
                 on_c2p_write: None,
                 on_p2c_notify: None,
                 psm_responses: VecDeque::new(),
+                version_responses: VecDeque::new(),
                 mtu_responses: VecDeque::new(),
                 mtu_default: 512,
             })),
@@ -160,6 +163,17 @@ impl MockBleInterface {
 
     pub fn seed_psm(&self, psm: Option<u16>) {
         self.inner.lock().unwrap().psm_responses.push_back(psm);
+    }
+
+    /// Queue one response for the next `read_version()` call. `None` means
+    /// "peer does not publish VERSION"; `Some(v)` is the byte the central
+    /// will observe.
+    pub fn seed_version(&self, version: Option<u8>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .version_responses
+            .push_back(version);
     }
 
     pub fn assert_called(&self, kind: &CallKind) {
@@ -260,6 +274,12 @@ impl BleInterface for MockBleInterface {
             self.inner.lock().unwrap().on_p2c_notify = Some(h);
         }
         Ok(())
+    }
+
+    async fn read_version(&self, device_id: &DeviceId) -> BleResult<Option<u8>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(CallKind::ReadVersion(device_id.clone()));
+        Ok(inner.version_responses.pop_front().flatten())
     }
 
     async fn read_psm(&self, device_id: &DeviceId) -> BleResult<Option<u16>> {

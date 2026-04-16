@@ -181,6 +181,8 @@ pub async fn run_peripheral_events(
                     } else {
                         responder.respond(Vec::new());
                     }
+                } else if char_uuid == crate::transport::transport::IROH_VERSION_CHAR_UUID {
+                    responder.respond(vec![crate::transport::transport::PROTOCOL_VERSION]);
                 } else {
                     responder.respond(Vec::new());
                 }

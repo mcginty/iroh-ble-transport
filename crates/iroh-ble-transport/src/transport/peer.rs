@@ -43,12 +43,24 @@ pub struct PeerEntry {
     pub last_rx: Option<Instant>,
     pub last_tx: Option<Instant>,
     pub consecutive_failures: u32,
+    /// Monotonic "which data-pipe generation this peer is on." Bumped every
+    /// time the peer enters `Connected` with a freshly-built pipe. Every
+    /// `SendDatagram` command carries the tx_gen of the pipe it was minted
+    /// for, so a datagram queued against an old pipe (e.g. one that was torn
+    /// down and rebuilt while the send sat in iroh's outbox) can be detected
+    /// and rejected rather than silently delivered on a channel the caller
+    /// never intended. Never decrements; the starting value is 0.
     pub tx_gen: u64,
     pub pending_sends: VecDeque<PendingSend>,
     pub role: ConnectRole,
     pub pipe: Option<PipeHandles>,
     pub rx_backlog: VecDeque<Bytes>,
     pub l2cap_channel: Option<L2capChannel>,
+    /// Peer's 12-byte advertising prefix, learned from a scan. `None` when
+    /// the entry was created by an inbound path (GATT write / L2CAP accept)
+    /// before scan ever saw the advertisement — those peers don't get
+    /// persisted to the `PeerStore` because we have no stable key for them.
+    pub prefix: Option<KeyPrefix>,
 }
 
 impl PeerEntry {
@@ -66,6 +78,7 @@ impl PeerEntry {
             pipe: None,
             rx_backlog: VecDeque::new(),
             l2cap_channel: None,
+            prefix: None,
         }
     }
 }
@@ -92,6 +105,7 @@ pub enum DisconnectReason {
     Gatt133,
     Timeout,
     LinkDead,
+    ProtocolMismatch,
     Unknown(i32),
 }
 
@@ -215,6 +229,15 @@ pub enum PeerCommand {
         device_id: DeviceId,
         error: String,
     },
+    /// Central read the peer's VERSION characteristic and got back a byte
+    /// that does not match our `PROTOCOL_VERSION`. The registry tears the
+    /// peer down into `Dead { ProtocolMismatch }` rather than letting an
+    /// incompatible data pipe start.
+    ProtocolVersionMismatch {
+        device_id: DeviceId,
+        got: u8,
+        want: u8,
+    },
     Stalled {
         device_id: DeviceId,
     },
@@ -242,6 +265,12 @@ pub enum PeerAction {
     OpenL2cap {
         device_id: DeviceId,
     },
+    /// Read the peer's VERSION characteristic and, on mismatch, emit
+    /// [`PeerCommand::ProtocolVersionMismatch`] so the registry can Dead
+    /// the peer instead of running an incompatible data pipe.
+    ReadVersion {
+        device_id: DeviceId,
+    },
     CloseChannel {
         device_id: DeviceId,
         channel: ChannelHandle,
@@ -257,12 +286,25 @@ pub enum PeerAction {
     },
     RebuildGattServer,
     RestartAdvertising,
-    PurgeAllForAdapterOff,
+    RestartL2capListener,
     StartDataPipe {
         device_id: DeviceId,
         role: ConnectRole,
         path: ConnectPath,
         l2cap_channel: Option<L2capChannel>,
+    },
+    /// Persist a snapshot of this peer to the configured `PeerStore`. Emitted
+    /// when a peer leaves `Connected` for `Draining`: we've seen enough of
+    /// this peer to want to remember them across restarts.
+    PutPeerStore {
+        prefix: KeyPrefix,
+        snapshot: crate::transport::store::PeerSnapshot,
+    },
+    /// Drop a peer from the configured `PeerStore`. Emitted when the registry
+    /// declares the peer permanently unusable (e.g. `Dead { MaxRetries }`):
+    /// there's no reason to keep trying after transport restart.
+    ForgetPeerStore {
+        prefix: KeyPrefix,
     },
     EmitMetric(String),
 }

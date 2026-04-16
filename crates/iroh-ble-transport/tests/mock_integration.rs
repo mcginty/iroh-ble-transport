@@ -5,10 +5,12 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use atomic_waker::AtomicWaker;
 use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{ChannelHandle, ConnectPath, KEY_PREFIX_LEN, KeyPrefix, PeerCommand},
     registry::{Registry, SnapshotMaps},
+    store::InMemoryPeerStore,
     test_util::{CallKind, MockBleInterface},
     transport::L2capPolicy,
 };
@@ -40,11 +42,13 @@ async fn advertised_then_send_triggers_connect_and_ack() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
     });
 
     let prefix: KeyPrefix = [1u8; KEY_PREFIX_LEN];
@@ -134,11 +138,13 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
     });
     tokio::spawn(iroh_ble_transport::transport::watchdog::run_watchdog(
         tx.clone(),
@@ -239,11 +245,13 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
     });
     tokio::spawn(iroh_ble_transport::transport::watchdog::run_watchdog(
         tx.clone(),
@@ -293,6 +301,216 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
+    let iface = Arc::new(MockBleInterface::new());
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+        Arc::new(InMemoryPeerStore::new()),
+    );
+    let reg = Registry::new(L2capPolicy::PreferL2cap);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
+    });
+
+    tx.send(PeerCommand::AdapterStateChanged { powered: false })
+        .await
+        .unwrap();
+    tx.send(PeerCommand::AdapterStateChanged { powered: true })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let calls = iface.calls();
+            let has_rebuild = calls.iter().any(|c| matches!(c, CallKind::RebuildServer));
+            let has_restart_adv = calls
+                .iter()
+                .any(|c| matches!(c, CallKind::RestartAdvertising));
+            let has_restart_l2cap = calls
+                .iter()
+                .any(|c| matches!(c, CallKind::RestartL2capListener));
+            if has_rebuild && has_restart_adv && has_restart_l2cap {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "expected rebuild_server + restart_advertising + restart_l2cap_listener after adapter-on",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_mismatch_deads_peer_and_closes_channel() {
+    use iroh_ble_transport::transport::peer::DeadReason;
+    use iroh_ble_transport::transport::registry::PhaseKind;
+
+    let iface = Arc::new(MockBleInterface::new());
+    let device_id = blew::DeviceId::from("dev-vmismatch");
+    iface.on_connect(
+        device_id.clone(),
+        Ok(ChannelHandle {
+            id: 1,
+            path: ConnectPath::Gatt,
+        }),
+    );
+    // Seed a peer-advertised version that disagrees with our compile-time one.
+    iface.seed_version(Some(0xAA));
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(64);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(8);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+        Arc::new(InMemoryPeerStore::new()),
+    );
+    let reg = Registry::new(L2capPolicy::Disabled);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
+    });
+
+    let prefix: KeyPrefix = [0x77; KEY_PREFIX_LEN];
+    tx.send(PeerCommand::Advertised {
+        prefix,
+        device: blew::BleDevice {
+            id: device_id.clone(),
+            name: None,
+            rssi: None,
+            services: vec![],
+        },
+        rssi: None,
+    })
+    .await
+    .unwrap();
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
+    tx.send(PeerCommand::SendDatagram {
+        device_id: device_id.clone(),
+        tx_gen: 0,
+        datagram: bytes::Bytes::from_static(b"x"),
+        waker: waker_from_channel(waker_tx),
+    })
+    .await
+    .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snap = snapshots.load();
+            if let Some(summary) = snap.peer_states.get(&device_id)
+                && summary.phase_kind == PhaseKind::Dead
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer should reach Dead after version mismatch");
+
+    assert!(
+        iface
+            .calls()
+            .iter()
+            .any(|c| matches!(c, CallKind::ReadVersion(d) if d == &device_id)),
+        "expected read_version to be called"
+    );
+    assert!(
+        iface
+            .calls()
+            .iter()
+            .any(|c| matches!(c, CallKind::Disconnect(d) if d == &device_id)),
+        "expected disconnect after version mismatch"
+    );
+    let _ = DeadReason::ProtocolMismatch { got: 0, want: 0 };
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_match_lets_data_pipe_start() {
+    let iface = Arc::new(MockBleInterface::new());
+    let device_id = blew::DeviceId::from("dev-vmatch");
+    iface.on_connect(
+        device_id.clone(),
+        Ok(ChannelHandle {
+            id: 1,
+            path: ConnectPath::Gatt,
+        }),
+    );
+    iface.seed_version(Some(
+        iroh_ble_transport::transport::transport::PROTOCOL_VERSION,
+    ));
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(64);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(8);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+        Arc::new(InMemoryPeerStore::new()),
+    );
+    let reg = Registry::new(L2capPolicy::Disabled);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
+    });
+
+    let prefix: KeyPrefix = [0x78; KEY_PREFIX_LEN];
+    tx.send(PeerCommand::Advertised {
+        prefix,
+        device: blew::BleDevice {
+            id: device_id.clone(),
+            name: None,
+            rssi: None,
+            services: vec![],
+        },
+        rssi: None,
+    })
+    .await
+    .unwrap();
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
+    tx.send(PeerCommand::SendDatagram {
+        device_id: device_id.clone(),
+        tx_gen: 0,
+        datagram: bytes::Bytes::from_static(b"x"),
+        waker: waker_from_channel(waker_tx),
+    })
+    .await
+    .unwrap();
+
+    wait_for_call_count(&iface, CallKindMatcher::Connect, 1, Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !iface
+            .calls()
+            .iter()
+            .any(|c| matches!(c, CallKind::Disconnect(d) if d == &device_id)),
+        "matching version must not trigger a disconnect"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn full_round_trip_over_mock_gatt() {
     use iroh_ble_transport::transport::test_util::MockFabric;
 
@@ -315,6 +533,7 @@ async fn full_round_trip_over_mock_gatt() {
         central_incoming_tx,
         c_retransmits,
         c_truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let peripheral_driver = Driver::new(
         fabric.peripheral.clone(),
@@ -322,6 +541,7 @@ async fn full_round_trip_over_mock_gatt() {
         peripheral_incoming_tx,
         p_retransmits,
         p_truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
 
     let central_reg = Registry::new(L2capPolicy::Disabled);
@@ -329,11 +549,23 @@ async fn full_round_trip_over_mock_gatt() {
     let cs = central_snapshots.clone();
     let ps = peripheral_snapshots.clone();
     tokio::spawn(async move {
-        central_reg.run(central_inbox_rx, central_driver, cs).await;
+        central_reg
+            .run(
+                central_inbox_rx,
+                central_driver,
+                cs,
+                Arc::new(AtomicWaker::new()),
+            )
+            .await;
     });
     tokio::spawn(async move {
         peripheral_reg
-            .run(peripheral_inbox_rx, peripheral_driver, ps)
+            .run(
+                peripheral_inbox_rx,
+                peripheral_driver,
+                ps,
+                Arc::new(AtomicWaker::new()),
+            )
             .await;
     });
 
@@ -395,6 +627,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         central_incoming_tx,
         c_retransmits,
         c_truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let peripheral_driver = Driver::new(
         fabric.peripheral.clone(),
@@ -402,6 +635,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         peripheral_incoming_tx,
         p_retransmits,
         p_truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
 
     let central_reg = Registry::new(L2capPolicy::Disabled);
@@ -409,11 +643,23 @@ async fn mock_fabric_handles_bidirectional_traffic() {
     let cs = central_snapshots.clone();
     let ps = peripheral_snapshots.clone();
     tokio::spawn(async move {
-        central_reg.run(central_inbox_rx, central_driver, cs).await;
+        central_reg
+            .run(
+                central_inbox_rx,
+                central_driver,
+                cs,
+                Arc::new(AtomicWaker::new()),
+            )
+            .await;
     });
     tokio::spawn(async move {
         peripheral_reg
-            .run(peripheral_inbox_rx, peripheral_driver, ps)
+            .run(
+                peripheral_inbox_rx,
+                peripheral_driver,
+                ps,
+                Arc::new(AtomicWaker::new()),
+            )
             .await;
     });
 
@@ -540,11 +786,13 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
     });
 
     // First lifecycle: advertise, send, wait for connect.
@@ -653,11 +901,13 @@ async fn connect_failure_retries_on_next_tick() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
     });
 
     let prefix: KeyPrefix = [9u8; KEY_PREFIX_LEN];
@@ -760,11 +1010,13 @@ async fn l2cap_prefer_succeeds_and_connects_via_l2cap() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new(L2capPolicy::PreferL2cap);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
     });
 
     let prefix: KeyPrefix = [0xCCu8; KEY_PREFIX_LEN];
@@ -857,11 +1109,13 @@ async fn l2cap_prefer_fallback_to_gatt_on_failure() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new(L2capPolicy::PreferL2cap);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
+            .await;
     });
 
     let prefix: KeyPrefix = [0xDDu8; KEY_PREFIX_LEN];

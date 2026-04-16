@@ -7,6 +7,11 @@ use tokio::sync::mpsc;
 
 use crate::transport::peer::PeerCommand;
 
+// TODO(perf): gate this pump on peer presence. Today we tick every 250 ms
+// forever, even when the registry has zero peers and nothing to time out.
+// A peer-presence notify (set when `peers` becomes non-empty, cleared when
+// it drains) would let idle apps suspend the pump entirely; wake it back
+// up the moment the first Advertised/Inbound* command arrives.
 pub const TICK_INTERVAL: Duration = Duration::from_millis(250);
 
 pub async fn run_watchdog(inbox: mpsc::Sender<PeerCommand>) {

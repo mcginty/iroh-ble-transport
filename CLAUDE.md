@@ -149,8 +149,7 @@ Key constants (registry.rs):
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `L2CAP_SELECT_TIMEOUT` | 1.5 s | Max time for the PSM-read + L2CAP-open sequence |
-| `HANDSHAKING_L2CAP_WALL` | 2 s | Safety-net tick timeout if `OpenL2cap` result never arrives |
+| `L2CAP_SELECT_TIMEOUT` | 1.5 s | Max time for the PSM-read + L2CAP-open sequence; also the deadline stored on `Handshaking` and checked by the tick safety-net |
 
 ### Per-peer state machine
 
@@ -245,12 +244,11 @@ Trailer:
 | `ACK_TIMEOUT_MAX` | 5 s | Max timeout after exponential backoff |
 | `ACK_DELAY` | 15 ms | Delayed-ACK window for piggybacking |
 | `LINK_DEAD_DEADLINE` | 6 s | Total time without progress before declaring the link dead |
-| `MAX_DATAGRAM_SIZE` | 1472 | Max reassembled datagram |
 | `SEQ_MODULUS` | 16 | Sequence number space (4-bit) |
 | `SEND_QUEUE_CAPACITY` | 32 | Outbound mpsc capacity |
 | `FRAGMENT_CANARY` | 0x5A | Per-fragment integrity sentinel |
 
-Chunk size is **not** a fixed constant — it is resolved per peer at handshake time from the negotiated ATT MTU via `mtu::resolve_chunk_size`, with `MIN_SANE_MTU=24` as the floor and `DEFAULT_FALLBACK_MTU=512` if MTU never reaches the floor inside `MTU_READY_DEADLINE=1s`.
+Chunk size is **not** a fixed constant — it is resolved per peer at handshake time from the negotiated ATT MTU via `mtu::resolve_chunk_size`, with `MIN_SANE_MTU=24` as the floor and `DEFAULT_FALLBACK_MTU=512` if MTU never reaches the floor inside `MTU_READY_DEADLINE=1s`. `mtu::MAX_DATAGRAM_SIZE=1472` is the single source of truth for the reassembled-datagram ceiling shared by both the GATT and L2CAP paths.
 
 **Protocol behaviour:**
 
@@ -278,9 +276,7 @@ The chat app polls these from `bandwidth_tick` (1 s) and `transport_state_tick` 
 
 - **No out-of-order ACK (SACK)**: GATT path's `ReliableChannel` sends cumulative ACKs only; out-of-order fragments are buffered but never explicitly acknowledged. (Not relevant for L2CAP path.)
 - **Same-machine BLE on macOS**: BLE discovery does not work between two processes on the same macOS host (CoreBluetooth limitation). Always test on separate devices.
-- **L2CAP not yet validated on real hardware**: The L2CAP data path is implemented and tested via mocks, but has not yet been exercised on physical BLE devices. Set `L2capPolicy::Disabled` to force GATT-only if L2CAP causes issues on a specific platform.
-- **L2CAP MTU**: `MAX_DATAGRAM_SIZE = 1472` is shared between both paths. This may be conservative for L2CAP CoC which can negotiate larger MTUs. iroh's `initial_mtu(1200)` may also be revisitable once L2CAP performance is characterized on hardware.
-- **No end-to-end integration test for L2CAP through driver + pipe**: Registry state machine tests cover L2CAP transitions thoroughly, but there is no mock integration test that exercises the full `PreferL2cap` chain (registry → driver → pipe → l2cap I/O).
+- **L2CAP MTU**: `mtu::MAX_DATAGRAM_SIZE = 1472` is shared between both paths. This may be conservative for L2CAP CoC which can negotiate larger MTUs. iroh's `initial_mtu(1200)` may also be revisitable once L2CAP performance is characterized on hardware. Set `L2capPolicy::Disabled` to force GATT-only if L2CAP causes issues on a specific platform.
 
 ## demos/iroh-ble-chat
 

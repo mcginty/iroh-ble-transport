@@ -173,16 +173,12 @@ async fn run_l2cap_pipe(
     registry_tx: mpsc::Sender<PeerCommand>,
 ) {
     let (reader, writer) = tokio::io::split(channel);
-    let tx_bytes = Arc::new(AtomicU64::new(0));
-    let rx_bytes = Arc::new(AtomicU64::new(0));
 
     let (l2cap_tx, _send_task, _recv_task, done) = crate::transport::l2cap::spawn_l2cap_io_tasks(
         reader,
         writer,
         device_id.clone(),
         incoming_tx,
-        tx_bytes,
-        rx_bytes,
     );
 
     let mut io_died = false;

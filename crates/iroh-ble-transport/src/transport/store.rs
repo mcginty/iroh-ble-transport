@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use iroh_base::EndpointId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::BleResult;
@@ -13,7 +12,6 @@ use crate::transport::peer::KeyPrefix;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerSnapshot {
-    pub endpoint_id: EndpointId,
     pub last_device_id: String,
     pub last_seen: SystemTime,
 }
@@ -71,7 +69,6 @@ mod tests {
 
     fn sample() -> PeerSnapshot {
         PeerSnapshot {
-            endpoint_id: EndpointId::from_bytes(&[1u8; 32]).unwrap(),
             last_device_id: "test-device".into(),
             last_seen: SystemTime::UNIX_EPOCH,
         }

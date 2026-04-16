@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use arc_swap::ArcSwap;
+use atomic_waker::AtomicWaker;
 use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
 use blew::gatt::service::{GattCharacteristic, GattService};
 use blew::peripheral::AdvertisingConfig;
@@ -27,6 +28,7 @@ use crate::transport::events::{run_central_events, run_l2cap_accept, run_periphe
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
 use crate::transport::routing::{TOKEN_LEN, TransportRouting, parse_token_addr, token_custom_addr};
+use crate::transport::store::{InMemoryPeerStore, PeerStore};
 use crate::transport::watchdog::run_watchdog;
 
 /// Unique transport discriminator — ASCII "BLE".
@@ -36,7 +38,13 @@ const IROH_SERVICE_UUID: Uuid = uuid!("69726f01-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
 pub(crate) const IROH_PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
-const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
+pub(crate) const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
+
+/// On-wire protocol version served by the peripheral on the VERSION
+/// characteristic and verified by the central immediately after connect.
+/// Mismatch transitions the peer to `Dead { ProtocolMismatch }` rather
+/// than running an incompatible data pipe.
+pub const PROTOCOL_VERSION: u8 = 1;
 
 const KEY_UUID_PREFIX: [u8; 4] = [0x69, 0x72, 0x6f, 0x00];
 
@@ -47,9 +55,33 @@ pub enum L2capPolicy {
     PreferL2cap,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Clone)]
 pub struct BleTransportConfig {
     pub l2cap_policy: L2capPolicy,
+    /// Persistent peer cache. Defaults to an in-memory store; applications
+    /// that want durable state across restarts can plug in their own
+    /// implementation of [`PeerStore`]. The transport writes a snapshot
+    /// whenever a peer leaves `Connected`, and forgets a peer when it
+    /// transitions to `Dead { MaxRetries }`.
+    pub store: Arc<dyn PeerStore>,
+}
+
+impl Default for BleTransportConfig {
+    fn default() -> Self {
+        Self {
+            l2cap_policy: L2capPolicy::default(),
+            store: Arc::new(InMemoryPeerStore::new()),
+        }
+    }
+}
+
+impl std::fmt::Debug for BleTransportConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BleTransportConfig")
+            .field("l2cap_policy", &self.l2cap_policy)
+            .field("store", &"<PeerStore>")
+            .finish()
+    }
 }
 
 fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
@@ -60,7 +92,7 @@ fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-async fn register_gatt_services(peripheral: &Peripheral, key_uuid: Uuid) -> BleResult<()> {
+fn build_gatt_services(key_uuid: Uuid) -> Vec<GattService> {
     let characteristics = vec![
         GattCharacteristic {
             uuid: IROH_C2P_CHAR_UUID,
@@ -82,7 +114,7 @@ async fn register_gatt_services(peripheral: &Peripheral, key_uuid: Uuid) -> BleR
             uuid: IROH_VERSION_CHAR_UUID,
             properties: CharacteristicProperties::READ,
             permissions: AttributePermissions::READ,
-            value: vec![],
+            value: vec![PROTOCOL_VERSION],
             descriptors: vec![],
         },
         GattCharacteristic {
@@ -93,20 +125,27 @@ async fn register_gatt_services(peripheral: &Peripheral, key_uuid: Uuid) -> BleR
             descriptors: vec![],
         },
     ];
-    peripheral
-        .add_service(&GattService {
+    vec![
+        GattService {
             uuid: IROH_SERVICE_UUID,
             primary: true,
             characteristics,
-        })
-        .await?;
-    peripheral
-        .add_service(&GattService {
+        },
+        GattService {
             uuid: key_uuid,
             primary: false,
             characteristics: vec![],
-        })
-        .await?;
+        },
+    ]
+}
+
+async fn register_gatt_services(
+    peripheral: &Peripheral,
+    services: &[GattService],
+) -> BleResult<()> {
+    for service in services {
+        peripheral.add_service(service).await?;
+    }
     Ok(())
 }
 
@@ -126,6 +165,11 @@ pub struct BleTransport {
     rx_bytes: Arc<AtomicU64>,
     retransmits: Arc<AtomicU64>,
     truncations: Arc<AtomicU64>,
+    /// Woken by the registry actor whenever it pops a command off the inbox,
+    /// letting `BleSender::poll_send` wait for capacity without a busy spin
+    /// when `try_send` sees `Full`.
+    inbox_capacity_waker: Arc<AtomicWaker>,
+    store: Arc<dyn PeerStore>,
 }
 
 impl std::fmt::Debug for BleTransport {
@@ -163,7 +207,8 @@ impl BleTransport {
             })?;
 
         let key_uuid = iroh_key_uuid(&local_id);
-        register_gatt_services(&peripheral, key_uuid).await?;
+        let services = build_gatt_services(key_uuid);
+        register_gatt_services(&peripheral, &services).await?;
         let advertising_config = AdvertisingConfig {
             local_name: "iroh".to_string(),
             service_uuids: vec![key_uuid],
@@ -191,10 +236,13 @@ impl BleTransport {
         let rx_bytes = Arc::new(AtomicU64::new(0));
         let retransmits = Arc::new(AtomicU64::new(0));
         let truncations = Arc::new(AtomicU64::new(0));
+        let inbox_capacity_waker = Arc::new(AtomicWaker::new());
 
         let iface = Arc::new(BlewDriver::new(
             Arc::clone(&central),
             Arc::clone(&peripheral),
+            services,
+            advertising_config,
         ));
         let driver = Driver::new(
             iface,
@@ -202,6 +250,7 @@ impl BleTransport {
             incoming_tx,
             Arc::clone(&retransmits),
             Arc::clone(&truncations),
+            Arc::clone(&config.store),
         );
 
         let mut psm = None;
@@ -220,8 +269,11 @@ impl BleTransport {
 
         let registry = Registry::new(config.l2cap_policy);
         let snap_for_actor = Arc::clone(&snapshots);
+        let waker_for_actor = Arc::clone(&inbox_capacity_waker);
         tokio::spawn(async move {
-            registry.run(inbox_rx, driver, snap_for_actor).await;
+            registry
+                .run(inbox_rx, driver, snap_for_actor, waker_for_actor)
+                .await;
         });
 
         tokio::spawn(run_central_events(
@@ -247,6 +299,8 @@ impl BleTransport {
             rx_bytes,
             retransmits,
             truncations,
+            inbox_capacity_waker,
+            store: config.store,
         })
     }
 
@@ -266,16 +320,35 @@ impl BleTransport {
         }
     }
 
+    /// The peer store wired into this transport. The transport writes to this
+    /// store on peer-lifecycle transitions; applications can read from it (or
+    /// share it at construction time) to implement durable reconnect policy.
+    #[must_use]
+    pub fn peer_store(&self) -> Arc<dyn PeerStore> {
+        Arc::clone(&self.store)
+    }
+
     #[must_use]
     pub fn device_for_endpoint(&self, endpoint_id: &EndpointId) -> Option<blew::DeviceId> {
         self.routing.device_for_endpoint(endpoint_id)
     }
 
+    /// Public-facing peer snapshot. Filters out `Unknown` (pre-state internal
+    /// construction) and `Dead` (tombstones kept around for `DEAD_GC_TTL`
+    /// dedup) so the returned list only contains peers that are actionable
+    /// to a UI — the chat app polls this and renders one row per entry.
     #[must_use]
     pub fn snapshot_peers(&self) -> Vec<BlePeerInfo> {
         let snap = self.handle.snapshots.load();
         snap.peer_states
             .iter()
+            .filter(|(_, state)| {
+                !matches!(
+                    state.phase_kind,
+                    crate::transport::registry::PhaseKind::Unknown
+                        | crate::transport::registry::PhaseKind::Dead
+                )
+            })
             .map(|(device_id, state)| BlePeerInfo {
                 device_id: device_id.clone(),
                 phase: BlePeerPhase::from(state.phase_kind),
@@ -339,6 +412,7 @@ impl CustomTransport for BleTransport {
             snapshots: Arc::clone(&self.handle.snapshots),
             routing: Arc::clone(&self.routing),
             tx_bytes: Arc::clone(&self.tx_bytes),
+            inbox_capacity_waker: Arc::clone(&self.inbox_capacity_waker),
         });
         Ok(Box::new(BleEndpoint {
             receiver: incoming_rx,
@@ -439,6 +513,7 @@ pub struct BleSender {
     snapshots: Arc<ArcSwap<SnapshotMaps>>,
     routing: Arc<TransportRouting>,
     tx_bytes: Arc<AtomicU64>,
+    inbox_capacity_waker: Arc<AtomicWaker>,
 }
 
 impl std::fmt::Debug for BleSender {
@@ -507,9 +582,22 @@ impl CustomSender for BleSender {
                 self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
                 Poll::Ready(Ok(()))
             }
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                Poll::Pending
+            Err(mpsc::error::TrySendError::Full(cmd)) => {
+                // Register for a wake-up when the actor pops a command, then
+                // re-try to close the race where the actor drained between the
+                // first try_send and the register.
+                self.inbox_capacity_waker.register(cx.waker());
+                match self.inbox.try_send(cmd) {
+                    Ok(()) => {
+                        self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
+                        Poll::Ready(Ok(()))
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => Poll::Pending,
+                    Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "transport shut down",
+                    ))),
+                }
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -558,9 +646,10 @@ impl std::fmt::Debug for BleAddressLookup {
 // wakes us. This mirrors how the UDP transport returns `Pending` from
 // `poll_send` when a path is not yet usable.
 //
-// Upstream tracking: TODO file an issue with a minimal repro (two resolvers in
-// `ConcurrentAddressLookup`: one yields `Err` immediately, one yields `Ok`
-// after 5 s — observe that the `Ok` is never delivered).
+// Upstream tracking: n0-computer/iroh#4130. When that lands (expected in iroh
+// 0.98), the prefix-token trick here can be replaced with a normal resolver
+// that yields `Err` on unknown peers without poisoning siblings.
+// TODO(iroh-0.98): revisit once the fix ships upstream.
 // ---------------------------------------------------------------------------
 impl AddressLookup for BleAddressLookup {
     fn resolve(
@@ -621,6 +710,7 @@ mod tests {
             snapshots,
             routing,
             tx_bytes,
+            inbox_capacity_waker: Arc::new(AtomicWaker::new()),
         };
         (sender, inbox_rx)
     }

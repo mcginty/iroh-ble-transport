@@ -56,6 +56,9 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, trace, warn};
+
+use super::mtu::MAX_DATAGRAM_SIZE;
+
 const HEADER_SIZE: usize = 2;
 
 /// Trailer byte appended to every outbound fragment so the receiver can
@@ -87,7 +90,6 @@ fn set_ack(header: &mut [u8], ack_seq: u8) {
 fn seq_dist(a: u8, b: u8) -> u8 {
     b.wrapping_sub(a) % SEQ_MODULUS
 }
-pub const MAX_DATAGRAM_SIZE: usize = 1472;
 
 /// Must be < SEQ_MODULUS / 2 for correct modular window arithmetic.
 const WINDOW_SIZE: u8 = 6;
