@@ -59,5 +59,7 @@
 	<string>This app uses the camera to scan QR code invitation links.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>This app accesses your photo library to share images in chat.</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 </dict>
 </plist>
