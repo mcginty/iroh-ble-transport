@@ -11,9 +11,11 @@
 //! machine to connect to it.
 
 use iroh_ble_transport::{
-    AdvertisingConfig, AttributePermissions, CharacteristicProperties, GattCharacteristic,
-    GattService, Peripheral, PeripheralEvent,
+    AdvertisingConfig, AttributePermissions, CharacteristicProperties, DeviceId,
+    GattCharacteristic, GattService, Peripheral, PeripheralEvent,
 };
+use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::Duration;
 use tokio::time;
 use tokio_stream::StreamExt as _;
@@ -89,11 +91,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut notify_interval = time::interval(Duration::from_secs(2));
     notify_interval.tick().await; // skip the immediate first tick
 
+    let subscribers: Mutex<HashSet<DeviceId>> = Mutex::new(HashSet::new());
+
     loop {
         tokio::select! {
             event = events.next() => {
                 match event {
-                    Some(event) => handle_event(event, &peripheral).await?,
+                    Some(event) => handle_event(event, &subscribers).await?,
                     None => break,
                 }
             }
@@ -101,12 +105,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ = notify_interval.tick() => {
                 counter += 1;
                 let value = format!("count={counter}").into_bytes();
-                println!("-> notify: count={counter}");
-                if let Err(e) = peripheral
-                    .notify_characteristic(CHAR_UUID, value)
-                    .await
-                {
-                    eprintln!("notify error: {e}");
+                let targets: Vec<DeviceId> = subscribers.lock().unwrap().iter().cloned().collect();
+                if targets.is_empty() {
+                    continue;
+                }
+                println!("-> notify: count={counter} (to {} subscribers)", targets.len());
+                for device_id in targets {
+                    if let Err(e) = peripheral
+                        .notify_characteristic(&device_id, CHAR_UUID, value.clone())
+                        .await
+                    {
+                        eprintln!("notify error for {device_id}: {e}");
+                    }
                 }
             }
 
@@ -123,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn handle_event(
     event: PeripheralEvent,
-    _peripheral: &Peripheral,
+    subscribers: &Mutex<HashSet<DeviceId>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         PeripheralEvent::AdapterStateChanged { powered } => {
@@ -141,6 +151,14 @@ async fn handle_event(
                 "unsubscribed from"
             };
             println!("<- {client_id} {action} {char_uuid}");
+            if char_uuid == CHAR_UUID {
+                let mut set = subscribers.lock().unwrap();
+                if subscribed {
+                    set.insert(client_id);
+                } else {
+                    set.remove(&client_id);
+                }
+            }
         }
 
         PeripheralEvent::ReadRequest {

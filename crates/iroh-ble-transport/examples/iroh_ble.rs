@@ -38,10 +38,14 @@ use std::time::Instant;
 #[path = "../../../demos/support/key_utils.rs"]
 mod key_utils;
 
+use std::sync::Arc;
+
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
+use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh_ble_transport::transport::BleTransport;
+use iroh_ble_transport::{Central, Peripheral};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -114,11 +118,16 @@ async fn run_listener() -> Result<(), Box<dyn std::error::Error>> {
     let public = secret.public();
 
     println!("Initialising BLE transport...");
-    let transport = BleTransport::new(&secret).await?;
+    let central = Arc::new(Central::new().await?);
+    let peripheral = Arc::new(Peripheral::new().await?);
+    let transport = BleTransport::new(public, central, peripheral).await?;
+    let lookup = transport.address_lookup();
+    let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = Arc::new(transport);
 
-    let ep = Endpoint::builder(transport.preset())
+    let ep = Endpoint::builder(presets::N0DisableRelay)
+        .add_custom_transport(transport)
+        .address_lookup(lookup)
         .secret_key(secret)
-        .relay_mode(iroh::RelayMode::Disabled)
         .clear_ip_transports()
         .bind()
         .await?;
@@ -283,13 +292,19 @@ async fn run_dialer(remote_str: &str) -> Result<(), Box<dyn std::error::Error>> 
     let remote_id: iroh::EndpointId = remote_str.parse()?;
 
     let secret = key_utils::load_or_generate_key("iroh-ble-example");
+    let local_id = secret.public();
 
     println!("Initialising BLE transport...");
-    let transport = BleTransport::new(&secret).await?;
+    let central = Arc::new(Central::new().await?);
+    let peripheral = Arc::new(Peripheral::new().await?);
+    let transport = BleTransport::new(local_id, central, peripheral).await?;
+    let lookup = transport.address_lookup();
+    let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = Arc::new(transport);
 
-    let ep = Endpoint::builder(transport.preset())
+    let ep = Endpoint::builder(presets::N0DisableRelay)
+        .add_custom_transport(transport)
+        .address_lookup(lookup)
         .secret_key(secret)
-        .relay_mode(iroh::RelayMode::Disabled)
         .clear_ip_transports()
         .bind()
         .await?;

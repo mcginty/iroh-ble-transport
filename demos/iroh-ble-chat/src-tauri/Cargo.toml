@@ -1,8 +1,11 @@
 [package]
 name = "iroh-ble-chat"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.6"
 edition = "2021"
 publish = false
+
+[package.metadata.release]
+pre-release-hook = ["./scripts/bump-ios-version.sh"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -47,7 +50,7 @@ base64 = "0.22"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-deep-link = "2"
-tauri-plugin-blew = { git = "https://github.com/mcginty/blew.git" }
+tauri-plugin-blew = "0.1.0-alpha.5"
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 tauri-plugin-barcode-scanner = "2"

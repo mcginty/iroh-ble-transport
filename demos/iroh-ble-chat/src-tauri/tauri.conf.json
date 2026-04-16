@@ -31,12 +31,22 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "android": {
+      "autoIncrementVersionCode": true
+    },
+    "iOS": {
+      "bundleVersion": "60"
+    }
   },
   "plugins": {
     "deep-link": {
       "mobile": [
-        { "scheme": ["iroh-ble-chat"] }
+        {
+          "scheme": [
+            "iroh-ble-chat"
+          ]
+        }
       ]
     }
   }

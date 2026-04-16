@@ -23,11 +23,11 @@ library for Rust.
 
 ## Supported Platforms
 
-| Platform | Backend | Status |
-|----------|---------|--------|
-| macOS / iOS | CoreBluetooth (via `objc2`) | Supported |
-| Linux | BlueZ (via `bluer`) | Supported |
-| Android | JNI + Kotlin (via `jni` and `ndk-context`) | Supported |
+| Platform | Backend |
+|----------|---------|
+| macOS / iOS | CoreBluetooth (via `objc2`) |
+| Linux | BlueZ (via `bluer`) |
+| Android | JNI + Kotlin (via `jni` and `ndk-context`) |
 
 ## Usage
 

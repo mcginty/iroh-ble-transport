@@ -7,9 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		0592C7251A62463CF3982C43 /* a blue tooth.icon in Resources */ = {isa = PBXBuildFile; fileRef = 1DEDEE14C1B7651D76249149 /* a blue tooth.icon */; };
 		0C42C1760FDF7ED0A50A252A /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = C02121B9008B56CA974BE8C3 /* Assets.xcassets */; };
 		3C5FCB955C36D904D23A108F /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 9848CF8A940FD36FBFCE9733 /* MetalKit.framework */; };
 		498D2F5A152C6B79357E96EF /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FD3C135BBFC786FFB0A59255 /* CoreGraphics.framework */; };
+		4CAE647C504A83AFEB3CB777 /* CoreBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = CA6B1DFB767F67AD1EDAE651 /* CoreBluetooth.framework */; };
 		8023C7F2A1C3EA13B176F711 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = E10E8F0D41129AFEA2533AA7 /* Metal.framework */; };
 		9092B4052264194273C76046 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D5CAB67ABFB04096AF1187CA /* Security.framework */; };
 		93A320D2C5DB323A095BBB17 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = B28576AB0BA4738DE6899C22 /* WebKit.framework */; };
@@ -18,30 +20,29 @@
 		AB907D7E17DB133CB4FF8823 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 98D0F0F2BC4287B76CC28DE8 /* libapp.a */; };
 		AEE7CB633EBB8AF6E7650DFF /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 4AE5C92AC983DA2628EBF3EE /* UIKit.framework */; };
 		B8E442B751422255FA26DBBD /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 47A0F7EC6C2E1519B4EDB222 /* main.mm */; };
-		BB1234567890ABCDEF012345 /* CoreBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AA9876543210FEDCBA987654 /* CoreBluetooth.framework */; };
 		C151D94DD6BB1ABAB433E389 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 730CCA979685231E910DB05B /* LaunchScreen.storyboard */; };
-		EB940ABC2F86DB7B003828B6 /* a blue tooth.icon in Resources */ = {isa = PBXBuildFile; fileRef = EB940ABB2F86DB7B003828B6 /* a blue tooth.icon */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		17F0333CEDD20D1E54B70211 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
-		2A7990F14FC42B31A45D7024 /* iroh-ble-chat.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "iroh-ble-chat.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		1C0A760904A910AEE46ABEBC /* image.rs */ = {isa = PBXFileReference; path = image.rs; sourceTree = "<group>"; };
+		1DEDEE14C1B7651D76249149 /* a blue tooth.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = "a blue tooth.icon"; sourceTree = "<group>"; };
+		2A7990F14FC42B31A45D7024 /* iroh-ble-chat_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "iroh-ble-chat_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		47A0F7EC6C2E1519B4EDB222 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
 		4AE5C92AC983DA2628EBF3EE /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
 		730CCA979685231E910DB05B /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		91C0A8189E2FDC9DC5505B75 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
-		92B02D26D52191407DA2011A /* main.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = main.rs; sourceTree = "<group>"; };
+		92B02D26D52191407DA2011A /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
 		94D79508C0059A24D3F77573 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		9848CF8A940FD36FBFCE9733 /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
 		98D0F0F2BC4287B76CC28DE8 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
-		A878A610429EB86014638AA2 /* lib.rs */ = {isa = PBXFileReference; lastKnownFileType = text; path = lib.rs; sourceTree = "<group>"; };
-		AA9876543210FEDCBA987654 /* CoreBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreBluetooth.framework; path = System/Library/Frameworks/CoreBluetooth.framework; sourceTree = SDKROOT; };
+		A878A610429EB86014638AA2 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
 		B28576AB0BA4738DE6899C22 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		C02121B9008B56CA974BE8C3 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		C82870CC0F573F133D5E0AED /* iroh-ble-chat_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "iroh-ble-chat_iOS.entitlements"; sourceTree = "<group>"; };
+		CA6B1DFB767F67AD1EDAE651 /* CoreBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreBluetooth.framework; path = System/Library/Frameworks/CoreBluetooth.framework; sourceTree = SDKROOT; };
 		D5CAB67ABFB04096AF1187CA /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		E10E8F0D41129AFEA2533AA7 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
-		EB940ABB2F86DB7B003828B6 /* a blue tooth.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer.icon; path = "a blue tooth.icon"; sourceTree = "<group>"; };
 		FC2D78775BFCBE4B7E4E6E70 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		FD3C135BBFC786FFB0A59255 /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
@@ -59,7 +60,7 @@
 				9092B4052264194273C76046 /* Security.framework in Frameworks */,
 				AEE7CB633EBB8AF6E7650DFF /* UIKit.framework in Frameworks */,
 				93A320D2C5DB323A095BBB17 /* WebKit.framework in Frameworks */,
-				BB1234567890ABCDEF012345 /* CoreBluetooth.framework in Frameworks */,
+				4CAE647C504A83AFEB3CB777 /* CoreBluetooth.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -69,7 +70,7 @@
 		1BB4E5C48CBC9B36245BD7D0 /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				EB940ABB2F86DB7B003828B6 /* a blue tooth.icon */,
+				CA6B1DFB767F67AD1EDAE651 /* CoreBluetooth.framework */,
 				FD3C135BBFC786FFB0A59255 /* CoreGraphics.framework */,
 				98D0F0F2BC4287B76CC28DE8 /* libapp.a */,
 				E10E8F0D41129AFEA2533AA7 /* Metal.framework */,
@@ -78,7 +79,6 @@
 				D5CAB67ABFB04096AF1187CA /* Security.framework */,
 				4AE5C92AC983DA2628EBF3EE /* UIKit.framework */,
 				B28576AB0BA4738DE6899C22 /* WebKit.framework */,
-				AA9876543210FEDCBA987654 /* CoreBluetooth.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -86,6 +86,7 @@
 		3C4905C66F713FCF51658910 /* src */ = {
 			isa = PBXGroup;
 			children = (
+				1C0A760904A910AEE46ABEBC /* image.rs */,
 				A878A610429EB86014638AA2 /* lib.rs */,
 				92B02D26D52191407DA2011A /* main.rs */,
 			);
@@ -127,20 +128,13 @@
 			path = "iroh-ble-chat_iOS";
 			sourceTree = "<group>";
 		};
-		AD5ABAF7E6ABEE89D916D1D3 /* Externals */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = Externals;
-			sourceTree = "<group>";
-		};
 		B9932BF90B7077965A2EB012 = {
 			isa = PBXGroup;
 			children = (
+				1DEDEE14C1B7651D76249149 /* a blue tooth.icon */,
 				91C0A8189E2FDC9DC5505B75 /* assets */,
 				C02121B9008B56CA974BE8C3 /* Assets.xcassets */,
 				730CCA979685231E910DB05B /* LaunchScreen.storyboard */,
-				AD5ABAF7E6ABEE89D916D1D3 /* Externals */,
 				A682EB2131178F4B60AA6015 /* iroh-ble-chat_iOS */,
 				90E0F9A5BC5B35607F519906 /* Sources */,
 				3C4905C66F713FCF51658910 /* src */,
@@ -152,7 +146,7 @@
 		CA2B060DC95215A6A8C8E2A0 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				2A7990F14FC42B31A45D7024 /* iroh-ble-chat.app */,
+				2A7990F14FC42B31A45D7024 /* iroh-ble-chat_iOS.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -177,7 +171,7 @@
 			packageProductDependencies = (
 			);
 			productName = "iroh-ble-chat_iOS";
-			productReference = 2A7990F14FC42B31A45D7024 /* iroh-ble-chat.app */;
+			productReference = 2A7990F14FC42B31A45D7024 /* iroh-ble-chat_iOS.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -188,6 +182,11 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = YES;
 				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					5FFFAC84D1070959FC08CCE8 = {
+						DevelopmentTeam = XG66F95CNS;
+					};
+				};
 			};
 			buildConfigurationList = C930CBCB665D2368B487439C /* Build configuration list for PBXProject "iroh-ble-chat" */;
 			developmentRegion = en;
@@ -215,8 +214,8 @@
 			files = (
 				0C42C1760FDF7ED0A50A252A /* Assets.xcassets in Resources */,
 				C151D94DD6BB1ABAB433E389 /* LaunchScreen.storyboard in Resources */,
+				0592C7251A62463CF3982C43 /* a blue tooth.icon in Resources */,
 				A378C0409B1882DE904042ED /* assets in Resources */,
-				EB940ABC2F86DB7B003828B6 /* a blue tooth.icon in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

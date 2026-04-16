@@ -2,7 +2,7 @@ name: iroh-ble-chat
 options:
   bundleIdPrefix: org.jakebot.iroh-ble-chat
   deploymentTarget:
-    iOS: 14.0
+    iOS: 16.0
 fileGroups: [../../src]
 configs:
   debug: debug
@@ -30,8 +30,9 @@ targets:
     sources:
       - path: Sources
       - path: Assets.xcassets
-      - path: Externals
       - path: iroh-ble-chat_iOS
+      - path: "a blue tooth.icon"
+        buildPhase: resources
       - path: assets
         buildPhase: resources
         type: folder
@@ -53,6 +54,16 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
+        CFBundleDisplayName: "BlewChat (Demo)"
+        NSLocalNetworkUsageDescription: "This app connects to a local development server and to nearby peers over BLE."
+        NSBonjourServices:
+          - _http._tcp
+          - _https._tcp
+        NSBluetoothAlwaysUsageDescription: "This app uses Bluetooth to discover and connect to nearby iroh peers."
+        UIBackgroundModes:
+          - bluetooth-central
+        NSCameraUsageDescription: "This app uses the camera to scan QR code invitation links."
+        NSPhotoLibraryUsageDescription: "This app accesses your photo library to share images in chat."
     entitlements:
       path: iroh-ble-chat_iOS/iroh-ble-chat_iOS.entitlements
     scheme:
@@ -62,12 +73,24 @@ targets:
     settings:
       base:
         ENABLE_BITCODE: false
-        ARCHS: [arm64]
-        VALID_ARCHS: arm64 
-        LIBRARY_SEARCH_PATHS[arch=x86_64]: $(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)
-        LIBRARY_SEARCH_PATHS[arch=arm64]: $(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME) $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        ARCHS: arm64
+        VALID_ARCHS: arm64
+        LIBRARY_SEARCH_PATHS[arch=x86_64]:
+          - $(inherited)
+          - $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION)
+          - $(SDKROOT)/usr/lib/swift
+          - $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)
+          - $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)
+        LIBRARY_SEARCH_PATHS[arch=arm64]:
+          - $(inherited)
+          - $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION)
+          - $(SDKROOT)/usr/lib/swift
+          - $(TOOLCHAIN_DIR)/usr/lib/swift/$(PLATFORM_NAME)
+          - $(TOOLCHAIN_DIR)/usr/lib/swift-5.0/$(PLATFORM_NAME)
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
+        ASSETCATALOG_COMPILER_APPICON_NAME: "a blue tooth"
+        DEVELOPMENT_TEAM: XG66F95CNS
       groups: [app]
     dependencies:
       - framework: libapp.a
@@ -79,8 +102,20 @@ targets:
       - sdk: Security.framework
       - sdk: UIKit.framework
       - sdk: WebKit.framework
+      - sdk: CoreBluetooth.framework
     preBuildScripts:
-      - script: pnpm tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
+      - script: |
+          if [ -f "$SRCROOT/.xcode.env" ]; then
+            . "$SRCROOT/.xcode.env"
+          fi
+
+          # In Xcode Cloud, libapp.a is pre-built by ci_post_clone.sh
+          if [ "${CI_XCODE_CLOUD:-}" = "TRUE" ]; then
+            echo "Xcode Cloud: skipping tauri xcode-script (libapp.a built in ci_post_clone)"
+            exit 0
+          fi
+
+          pnpm tauri ios xcode-script -v --platform ${PLATFORM_DISPLAY_NAME:?} --sdk-root ${SDKROOT:?} --framework-search-paths "${FRAMEWORK_SEARCH_PATHS:?}" --header-search-paths "${HEADER_SEARCH_PATHS:?}" --gcc-preprocessor-definitions "${GCC_PREPROCESSOR_DEFINITIONS:-}" --configuration ${CONFIGURATION:?} ${FORCE_COLOR} ${ARCHS:?}
         name: Build Rust Code
         basedOnDependencyAnalysis: false
         outputFiles:

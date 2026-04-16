@@ -5,8 +5,22 @@
 //!
 //! # Wire format
 //!
-//! Every GATT write or notification carries a 2-byte header followed by an
-//! optional payload:
+//! Data fragments carry a 2-byte header, a payload, and a 1-byte canary
+//! trailer ([`FRAGMENT_CANARY`], `0x5A`).  The canary lets the receiver detect
+//! silent host-stack truncation (e.g. Android silently dropping the last few
+//! bytes of an oversized write):
+//!
+//! ```text
+//!   [header: 2 bytes][payload: 1..N bytes][canary: 0x5A]
+//! ```
+//!
+//! Pure ACKs (no payload) carry only the header — no canary:
+//!
+//! ```text
+//!   [header: 2 bytes]
+//! ```
+//!
+//! Header layout:
 //!
 //! ```text
 //!   Byte 0:
@@ -43,6 +57,12 @@ use std::time::Duration;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, trace, warn};
 const HEADER_SIZE: usize = 2;
+
+/// Trailer byte appended to every outbound fragment so the receiver can
+/// detect silent host-stack truncation (e.g. Android dropping the last 3
+/// bytes of every write when MTU and chunk size disagree). `0x5A` is a
+/// recognizable non-zero sentinel — any fixed non-zero byte works equally.
+pub const FRAGMENT_CANARY: u8 = 0x5A;
 
 const SEQ_MASK: u8 = 0x0F;
 pub const FLAG_FIRST: u8 = 0x10;
@@ -84,11 +104,16 @@ const ACK_TIMEOUT_MAX: Duration = Duration::from_secs(5);
 /// Delayed-ACK: gives outgoing data a chance to piggyback the ACK.
 const ACK_DELAY: Duration = Duration::from_millis(15);
 
-/// With exponential backoff (300ms base, 5s cap), 30 retries gives ~90s of tolerance.
-const MAX_RETRIES: u32 = 30;
+/// Hard wall-clock budget for forward progress. If the head of `in_flight` does
+/// not advance within this window, the send loop declares `LinkDead` regardless
+/// of how many retransmits have happened. Chosen to be close to iroh's default
+/// `default_path_max_idle_timeout` (6s) so BLE and QUIC give up in the same
+/// ballpark, and so a disappearing peer is detected in seconds — not minutes.
+const LINK_DEAD_DEADLINE: Duration = Duration::from_secs(6);
 
 const SEND_QUEUE_CAPACITY: usize = 32;
 struct InFlightFragment {
+    seq: u8,
     wire_msg: Vec<u8>,
 }
 
@@ -104,6 +129,10 @@ struct BufferedFragment {
     last: bool,
     payload: Vec<u8>,
 }
+/// Returned by [`ReliableChannel::run_send_loop`] when the link is declared dead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkDead;
+
 struct ChannelState {
     send_queue: VecDeque<Vec<u8>>,
     frag_queue: VecDeque<FragmentEntry>,
@@ -118,6 +147,11 @@ struct ChannelState {
     ack_pending: Option<u8>,
     /// Delayed-ACK deadline; allows outgoing data to piggyback the ACK first.
     ack_deadline: Option<tokio::time::Instant>,
+    /// Monotonic timestamp of the last forward-progress event — i.e. the last
+    /// cumulative ACK that advanced `send_base`. The send loop uses this as
+    /// the anchor for `LINK_DEAD_DEADLINE`; a stuck peer is detected purely
+    /// by wall-clock silence, never by retry count.
+    last_progress_at: tokio::time::Instant,
     link_dead: bool,
 }
 
@@ -164,6 +198,7 @@ pub struct ReliableChannel {
     chunk_size: usize,
     send_waker: Arc<atomic_waker::AtomicWaker>,
     retransmit_counter: Arc<AtomicU64>,
+    truncation_counter: Arc<AtomicU64>,
 }
 
 impl ReliableChannel {
@@ -171,6 +206,7 @@ impl ReliableChannel {
     pub fn new(
         chunk_size: usize,
         retransmit_counter: Arc<AtomicU64>,
+        truncation_counter: Arc<AtomicU64>,
     ) -> (Self, mpsc::Receiver<Vec<u8>>) {
         let (datagram_tx, datagram_rx) = mpsc::channel(64);
         let ch = ReliableChannel {
@@ -186,6 +222,7 @@ impl ReliableChannel {
                 recv_buf: Vec::new(),
                 ack_pending: None,
                 ack_deadline: None,
+                last_progress_at: tokio::time::Instant::now(),
                 link_dead: false,
             })),
             wake: Arc::new(Notify::new()),
@@ -193,8 +230,19 @@ impl ReliableChannel {
             chunk_size,
             send_waker: Arc::new(atomic_waker::AtomicWaker::new()),
             retransmit_counter,
+            truncation_counter,
         };
         (ch, datagram_rx)
+    }
+
+    /// Signal that the underlying link is gone — typically because blew has
+    /// surfaced a `CentralDisconnected` event or the pipe owner is tearing
+    /// down. Flips `link_dead` and wakes the send loop so it exits with
+    /// `LinkDead` on its next poll instead of waiting for the
+    /// `LINK_DEAD_DEADLINE` budget to burn.
+    pub async fn mark_dead(&self) {
+        self.state.lock().await.link_dead = true;
+        self.wake.notify_one();
     }
 
     /// Queue a datagram for reliable delivery. Returns `false` if the queue is full.
@@ -231,6 +279,23 @@ impl ReliableChannel {
         if value.len() < HEADER_SIZE {
             return;
         }
+        // Pure ACKs are exactly HEADER_SIZE bytes and carry no canary; the
+        // sender emits them without a trailer (see next_send_action()).
+        let value = if value.len() > HEADER_SIZE {
+            if value.last().copied() != Some(FRAGMENT_CANARY) {
+                self.truncation_counter.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    len = value.len(),
+                    last_byte = ?value.last(),
+                    expected_last = FRAGMENT_CANARY,
+                    "fragment canary mismatch — silent host-stack truncation suspected"
+                );
+                return;
+            }
+            &value[..value.len() - 1]
+        } else {
+            value
+        };
         let b0 = value[0];
         let b1 = value[1];
         let payload = &value[HEADER_SIZE..];
@@ -255,6 +320,7 @@ impl ReliableChannel {
                     state.in_flight.pop_front();
                 }
                 state.send_base = (ack_seq + 1) % SEQ_MODULUS;
+                state.last_progress_at = tokio::time::Instant::now();
                 trace!(
                     ack_seq,
                     new_base = state.send_base,
@@ -361,55 +427,74 @@ impl ReliableChannel {
         }
     }
 
-    /// Run the send loop as a background task. Returns `false` if the link dies.
-    pub async fn run_send_loop<F, Fut>(&self, mut send_fn: F) -> bool
+    /// Run the send loop as a background task. Returns `Err(LinkDead)` if the
+    /// link dies.
+    ///
+    /// Liveness is gated by `LINK_DEAD_DEADLINE`: the send loop declares
+    /// `LinkDead` if `last_progress_at` — the instant of the most recent
+    /// cumulative ACK that advanced `send_base` — is older than the deadline.
+    /// Retransmit cadence (exponential backoff from `ACK_TIMEOUT`) is
+    /// orthogonal; it only controls *how often* we poke a silent peer within
+    /// the wall-clock budget. The retransmit backoff is reset whenever
+    /// `last_progress_at` advances (real forward progress), never by
+    /// dispatching a fresh fragment — Selective Repeat keeps the window moving
+    /// while the head is stalled, so "we sent something new" implies nothing
+    /// about the dead peer.
+    pub async fn run_send_loop<F, Fut>(&self, mut send_fn: F) -> Result<(), LinkDead>
     where
         F: FnMut(Vec<u8>) -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
     {
         let mut timeout = ACK_TIMEOUT;
-        let mut retries = 0u32;
+        let mut tracked_progress_at: Option<tokio::time::Instant> = None;
 
         loop {
             let action = self.next_send_action().await;
 
             match action {
-                SendAction::Dead => return false,
+                SendAction::Dead => return Err(LinkDead),
                 SendAction::Wait => {
-                    let (has_in_flight, ack_deadline) = {
+                    let (head_seq, ack_deadline, last_progress_at) = {
                         let state = self.state.lock().await;
-                        (!state.in_flight.is_empty(), state.ack_deadline)
+                        (
+                            state.in_flight.front().map(|f| f.seq),
+                            state.ack_deadline,
+                            state.last_progress_at,
+                        )
                     };
 
-                    if has_in_flight {
-                        let retransmit_at = tokio::time::Instant::now() + timeout;
+                    if head_seq.is_some() {
+                        // Real forward progress since we last observed resets
+                        // the retransmit backoff back to the aggressive base.
+                        if tracked_progress_at.is_some_and(|prev| prev != last_progress_at) {
+                            timeout = ACK_TIMEOUT;
+                        }
+                        tracked_progress_at = Some(last_progress_at);
+
+                        let now = tokio::time::Instant::now();
+                        let dead_at = last_progress_at + LINK_DEAD_DEADLINE;
+                        if now >= dead_at {
+                            warn!(
+                                elapsed_ms = (now - last_progress_at).as_millis(),
+                                "no forward progress within LINK_DEAD_DEADLINE, declaring link dead"
+                            );
+                            self.state.lock().await.link_dead = true;
+                            return Err(LinkDead);
+                        }
+
+                        let retransmit_at = now + timeout;
                         let sleep_until = match ack_deadline {
-                            Some(dl) => dl.min(retransmit_at),
-                            None => retransmit_at,
+                            Some(dl) => dl.min(retransmit_at).min(dead_at),
+                            None => retransmit_at.min(dead_at),
                         };
-                        let sleep_dur =
-                            sleep_until.saturating_duration_since(tokio::time::Instant::now());
+                        let sleep_dur = sleep_until.saturating_duration_since(now);
 
                         match tokio::time::timeout(sleep_dur, self.wake.notified()).await {
-                            Ok(()) => {
-                                let state = self.state.lock().await;
-                                if state.in_flight.is_empty() {
-                                    retries = 0;
-                                    timeout = ACK_TIMEOUT;
-                                }
-                                continue;
-                            }
+                            Ok(()) => continue,
                             Err(_) => {
                                 // ACK delay expired, not retransmit timeout yet.
                                 if tokio::time::Instant::now() < retransmit_at {
                                     continue;
-                                }
-
-                                retries += 1;
-                                if retries > MAX_RETRIES {
-                                    warn!(retries, "max retries exceeded, declaring link dead");
-                                    self.state.lock().await.link_dead = true;
-                                    return false;
                                 }
 
                                 let resend = {
@@ -428,7 +513,6 @@ impl ReliableChannel {
                                 if let Some(msg) = resend {
                                     self.retransmit_counter.fetch_add(1, Ordering::Relaxed);
                                     debug!(
-                                        retries,
                                         timeout_ms = timeout.as_millis(),
                                         "ACK timeout, retransmitting oldest fragment"
                                     );
@@ -449,15 +533,12 @@ impl ReliableChannel {
                         } else {
                             self.wake.notified().await;
                         }
-                        retries = 0;
                         timeout = ACK_TIMEOUT;
+                        tracked_progress_at = None;
                         continue;
                     }
                 }
                 SendAction::Send(msg) => {
-                    retries = 0;
-                    timeout = ACK_TIMEOUT;
-
                     if let Err(e) = send_fn(msg).await {
                         warn!(err = %e, "BLE send failed");
                     }
@@ -496,11 +577,20 @@ impl ReliableChannel {
                     set_ack(&mut hdr, ack_seq);
                 }
 
-                let mut msg = Vec::with_capacity(HEADER_SIZE + frag.payload.len());
+                let mut msg = Vec::with_capacity(HEADER_SIZE + frag.payload.len() + 1);
                 msg.extend_from_slice(&hdr);
                 msg.extend_from_slice(&frag.payload);
+                msg.push(FRAGMENT_CANARY);
 
+                // Idle → busy transition: start a fresh liveness window.
+                // The 6s deadline measures elapsed wall-clock since we began
+                // expecting a response, so an idle channel that sat silent
+                // for 10s must not trip the deadline on its very first send.
+                if state.in_flight.is_empty() {
+                    state.last_progress_at = tokio::time::Instant::now();
+                }
                 state.in_flight.push_back(InFlightFragment {
+                    seq,
                     wire_msg: msg.clone(),
                 });
                 state.send_next = (state.send_next + 1) % SEQ_MODULUS;
@@ -526,7 +616,7 @@ impl ReliableChannel {
     }
 
     fn fragment_into(&self, state: &mut ChannelState, datagram: Vec<u8>) {
-        let max_payload = self.chunk_size - HEADER_SIZE;
+        let max_payload = self.chunk_size - HEADER_SIZE - 1;
 
         if datagram.len() <= max_payload {
             state.frag_queue.push_back(FragmentEntry {
@@ -562,7 +652,11 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     fn make_channel() -> (ReliableChannel, mpsc::Receiver<Vec<u8>>) {
-        ReliableChannel::new(512, Arc::new(AtomicU64::new(0)))
+        ReliableChannel::new(
+            512,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
     }
 
     fn hdr(seq: u8, first: bool, last: bool) -> [u8; 2] {
@@ -575,6 +669,7 @@ mod tests {
     fn fragment(seq: u8, first: bool, last: bool, payload: &[u8]) -> Vec<u8> {
         let mut v = hdr(seq, first, last).to_vec();
         v.extend_from_slice(payload);
+        v.push(FRAGMENT_CANARY);
         v
     }
     #[test]
@@ -719,6 +814,7 @@ mod tests {
         let mut v = hdr(seq, first, last).to_vec();
         set_ack(&mut v, ack_seq);
         v.extend_from_slice(payload);
+        v.push(FRAGMENT_CANARY);
         v
     }
 
@@ -805,11 +901,12 @@ mod tests {
         let action = ch.next_send_action().await;
         match action {
             SendAction::Send(msg) => {
-                assert!(msg.len() >= HEADER_SIZE);
+                assert!(msg.len() > HEADER_SIZE);
                 let b0 = msg[0];
                 assert_ne!(b0 & FLAG_FIRST, 0, "single fragment must have FIRST");
                 assert_ne!(b0 & FLAG_LAST, 0, "single fragment must have LAST");
-                assert_eq!(&msg[HEADER_SIZE..], b"small");
+                assert_eq!(msg.last().copied(), Some(FRAGMENT_CANARY));
+                assert_eq!(&msg[HEADER_SIZE..msg.len() - 1], b"small");
             }
             _ => panic!("expected Send action"),
         }
@@ -818,8 +915,8 @@ mod tests {
     #[tokio::test]
     async fn test_large_datagram_fragmented() {
         let retransmits = Arc::new(AtomicU64::new(0));
-        // chunk_size=10 -> 8 bytes payload per fragment -> 20 bytes = 3 fragments.
-        let (ch, _rx) = ReliableChannel::new(10, retransmits);
+        // chunk_size=10 -> max_payload=7 (10 - 2 header - 1 canary) -> 20 bytes = 3 fragments.
+        let (ch, _rx) = ReliableChannel::new(10, retransmits, Arc::new(AtomicU64::new(0)));
 
         let data = vec![0xAA; 20];
         ch.enqueue_datagram(data).await;
@@ -829,7 +926,7 @@ mod tests {
             SendAction::Send(msg) => {
                 assert_ne!(msg[0] & FLAG_FIRST, 0);
                 assert_eq!(msg[0] & FLAG_LAST, 0);
-                assert_eq!(msg.len() - HEADER_SIZE, 8);
+                assert_eq!(msg.len() - HEADER_SIZE, 8); // 7 payload + 1 canary
             }
             _ => panic!("expected Send"),
         }
@@ -839,7 +936,7 @@ mod tests {
             SendAction::Send(msg) => {
                 assert_eq!(msg[0] & FLAG_FIRST, 0);
                 assert_eq!(msg[0] & FLAG_LAST, 0);
-                assert_eq!(msg.len() - HEADER_SIZE, 8);
+                assert_eq!(msg.len() - HEADER_SIZE, 8); // 7 payload + 1 canary
             }
             _ => panic!("expected Send"),
         }
@@ -849,7 +946,7 @@ mod tests {
             SendAction::Send(msg) => {
                 assert_eq!(msg[0] & FLAG_FIRST, 0);
                 assert_ne!(msg[0] & FLAG_LAST, 0);
-                assert_eq!(msg.len() - HEADER_SIZE, 4);
+                assert_eq!(msg.len() - HEADER_SIZE, 7); // 6 payload + 1 canary
             }
             _ => panic!("expected Send"),
         }
@@ -1076,8 +1173,229 @@ mod tests {
 
         let messages = sent.lock().await;
         assert_eq!(messages.len(), 1);
-        assert_eq!(&messages[0][HEADER_SIZE..], b"hello");
+        assert_eq!(messages[0].last().copied(), Some(FRAGMENT_CANARY));
+        assert_eq!(&messages[0][HEADER_SIZE..messages[0].len() - 1], b"hello");
     }
+    #[tokio::test(start_paused = true)]
+    async fn test_send_loop_deadline_declares_link_dead() {
+        let (ch, _rx) = make_channel();
+        let ch = Arc::new(ch);
+
+        ch.enqueue_datagram(b"data".to_vec()).await;
+
+        let ch2 = ch.clone();
+        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+
+        // Advance well past LINK_DEAD_DEADLINE (6s) with no ACKs. 30 × 500ms
+        // is 15s — more than enough for the progress deadline to fire.
+        for _ in 0..30 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+            if handle.is_finished() {
+                break;
+            }
+        }
+
+        let result = handle.await.unwrap();
+        assert_eq!(result, Err(LinkDead));
+    }
+
+    /// Regression: dispatching a fresh fragment must not reset the retransmit
+    /// backoff on the stuck head of `in_flight`. In the original buggy code,
+    /// every `SendAction::Send` cleared `retries` *and* `timeout`, so as long
+    /// as the app kept enqueueing small datagrams the retransmit schedule
+    /// restarted at `ACK_TIMEOUT` each time — preventing the link-dead path
+    /// from ever firing against a silently-dead peer. The fix ties both
+    /// retransmit cadence and the liveness deadline to real ACK progress.
+    ///
+    /// Strategy: force one retransmit to happen so the backoff doubles to
+    /// 600ms, then enqueue a new datagram mid-backoff. In the fixed code the
+    /// next retransmit stays on the 600ms schedule; in the buggy code it
+    /// reverts to 300ms. We catch the divergence by checking the retransmit
+    /// counter at a time window between the two.
+    #[tokio::test(start_paused = true)]
+    async fn test_new_send_does_not_reset_retry_backoff() {
+        let (ch, _rx) = make_channel();
+        let ch = Arc::new(ch);
+        let retransmit_counter = ch.retransmit_counter.clone();
+
+        ch.enqueue_datagram(b"stuck".to_vec()).await;
+
+        let ch2 = ch.clone();
+        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+
+        // Helper: advance virtual time in small chunks with yields between,
+        // so each timer firing gets polled by the runtime. Coarse advances
+        // skip polls and leave the send loop parked.
+        async fn tick(ms: u64) {
+            for _ in 0..(ms / 10).max(1) {
+                tokio::time::advance(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+
+        // Drive the first retransmit (fires at ~t=300ms after ACK_TIMEOUT).
+        tick(400).await;
+        assert_eq!(
+            retransmit_counter.load(Ordering::Relaxed),
+            1,
+            "first retransmit should have fired after ACK_TIMEOUT"
+        );
+
+        // Backoff is now 600ms; the next retransmit is armed for ~t=1000ms.
+        // Inject a fresh datagram mid-backoff. In the buggy code this reset
+        // both `retries` and `timeout`, so the next retransmit would shift to
+        // ~t=700ms (300ms from now). In the fixed code the schedule is
+        // unchanged.
+        ch.enqueue_datagram(b"fresh".to_vec()).await;
+
+        // Advance to ~t=800ms — past the buggy reset schedule (~700ms),
+        // still before the correct schedule (~1000ms).
+        tick(400).await;
+
+        assert_eq!(
+            retransmit_counter.load(Ordering::Relaxed),
+            1,
+            "new Send must not reset the retransmit backoff on the stuck head"
+        );
+
+        // Clean shutdown.
+        ch.state.lock().await.link_dead = true;
+        ch.wake.notify_one();
+        let _ = handle.await;
+    }
+
+    /// `mark_dead()` is the fast-path signal from the pipe owner when the
+    /// BLE link is gone (`CentralDisconnected`, registry-initiated teardown).
+    /// It must wake a parked send loop within a tokio poll cycle and cause
+    /// it to return `LinkDead` without waiting for the 6s deadline.
+    #[tokio::test(start_paused = true)]
+    async fn test_mark_dead_wakes_parked_send_loop() {
+        let (ch, _rx) = make_channel();
+        let ch = Arc::new(ch);
+
+        // Park the send loop on the ACK timer.
+        ch.enqueue_datagram(b"stuck".to_vec()).await;
+
+        let ch2 = ch.clone();
+        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+
+        // Let the loop dispatch frag0, clear INTER_FRAME_GAP, re-enter the
+        // Wait arm and park on `wake.notified()`.
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !handle.is_finished(),
+            "loop should be parked waiting for ACK"
+        );
+
+        // Fire the disconnect signal.
+        ch.mark_dead().await;
+
+        // A small advance gives the runtime a turn after the notify so the
+        // send loop can be polled and transition Dead → return.
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+            if handle.is_finished() {
+                break;
+            }
+        }
+        assert!(handle.is_finished(), "mark_dead must wake the parked loop");
+
+        let result = handle.await.unwrap();
+        assert_eq!(result, Err(LinkDead));
+    }
+
+    /// The liveness deadline is a hard wall-clock budget. With no ACKs at all,
+    /// the send loop must declare `LinkDead` close to `LINK_DEAD_DEADLINE`
+    /// (6s) — not wait for dozens of retransmits to exhaust.
+    #[tokio::test(start_paused = true)]
+    async fn test_link_dead_fires_within_deadline() {
+        let (ch, _rx) = make_channel();
+        let ch = Arc::new(ch);
+
+        ch.enqueue_datagram(b"stuck".to_vec()).await;
+
+        let start = tokio::time::Instant::now();
+        let ch2 = ch.clone();
+        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+
+        // Advance in 250ms steps — fine enough that every retransmit timer
+        // and the deadline fire promptly.
+        for _ in 0..60 {
+            tokio::time::advance(Duration::from_millis(250)).await;
+            tokio::task::yield_now().await;
+            if handle.is_finished() {
+                break;
+            }
+        }
+
+        assert!(handle.is_finished(), "send loop should have exited");
+        let result = handle.await.unwrap();
+        assert_eq!(result, Err(LinkDead));
+
+        let elapsed = tokio::time::Instant::now() - start;
+        // Deadline is 6s; allow a small margin for the final sleep quantum
+        // and the post-exit advance steps.
+        assert!(
+            elapsed >= LINK_DEAD_DEADLINE,
+            "declared dead too early: elapsed={elapsed:?}"
+        );
+        assert!(
+            elapsed < LINK_DEAD_DEADLINE + Duration::from_millis(750),
+            "declared dead too late: elapsed={elapsed:?}"
+        );
+    }
+
+    /// An ACK that advances the head of the send window is the only signal
+    /// of genuine progress, and it must (a) reset the retransmit backoff to
+    /// `ACK_TIMEOUT` and (b) slide the liveness deadline forward. We
+    /// retransmit the same head fragment a few times inside the 6s window,
+    /// then deliver an ACK that drains in-flight, and confirm the loop gets a
+    /// fresh 6s budget and does not declare LinkDead.
+    #[tokio::test(start_paused = true)]
+    async fn test_deadline_resets_when_head_advances() {
+        let (ch, _rx) = make_channel();
+        let ch = Arc::new(ch);
+
+        ch.enqueue_datagram(b"one".to_vec()).await;
+
+        let ch2 = ch.clone();
+        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+
+        // Burn ~4s of the deadline with retransmits — under 6s, still alive.
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(!handle.is_finished(), "loop should still be alive pre-ACK");
+
+        // ACK seq 0: cumulative ACK advances send_base, drains in_flight,
+        // and (critically) bumps `last_progress_at` to now.
+        ch.receive_fragment(&pure_ack(0)).await;
+        ch.wake.notify_waiters();
+        tokio::task::yield_now().await;
+
+        // Enqueue a follow-up and advance another ~4s. If the deadline did
+        // not reset, total elapsed (~8s) would trip LinkDead; it must not.
+        ch.enqueue_datagram(b"two".to_vec()).await;
+        for _ in 0..8 {
+            tokio::time::advance(Duration::from_millis(500)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !handle.is_finished(),
+            "after head advanced, deadline should have reset and loop should be alive"
+        );
+
+        ch.state.lock().await.link_dead = true;
+        ch.wake.notify_one();
+        let _ = handle.await;
+    }
+
     #[tokio::test]
     async fn test_link_dead_returns_dead() {
         let (ch, _rx) = make_channel();
@@ -1208,7 +1526,8 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_fragment_requires_retransmit() {
         let retransmits = Arc::new(AtomicU64::new(0));
-        let (a, _a_rx) = ReliableChannel::new(512, retransmits.clone());
+        let (a, _a_rx) =
+            ReliableChannel::new(512, retransmits.clone(), Arc::new(AtomicU64::new(0)));
         let (_b, mut b_rx) = make_channel();
 
         a.enqueue_datagram(b"will-drop".to_vec()).await;
@@ -1227,7 +1546,8 @@ mod tests {
     #[tokio::test]
     async fn test_dropped_ack_sender_retransmits() {
         let retransmits_a = Arc::new(AtomicU64::new(0));
-        let (a, _a_rx) = ReliableChannel::new(512, retransmits_a.clone());
+        let (a, _a_rx) =
+            ReliableChannel::new(512, retransmits_a.clone(), Arc::new(AtomicU64::new(0)));
         let (b, mut b_rx) = make_channel();
 
         a.enqueue_datagram(b"data".to_vec()).await;
@@ -1255,8 +1575,8 @@ mod tests {
     #[tokio::test]
     async fn test_drop_first_of_two_fragments() {
         let retransmits = Arc::new(AtomicU64::new(0));
-        // chunk_size=10 -> 8 payload -> 20 bytes = 3 fragments.
-        let (a, _a_rx) = ReliableChannel::new(10, retransmits);
+        // chunk_size=10 -> 7 payload -> 20 bytes = 3 fragments.
+        let (a, _a_rx) = ReliableChannel::new(10, retransmits, Arc::new(AtomicU64::new(0)));
         let (b, mut b_rx) = make_channel();
 
         a.enqueue_datagram(vec![0xAA; 20]).await;
@@ -1293,9 +1613,8 @@ mod tests {
     #[tokio::test]
     async fn test_reordered_fragments_reassembled_correctly() {
         let retransmits = Arc::new(AtomicU64::new(0));
-        let (a, _a_rx) = ReliableChannel::new(10, retransmits);
-        let (_b, _b_rx) = make_channel();
-
+        // chunk_size=10 -> max_payload=7 -> 16 bytes = 3 fragments (7+7+2).
+        let (a, _a_rx) = ReliableChannel::new(10, retransmits, Arc::new(AtomicU64::new(0)));
         let (b2, mut b2_rx) = make_channel();
 
         a.enqueue_datagram(vec![0xBB; 16]).await;
@@ -1307,15 +1626,22 @@ mod tests {
             SendAction::Send(msg) => msg,
             _ => panic!("expected send"),
         };
+        let frag2 = match a.next_send_action().await {
+            SendAction::Send(msg) => msg,
+            _ => panic!("expected send"),
+        };
 
-        // Deliver in reverse order.
-        b2.receive_fragment(&frag1).await;
-        assert!(
-            b2_rx.try_recv().is_err(),
-            "not complete yet (frag0 missing)"
-        );
+        // Deliver out of order: 2, 0, 1.
+        b2.receive_fragment(&frag2).await;
+        assert!(b2_rx.try_recv().is_err(), "not complete yet");
 
         b2.receive_fragment(&frag0).await;
+        assert!(
+            b2_rx.try_recv().is_err(),
+            "not complete yet (frag1 missing)"
+        );
+
+        b2.receive_fragment(&frag1).await;
         let got = b2_rx.try_recv().expect("should deliver after reorder");
         assert_eq!(got, vec![0xBB; 16]);
     }
@@ -1380,8 +1706,8 @@ mod tests {
     #[tokio::test]
     async fn test_multi_fragment_datagram_across_sequence_wrap() {
         let retransmits = Arc::new(AtomicU64::new(0));
-        // chunk_size=10 -> 8 payload per fragment.
-        let (a, _a_rx) = ReliableChannel::new(10, retransmits);
+        // chunk_size=10 -> 7 payload per fragment.
+        let (a, _a_rx) = ReliableChannel::new(10, retransmits, Arc::new(AtomicU64::new(0)));
         let (b, mut b_rx) = make_channel();
 
         for i in 0..14u8 {
@@ -1486,5 +1812,69 @@ mod tests {
 
         let state = ch.state.lock().await;
         assert_eq!(state.recv_next, 1);
+    }
+
+    #[tokio::test]
+    async fn send_loop_appends_canary_to_every_fragment() {
+        let retransmit = Arc::new(AtomicU64::new(0));
+        let truncation = Arc::new(AtomicU64::new(0));
+        let (ch, _rx) = ReliableChannel::new(32, Arc::clone(&retransmit), Arc::clone(&truncation));
+        let ch = Arc::new(ch);
+
+        ch.enqueue_datagram(vec![0xAB; 100]).await;
+
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<Vec<u8>>::new()));
+        let captured_for_cb = Arc::clone(&captured);
+        let ch_for_task = Arc::clone(&ch);
+        let handle = tokio::spawn(async move {
+            ch_for_task
+                .run_send_loop(move |bytes| {
+                    let captured = Arc::clone(&captured_for_cb);
+                    async move {
+                        captured.lock().unwrap().push(bytes);
+                        Ok::<(), String>(())
+                    }
+                })
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+
+        let frames = captured.lock().unwrap();
+        assert!(
+            !frames.is_empty(),
+            "expected at least one fragment on the wire"
+        );
+        for (i, frame) in frames.iter().enumerate() {
+            assert_eq!(
+                frame.last().copied(),
+                Some(FRAGMENT_CANARY),
+                "fragment {i} did not end with FRAGMENT_CANARY: {frame:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_fragment_drops_and_counts_canary_mismatch() {
+        let retransmit = Arc::new(AtomicU64::new(0));
+        let truncation = Arc::new(AtomicU64::new(0));
+        let (ch, mut rx) =
+            ReliableChannel::new(32, Arc::clone(&retransmit), Arc::clone(&truncation));
+
+        let mut bad = vec![FLAG_FIRST | FLAG_LAST, 0x00];
+        bad.extend_from_slice(b"hi");
+
+        ch.receive_fragment(&bad).await;
+
+        assert_eq!(
+            truncation.load(Ordering::Relaxed),
+            1,
+            "truncation counter should bump exactly once on missing canary"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "corrupt fragment must not deliver a datagram"
+        );
     }
 }

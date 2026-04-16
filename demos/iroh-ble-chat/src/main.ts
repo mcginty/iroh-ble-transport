@@ -4,15 +4,45 @@ import QRCode from "qrcode";
 import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { scan, Format, checkPermissions, requestPermissions } from "@tauri-apps/plugin-barcode-scanner";
 
+// Self-hosted fonts (bundled into the app so they work offline).
+import "@fontsource/inter/400.css";
+import "@fontsource/inter/500.css";
+import "@fontsource/inter/600.css";
+import "@fontsource/inter/800.css";
+import "@fontsource/press-start-2p/400.css";
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+type PeerStatus =
+  | "self"
+  | "connected"
+  | "handshaking"
+  | "connecting"
+  | "reconnecting"
+  | "in_topic"
+  | "nearby"
+  | "draining"
+  | "stale"
+  | "dead"
+  | "unknown";
+
 interface PeerStateUI {
   id: string;
   nickname: string | null;
-  status: "self" | "direct" | "in_topic" | "stale";
+  status: PeerStatus;
+  ble_phase: string | null;
+  ble_path: string | null;
+  ble_failures: number;
   last_seen_secs_ago: number;
+}
+
+interface BlePeerDebugUI {
+  device_id: string;
+  phase: string;
+  consecutive_failures: number;
+  path: string | null;
 }
 
 interface ChatMsgPayload {
@@ -52,6 +82,59 @@ interface ImageProgressPayload {
 let myId = "";
 let myNickname = "";
 const peers = new Map<string, PeerStateUI>();
+const blePeers = new Map<string, BlePeerDebugUI>();
+
+interface PeerExtras {
+  lastSeenAt: number;       // wall clock ms
+  connectedSince?: number;  // wall clock ms when status became connected
+  msgsReceived: number;
+  lastMsgAt?: number;       // wall clock ms
+}
+const peerExtras = new Map<string, PeerExtras>();
+
+function ensureExtras(id: string): PeerExtras {
+  let e = peerExtras.get(id);
+  if (!e) {
+    e = { lastSeenAt: Date.now(), msgsReceived: 0 };
+    peerExtras.set(id, e);
+  }
+  return e;
+}
+
+function formatRelative(ms: number): string {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  if (sec < 5)   return "just now";
+  if (sec < 60)  return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60)  return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24)   return `${hr}h ago`;
+  const d = Math.floor(hr / 24);
+  return `${d}d ago`;
+}
+
+function formatDuration(ms: number): string {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  if (sec < 60)  return `${sec}s`;
+  const min = Math.floor(sec / 60);
+  const secRem = sec % 60;
+  if (min < 60)  return secRem === 0 ? `${min}m` : `${min}m ${secRem}s`;
+  const hr = Math.floor(min / 60);
+  const minRem = min % 60;
+  return minRem === 0 ? `${hr}h` : `${hr}h ${minRem}m`;
+}
+
+const BLE_PHASE_LABEL: Record<string, string> = {
+  Unknown: "Unknown",
+  Discovered: "Discovered",
+  Connecting: "Connecting",
+  Handshaking: "Handshaking",
+  Connected: "Connected",
+  Draining: "Draining",
+  Reconnecting: "Reconnecting",
+  Restoring: "Restoring",
+  Dead: "Dead",
+};
 
 // Sender colour palette (8 colours, indexed by hash of EndpointId)
 const SENDER_COLOURS = 8;
@@ -82,6 +165,8 @@ const copyIdBtn = document.getElementById("copy-id-btn") as HTMLButtonElement;
 const membersToggleBtn = document.getElementById("members-toggle-btn") as HTMLButtonElement;
 const membersSidebar = document.getElementById("members-sidebar")!;
 const membersList = document.getElementById("members-list")!;
+const blePeersSection = document.getElementById("ble-peers-section")!;
+const blePeersList = document.getElementById("ble-peers-list")!;
 const membersCount = document.getElementById("members-count")!;
 const membersBadge = document.getElementById("members-badge")!;
 const sidebarCloseBtn = document.getElementById("sidebar-close-btn") as HTMLButtonElement;
@@ -113,24 +198,39 @@ function setStatus(text: string, cls: string) {
 }
 
 function updateStatusFromPeers() {
-  let direct = 0;
+  let connected = 0;
+  let pending = 0;
   let inTopic = 0;
   for (const p of peers.values()) {
-    if (p.status === "direct") direct++;
-    else if (p.status === "in_topic") inTopic++;
+    switch (p.status) {
+      case "connected":
+        connected++;
+        break;
+      case "handshaking":
+      case "connecting":
+      case "reconnecting":
+      case "nearby":
+        pending++;
+        break;
+      case "in_topic":
+        inTopic++;
+        break;
+      default:
+        break;
+    }
   }
-  if (direct === 0 && inTopic === 0) {
-    setStatus("Waiting for peers", "ready");
+  if (connected === 0 && pending === 0 && inTopic === 0) {
+    setStatus("Scanning…", "ready");
   } else {
     const parts: string[] = [];
-    if (direct > 0) parts.push(`${direct} direct`);
+    if (connected > 0) parts.push(`${connected} connected`);
+    if (pending > 0) parts.push(`${pending} pending`);
     if (inTopic > 0) parts.push(`${inTopic} in topic`);
-    setStatus(parts.join(" · "), "connected");
+    setStatus(parts.join(" · "), connected > 0 ? "connected" : "ready");
   }
 
-  // Update badge
-  if (direct > 0) {
-    membersBadge.textContent = String(direct);
+  if (connected > 0) {
+    membersBadge.textContent = String(connected);
     membersBadge.style.display = "";
   } else {
     membersBadge.style.display = "none";
@@ -141,20 +241,46 @@ function updateStatusFromPeers() {
 // Members list rendering
 // ---------------------------------------------------------------------------
 
+const STATUS_RANK: Record<PeerStatus, number> = {
+  self: 0,
+  connected: 1,
+  handshaking: 2,
+  connecting: 3,
+  reconnecting: 4,
+  in_topic: 5,
+  nearby: 6,
+  draining: 7,
+  stale: 8,
+  dead: 9,
+  unknown: 10,
+};
+
+const STATUS_LABEL: Record<PeerStatus, string> = {
+  self: "you",
+  connected: "Connected",
+  handshaking: "Handshaking…",
+  connecting: "Connecting…",
+  reconnecting: "Reconnecting…",
+  in_topic: "In topic",
+  nearby: "Nearby",
+  draining: "Draining",
+  stale: "Stale",
+  dead: "Unreachable",
+  unknown: "—",
+};
+
 function renderMembers() {
   const sorted = Array.from(peers.values()).sort((a, b) => {
-    const rank = (s: string) => {
-      switch (s) {
-        case "self": return 0;
-        case "direct": return 1;
-        case "in_topic": return 2;
-        case "stale": return 3;
-        default: return 4;
-      }
-    };
-    const r = rank(a.status) - rank(b.status);
+    const r = (STATUS_RANK[a.status] ?? 99) - (STATUS_RANK[b.status] ?? 99);
     if (r !== 0) return r;
     return (a.nickname ?? a.id).localeCompare(b.nickname ?? b.id);
+  });
+
+  // Remember which rows were open so we can restore them after re-render.
+  const openIds = new Set<string>();
+  membersList.querySelectorAll<HTMLElement>(".member-detail.expanded").forEach((el) => {
+    const id = el.dataset.peerId;
+    if (id) openIds.add(id);
   });
 
   membersList.innerHTML = "";
@@ -168,11 +294,22 @@ function renderMembers() {
     row.className = "member-row";
     row.dataset.peerId = peer.id;
 
+    const dimmed = peer.status === "stale" || peer.status === "dead";
+    const statusLabel = STATUS_LABEL[peer.status] ?? peer.status;
+    const extras = peerExtras.get(peer.id);
+    const showLastSeen = peer.status !== "self"
+      && peer.status !== "connected"
+      && peer.status !== "handshaking"
+      && extras !== undefined;
+    const subline = showLastSeen && extras
+      ? `${statusLabel} · ${formatRelative(Date.now() - extras.lastSeenAt)}`
+      : statusLabel;
+
     row.innerHTML = `
       <div class="member-dot ${peer.status}"></div>
       <div class="member-info">
-        <div class="member-name ${peer.status === "stale" ? "stale" : ""}">${escapeHtml(name)}</div>
-        <div class="member-id">${escapeHtml(shortId)}</div>
+        <div class="member-name ${dimmed ? "stale" : ""}">${escapeHtml(name)}</div>
+        <div class="member-id">${escapeHtml(subline)}</div>
       </div>
     `;
 
@@ -183,32 +320,163 @@ function renderMembers() {
         return;
       }
       membersList.querySelectorAll(".member-detail").forEach((el) => el.remove());
-
-      const detail = document.createElement("div");
-      detail.className = "member-detail expanded";
-      detail.innerHTML = `
-        <div class="member-detail-id">${escapeHtml(peer.id)}</div>
-        <button class="member-detail-copy">Copy ID</button>
-      `;
-      detail.querySelector("button")!.addEventListener("click", async (e) => {
-        e.stopPropagation();
-        try {
-          await navigator.clipboard.writeText(peer.id);
-          (e.target as HTMLButtonElement).textContent = "Copied!";
-          setTimeout(() => {
-            (e.target as HTMLButtonElement).textContent = "Copy ID";
-          }, 1500);
-        } catch {
-          // ignore
-        }
-      });
+      const detail = buildMemberDetail(peer);
       row.after(detail);
     });
 
     membersList.appendChild(row);
+
+    if (openIds.has(peer.id)) {
+      membersList.appendChild(buildMemberDetail(peer));
+    }
   }
 
   membersCount.textContent = String(sorted.length);
+}
+
+function buildMemberDetail(peer: PeerStateUI): HTMLElement {
+  const detail = document.createElement("div");
+  detail.className = "member-detail expanded";
+  detail.dataset.peerId = peer.id;
+
+  const stats = document.createElement("div");
+  stats.className = "member-detail-stats";
+  renderDetailStats(stats, peer);
+  detail.appendChild(stats);
+
+  const idEl = document.createElement("div");
+  idEl.className = "member-detail-id";
+  idEl.textContent = peer.id;
+  detail.appendChild(idEl);
+
+  if (peer.id !== myId) {
+    const actions = document.createElement("div");
+    actions.className = "member-detail-actions";
+
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "member-detail-copy";
+    copyBtn.textContent = "Copy ID";
+    copyBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(peer.id);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => { copyBtn.textContent = "Copy ID"; }, 1500);
+      } catch { /* ignore */ }
+    });
+    actions.appendChild(copyBtn);
+
+    const removeBtn = document.createElement("button");
+    removeBtn.className = "member-detail-remove";
+    removeBtn.textContent = "Remove";
+    removeBtn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const shortLabel = peer.nickname ?? peer.id.slice(0, 8);
+      if (!confirm(`Remove ${shortLabel}?`)) return;
+      try {
+        await invoke("remove_peer", { idStr: peer.id });
+      } catch (err) {
+        console.error("remove_peer failed", err);
+      }
+    });
+    actions.appendChild(removeBtn);
+
+    detail.appendChild(actions);
+  }
+
+  return detail;
+}
+
+function renderDetailStats(container: HTMLElement, peer: PeerStateUI) {
+  const rows: Array<[string, string]> = [];
+  const extras = peerExtras.get(peer.id);
+  const now = Date.now();
+
+  if (peer.status === "self") {
+    rows.push(["Status", "You"]);
+  } else {
+    if (peer.status === "connected" && extras?.connectedSince) {
+      rows.push(["Connected", `for ${formatDuration(now - extras.connectedSince)}`]);
+    } else {
+      rows.push(["Status", STATUS_LABEL[peer.status] ?? peer.status]);
+    }
+
+    if (extras) {
+      rows.push(["Last seen", formatRelative(now - extras.lastSeenAt)]);
+    }
+
+    if (peer.ble_phase) {
+      const phase = BLE_PHASE_LABEL[peer.ble_phase] ?? peer.ble_phase;
+      const pathSuffix = peer.ble_path ? ` (${peer.ble_path.toUpperCase()})` : "";
+      rows.push(["BLE", phase + pathSuffix]);
+    }
+    if (peer.ble_failures > 0) {
+      rows.push([
+        "Failures",
+        `${peer.ble_failures} consecutive`,
+      ]);
+    }
+
+    if (extras && extras.msgsReceived > 0) {
+      rows.push(["Received", `${extras.msgsReceived} msg${extras.msgsReceived === 1 ? "" : "s"}`]);
+      if (extras.lastMsgAt) {
+        rows.push(["Last msg", formatRelative(now - extras.lastMsgAt)]);
+      }
+    }
+  }
+
+  container.innerHTML = "";
+  for (const [label, value] of rows) {
+    const row = document.createElement("div");
+    row.className = "member-detail-stat";
+    row.innerHTML = `
+      <span class="stat-label">${escapeHtml(label)}</span>
+      <span class="stat-value">${escapeHtml(value)}</span>
+    `;
+    container.appendChild(row);
+  }
+}
+
+// Live-refresh any expanded detail rows once a second so timers tick.
+setInterval(() => {
+  const open = membersList.querySelectorAll<HTMLElement>(".member-detail.expanded");
+  if (open.length === 0) return;
+  open.forEach((el) => {
+    const id = el.dataset.peerId;
+    if (!id) return;
+    const peer = peers.get(id);
+    if (!peer) return;
+    const stats = el.querySelector<HTMLElement>(".member-detail-stats");
+    if (stats) renderDetailStats(stats, peer);
+  });
+}, 1000);
+
+function renderBlePeers() {
+  if (!debugCheckbox.checked || blePeers.size === 0) {
+    blePeersSection.style.display = "none";
+    blePeersList.innerHTML = "";
+    return;
+  }
+  blePeersSection.style.display = "";
+
+  const sorted = Array.from(blePeers.values()).sort((a, b) =>
+    a.device_id.localeCompare(b.device_id),
+  );
+
+  blePeersList.innerHTML = "";
+  for (const peer of sorted) {
+    const row = document.createElement("div");
+    row.className = "ble-peer-row";
+    const failureBadge = peer.consecutive_failures > 0
+      ? ` · ${peer.consecutive_failures} fail${peer.consecutive_failures === 1 ? "" : "s"}`
+      : "";
+    const pathBadge = peer.path ? ` · ${peer.path}` : "";
+    row.innerHTML = `
+      <div class="ble-peer-id" title="${escapeHtml(peer.device_id)}">${escapeHtml(peer.device_id)}</div>
+      <div class="ble-peer-phase">${escapeHtml(peer.phase)}${escapeHtml(pathBadge)}${escapeHtml(failureBadge)}</div>
+    `;
+    blePeersList.appendChild(row);
+  }
 }
 
 function escapeHtml(s: string): string {
@@ -245,6 +513,56 @@ drawerOverlay.addEventListener("click", closeDrawer);
 document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeDrawer();
 });
+
+// ---------------------------------------------------------------------------
+// Events (unified system/debug row)
+// ---------------------------------------------------------------------------
+
+type EventLevel = "debug" | "info" | "warn" | "error" | "success";
+
+const LEVEL_TAG: Record<EventLevel, string> = {
+  debug: "DBG",
+  info: "INFO",
+  warn: "WARN",
+  error: "ERR",
+  success: "OK",
+};
+
+function levelFromString(raw: string): EventLevel {
+  const s = raw.toUpperCase();
+  if (s.includes("ERROR")) return "error";
+  if (s.includes("WARN")) return "warn";
+  if (s.includes("INFO")) return "info";
+  return "debug";
+}
+
+function appendEvent(level: EventLevel, message: string, target?: string) {
+  const welcome = chatMessages.querySelector(".welcome");
+  if (welcome) welcome.remove();
+
+  const row = document.createElement("div");
+  row.className = `event-row level-${level}`;
+
+  const tag = document.createElement("span");
+  tag.className = "event-tag";
+  tag.textContent = LEVEL_TAG[level];
+  row.appendChild(tag);
+
+  if (target) {
+    const t = document.createElement("span");
+    t.className = "event-target";
+    t.textContent = target;
+    row.appendChild(t);
+  }
+
+  const msg = document.createElement("span");
+  msg.className = "event-msg";
+  msg.textContent = message;
+  row.appendChild(msg);
+
+  chatMessages.appendChild(row);
+  chatMessages.scrollTop = chatMessages.scrollHeight;
+}
 
 // ---------------------------------------------------------------------------
 // Messages
@@ -366,6 +684,9 @@ async function initNode() {
       id: myId,
       nickname: myNickname,
       status: "self",
+      ble_phase: null,
+      ble_path: null,
+      ble_failures: 0,
       last_seen_secs_ago: 0,
     });
     renderMembers();
@@ -403,6 +724,48 @@ async function initNode() {
 }
 
 document.addEventListener("DOMContentLoaded", () => initNode());
+
+// ---------------------------------------------------------------------------
+// Keyboard / visual viewport tracking
+// ---------------------------------------------------------------------------
+
+// Some mobile WebViews don't shrink `100dvh` when the soft keyboard opens.
+// Track the difference between layout viewport and visual viewport and expose
+// it as --kb-offset so the app container is pushed above the keyboard.
+(() => {
+  const vv = window.visualViewport;
+  if (!vv) return;
+
+  const root = document.documentElement;
+  const update = () => {
+    const offset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+    root.style.setProperty("--kb-offset", `${offset}px`);
+    if (document.activeElement === msgInput && offset > 0) {
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+  };
+
+  vv.addEventListener("resize", update);
+  vv.addEventListener("scroll", update);
+  update();
+})();
+
+msgInput.addEventListener("focus", () => {
+  setTimeout(() => {
+    chatMessages.scrollTop = chatMessages.scrollHeight;
+  }, 120);
+});
+
+// Prevent the send button from stealing focus from the input, so the
+// soft keyboard stays open after a send. Same for the attach button.
+for (const btn of [sendBtn, attachBtn]) {
+  btn.addEventListener("pointerdown", (e) => {
+    if (document.activeElement === msgInput) e.preventDefault();
+  });
+  btn.addEventListener("mousedown", (e) => {
+    if (document.activeElement === msgInput) e.preventDefault();
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Copy ID
@@ -513,20 +876,10 @@ confirmAddBtn.addEventListener("click", async () => {
 
   try {
     await invoke("add_peer", { idStr: peerId });
-    appendMessage({
-      from_id: myId,
-      nickname: myNickname,
-      text: `Peer added from QR code`,
-      is_self: true,
-    });
+    appendEvent("success", "Peer added from QR code");
   } catch (e: any) {
     console.error("Failed to add peer from deep link", e);
-    appendMessage({
-      from_id: myId,
-      nickname: myNickname,
-      text: `Failed to add peer: ${e}`,
-      is_self: true,
-    });
+    appendEvent("error", `Failed to add peer: ${e}`);
   }
 });
 
@@ -579,6 +932,18 @@ onOpenUrl((urls: string[]) => {
 // Add peer panel
 // ---------------------------------------------------------------------------
 
+function closeConnectPanel() {
+  if (connectPanel.classList.contains("collapsed")) return;
+  connectPanel.classList.add("collapsed");
+  connectToggleBtn.classList.remove("active");
+  connectToggleBtn.textContent = "＋";
+}
+
+function closeNicknamePanel() {
+  if (nicknamePanel.classList.contains("collapsed")) return;
+  nicknamePanel.classList.add("collapsed");
+}
+
 connectToggleBtn.addEventListener("click", () => {
   const isCollapsed = connectPanel.classList.toggle("collapsed");
   connectToggleBtn.classList.toggle("active", !isCollapsed);
@@ -586,6 +951,31 @@ connectToggleBtn.addEventListener("click", () => {
   if (!isCollapsed) {
     nicknamePanel.classList.add("collapsed");
     setTimeout(() => peerIdInput.focus(), 350);
+  }
+});
+
+// Tap outside of the connect or nickname panels (and not on the toggle that
+// opened them) to dismiss. Pointerdown runs before focus changes, so tapping
+// the message input or another control also closes the panel cleanly.
+document.addEventListener("pointerdown", (e) => {
+  const target = e.target as Node | null;
+  if (!target) return;
+  if (!connectPanel.classList.contains("collapsed")
+      && !connectPanel.contains(target)
+      && !connectToggleBtn.contains(target)) {
+    closeConnectPanel();
+  }
+  if (!nicknamePanel.classList.contains("collapsed")
+      && !nicknamePanel.contains(target)
+      && !editNicknameBtn.contains(target)) {
+    closeNicknamePanel();
+  }
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    closeConnectPanel();
+    closeNicknamePanel();
   }
 });
 
@@ -662,20 +1052,19 @@ nicknameInput.addEventListener("keydown", (e) => {
 msgForm.addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = msgInput.value.trim();
-  if (!text) return;
+  if (!text) {
+    msgInput.focus({ preventScroll: true });
+    return;
+  }
 
   msgInput.value = "";
+  msgInput.focus({ preventScroll: true });
 
   try {
     await invoke("send_message", { text });
   } catch (e) {
     console.error("Failed to send", e);
-    appendMessage({
-      from_id: myId,
-      nickname: myNickname,
-      text: "Failed to send message",
-      is_self: true,
-    });
+    appendEvent("error", "Failed to send message");
   }
 });
 
@@ -684,12 +1073,7 @@ attachBtn.addEventListener("click", async () => {
     await invoke("send_image");
   } catch (e: any) {
     console.error("Failed to send image", e);
-    appendMessage({
-      from_id: myId,
-      nickname: myNickname,
-      text: "Failed to send image: " + e,
-      is_self: true,
-    });
+    appendEvent("error", `Failed to send image: ${e}`);
   }
 });
 
@@ -700,17 +1084,38 @@ attachBtn.addEventListener("click", async () => {
 listen("chat-msg", (event: any) => {
   const payload: ChatMsgPayload = event.payload;
   appendMessage(payload);
+  if (!payload.is_self) {
+    const extras = ensureExtras(payload.from_id);
+    extras.msgsReceived += 1;
+    extras.lastMsgAt = Date.now();
+  }
 });
 
 listen("peer-updated", (event: any) => {
   const peer: PeerStateUI = event.payload;
+  const prev = peers.get(peer.id);
   peers.set(peer.id, peer);
+
+  if (peer.status !== "self") {
+    const extras = ensureExtras(peer.id);
+    // Backend sends last_seen_secs_ago relative to emit time — convert to wall clock.
+    extras.lastSeenAt = Date.now() - peer.last_seen_secs_ago * 1000;
+    if (peer.status === "connected") {
+      if (!extras.connectedSince || prev?.status !== "connected") {
+        extras.connectedSince = Date.now();
+      }
+    } else if (prev?.status === "connected") {
+      extras.connectedSince = undefined;
+    }
+  }
+
   renderMembers();
   updateStatusFromPeers();
 });
 
 listen("peer-removed", (event: any) => {
   peers.delete(event.payload.id);
+  peerExtras.delete(event.payload.id);
   renderMembers();
   updateStatusFromPeers();
 });
@@ -730,27 +1135,28 @@ debugCheckbox.addEventListener("change", async () => {
     console.error("Failed to set debug", e);
     debugCheckbox.checked = false;
   }
+  renderBlePeers();
+});
+
+listen("ble-peer-updated", (event: any) => {
+  const payload = event.payload as BlePeerDebugUI;
+  blePeers.set(payload.device_id, payload);
+  renderBlePeers();
+});
+
+listen("ble-peer-removed", (event: any) => {
+  const payload = event.payload as { device_id: string };
+  blePeers.delete(payload.device_id);
+  renderBlePeers();
 });
 
 listen("debug-log", (event: any) => {
-  const { target, message } = event.payload as {
+  const { message, level } = event.payload as {
     target: string;
     level: string;
     message: string;
   };
-
-  const welcome = chatMessages.querySelector(".welcome");
-  if (welcome) welcome.remove();
-
-  const wrapper = document.createElement("div");
-  wrapper.className = "message debug";
-
-  const textEl = document.createElement("span");
-  textEl.textContent = `[DBG] ${target}: ${message}`;
-  wrapper.appendChild(textEl);
-
-  chatMessages.appendChild(wrapper);
-  chatMessages.scrollTop = chatMessages.scrollHeight;
+  appendEvent(levelFromString(level), message);
 });
 
 listen("image-start", (event: any) => {
@@ -766,6 +1172,11 @@ listen("image-progress", (event: any) => {
 listen("chat-image", (event: any) => {
   const payload: ChatImagePayload = event.payload;
   appendImageMessage(payload);
+  if (!payload.is_self) {
+    const extras = ensureExtras(payload.from_id);
+    extras.msgsReceived += 1;
+    extras.lastMsgAt = Date.now();
+  }
 });
 
 listen("image-send-error", (event: any) => {
@@ -785,9 +1196,23 @@ listen("image-send-error", (event: any) => {
 
 const bwTx = document.getElementById("bw-tx")!;
 const bwRx = document.getElementById("bw-rx")!;
+const bwRtx = document.getElementById("bw-rtx")!;
+const bwTrunc = document.getElementById("bw-trunc")!;
+
+let rtxTotal = 0;
+let truncTotal = 0;
 
 listen("bandwidth", (event: any) => {
-  const { tx_kbps, rx_kbps } = event.payload as { tx_kbps: number; rx_kbps: number };
+  const { tx_kbps, rx_kbps, retransmits, truncations } = event.payload as {
+    tx_kbps: number;
+    rx_kbps: number;
+    retransmits: number;
+    truncations: number;
+  };
   bwTx.textContent = tx_kbps < 10 ? tx_kbps.toFixed(1) : Math.round(tx_kbps).toString();
   bwRx.textContent = rx_kbps < 10 ? rx_kbps.toFixed(1) : Math.round(rx_kbps).toString();
+  rtxTotal += retransmits ?? 0;
+  truncTotal += truncations ?? 0;
+  bwRtx.textContent = rtxTotal.toString();
+  bwTrunc.textContent = truncTotal.toString();
 });

@@ -127,7 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
 
-                    Some(CentralEvent::DeviceDisconnected { device_id: ref id })
+                    Some(CentralEvent::DeviceDisconnected { device_id: ref id, .. })
                         if *id == device_id =>
                     {
                         println!("Device disconnected.");

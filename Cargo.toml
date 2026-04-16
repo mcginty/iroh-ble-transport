@@ -2,11 +2,13 @@
 members = [
     "crates/iroh-ble-transport",
     "demos/protocol",
-    "demos/chat-tui",
     "demos/iroh-ble-chat/src-tauri",
 ]
 resolver = "2"
 
 [workspace.metadata.release]
+consolidate-commits = false
 tag-message = "{{crate_name}}: release {{version}}"
 pre-release-commit-message = "{{crate_name}}: release {{version}}"
+push = false
+publish = false

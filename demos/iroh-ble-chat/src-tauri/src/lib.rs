@@ -4,10 +4,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
+use iroh::endpoint::{presets, QuicTransportConfig};
 use iroh::protocol::Router;
-use iroh::{Endpoint, EndpointId, RelayMode};
+use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_ble_transport::transport::BleTransport;
+use iroh_ble_transport::{
+    BlePeerInfo, BlePeerPhase, Central, CentralConfig, ConnectPath, Peripheral,
+};
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
 use n0_future::StreamExt;
@@ -27,8 +31,8 @@ fn chat_topic_id() -> TopicId {
     let hash = blake3::hash(b"iroh-ble-chat-v1");
     TopicId::from_bytes(*hash.as_bytes())
 }
-#[derive(Clone, Debug)]
-enum PeerStatus {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GossipStatus {
     Direct,
     InTopic,
     Stale,
@@ -38,29 +42,73 @@ enum PeerStatus {
 struct PeerState {
     id: EndpointId,
     nickname: Option<String>,
-    status: PeerStatus,
+    gossip: Option<GossipStatus>,
+    ble_phase: Option<BlePeerPhase>,
+    ble_path: Option<String>,
+    ble_failures: u32,
     last_seen: Instant,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct PeerStateUI {
     id: String,
     nickname: Option<String>,
     status: String,
+    ble_phase: Option<String>,
+    ble_path: Option<String>,
+    ble_failures: u32,
     last_seen_secs_ago: u64,
 }
 
+fn ble_phase_str(phase: BlePeerPhase) -> &'static str {
+    match phase {
+        BlePeerPhase::Unknown => "unknown",
+        BlePeerPhase::Discovered => "discovered",
+        BlePeerPhase::Connecting => "connecting",
+        BlePeerPhase::Handshaking => "handshaking",
+        BlePeerPhase::Connected => "connected",
+        BlePeerPhase::Draining => "draining",
+        BlePeerPhase::Reconnecting => "reconnecting",
+        BlePeerPhase::Dead => "dead",
+        BlePeerPhase::Restoring => "restoring",
+    }
+}
+
 impl PeerState {
+    fn ui_status(&self) -> &'static str {
+        if matches!(self.gossip, Some(GossipStatus::Direct)) {
+            return "connected";
+        }
+        match self.ble_phase {
+            Some(BlePeerPhase::Connected) => "connected",
+            Some(BlePeerPhase::Handshaking) => "handshaking",
+            Some(BlePeerPhase::Connecting) => "connecting",
+            Some(BlePeerPhase::Reconnecting | BlePeerPhase::Restoring) => "reconnecting",
+            Some(BlePeerPhase::Discovered | BlePeerPhase::Unknown) => {
+                if matches!(self.gossip, Some(GossipStatus::InTopic)) {
+                    "in_topic"
+                } else {
+                    "nearby"
+                }
+            }
+            Some(BlePeerPhase::Draining) => "draining",
+            Some(BlePeerPhase::Dead) => "dead",
+            None => match self.gossip {
+                Some(GossipStatus::InTopic) => "in_topic",
+                Some(GossipStatus::Stale) => "stale",
+                _ => "unknown",
+            },
+        }
+    }
+
     fn to_ui(&self) -> PeerStateUI {
-        let status = match self.status {
-            PeerStatus::Direct => "direct",
-            PeerStatus::InTopic => "in_topic",
-            PeerStatus::Stale => "stale",
-        };
         PeerStateUI {
             id: self.id.to_string(),
             nickname: self.nickname.clone(),
-            status: status.to_string(),
+            status: self.ui_status().to_string(),
+            ble_phase: self.ble_phase.map(|p| ble_phase_str(p).to_string()),
+            ble_path: self.ble_path.clone(),
+            ble_failures: self.ble_failures,
             last_seen_secs_ago: self.last_seen.elapsed().as_secs(),
         }
     }
@@ -73,10 +121,10 @@ struct AppState {
     /// Dropping this kills gossip, so we hold it for the app lifetime.
     _router: Option<Router>,
     gossip_sender: Option<iroh_gossip::api::GossipSender>,
+    ble_transport: Option<Arc<BleTransport>>,
     peers: HashMap<EndpointId, PeerState>,
     debug_enabled: Arc<AtomicBool>,
     pending_images: crate::image::PendingImages,
-    transport: Option<BleTransport>,
 }
 
 impl AppState {
@@ -137,24 +185,54 @@ async fn start_node(
         info!("BLE permissions granted");
     }
 
-    let transport = BleTransport::new(&st.secret_key).await.map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("adapter not found") || msg.contains("AdapterNotFound") {
-            "Bluetooth is not available on this device. A physical Bluetooth adapter is required — simulators and emulators are not supported.".to_string()
-        } else if msg.contains("not powered")
-            || msg.contains("timed out waiting for Bluetooth")
-            || msg.contains("power on")
-        {
-            "Bluetooth is turned off. Please enable Bluetooth in Settings and restart the app."
-                .to_string()
-        } else {
-            msg
-        }
-    })?;
+    let ble_transport: Arc<BleTransport> = {
+        let central = Arc::new(
+            Central::with_config(CentralConfig {
+                restore_identifier: Some("org.jakebot.iroh-ble-chat.central".into()),
+            })
+            .await
+            .map_err(|e| e.to_string())?,
+        );
+        let peripheral = Arc::new(Peripheral::new().await.map_err(|e| e.to_string())?);
+        let local_id = st.secret_key.public();
+        let transport = BleTransport::new(local_id, central, peripheral).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("adapter not found") || msg.contains("AdapterNotFound") {
+                "Bluetooth is not available on this device. A physical Bluetooth adapter is required — simulators and emulators are not supported.".to_string()
+            } else if msg.contains("not powered")
+                || msg.contains("timed out waiting for Bluetooth")
+                || msg.contains("power on")
+            {
+                "Bluetooth is turned off. Please enable Bluetooth in Settings and restart the app."
+                    .to_string()
+            } else {
+                msg
+            }
+        })?;
+        Arc::new(transport)
+    };
+    let lookup = ble_transport.address_lookup();
+    let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble_transport.clone();
 
-    let ep = Endpoint::builder(transport.preset())
+    // BLE-tuned QUIC idle timeout. The default (30s) leaves a large window
+    // between BLE-level disconnect detection (~6s via ReliableChannel's
+    // LINK_DEAD_DEADLINE) and iroh finally marking the connection dead, which
+    // manifests as the UI showing a peer as connected long after the BLE link
+    // is gone. 15s is short enough to cut that gap noticeably while still
+    // tolerating the multi-second pauses real BLE links exhibit.
+    let transport_cfg = QuicTransportConfig::builder()
+        .max_idle_timeout(Some(
+            std::time::Duration::from_secs(15)
+                .try_into()
+                .expect("15s fits in IdleTimeout"),
+        ))
+        .build();
+
+    let ep = Endpoint::builder(presets::N0DisableRelay)
+        .add_custom_transport(Arc::clone(&transport))
+        .address_lookup(lookup)
+        .transport_config(transport_cfg)
         .secret_key(st.secret_key.clone())
-        .relay_mode(RelayMode::Disabled)
         .clear_ip_transports()
         .bind()
         .await
@@ -182,6 +260,18 @@ async fn start_node(
 
     let known_peers = load_known_peers(&st.cache_dir);
 
+    let own_id_pre = st.own_id();
+    for peer_id in &known_peers {
+        if *peer_id == own_id_pre {
+            continue;
+        }
+        let peer = st
+            .peers
+            .entry(*peer_id)
+            .or_insert_with(|| new_peer_entry(*peer_id));
+        let _ = app.emit("peer-updated", &peer.to_ui());
+    }
+
     let topic = gossip
         .subscribe(chat_topic_id(), known_peers.clone())
         .await
@@ -192,7 +282,7 @@ async fn start_node(
     st.endpoint = Some(ep);
     st._router = Some(router);
     st.gossip_sender = Some(sender.clone());
-    st.transport = Some(transport);
+    st.ble_transport = Some(ble_transport.clone());
 
     let own_id = st.own_id();
     let nickname = st.nickname.clone();
@@ -220,7 +310,13 @@ async fn start_node(
     ));
 
     tauri::async_runtime::spawn(stale_tick(app.clone(), state_arc.clone()));
-    tauri::async_runtime::spawn(bandwidth_tick(app.clone(), state_arc));
+    tauri::async_runtime::spawn(bandwidth_tick(app.clone(), ble_transport.clone()));
+    tauri::async_runtime::spawn(transport_state_tick(
+        app.clone(),
+        ble_transport,
+        state_arc.clone(),
+    ));
+    tauri::async_runtime::spawn(reconnect_tick(state_arc));
 
     Ok(result)
 }
@@ -240,23 +336,27 @@ async fn gossip_event_pump(
                 }
                 info!(peer = %peer_id.fmt_short(), "NeighborUp");
                 let mut st = state.lock().await;
-                let peer = st.peers.entry(peer_id).or_insert_with(|| PeerState {
-                    id: peer_id,
-                    nickname: None,
-                    status: PeerStatus::Direct,
-                    last_seen: Instant::now(),
-                });
-                peer.status = PeerStatus::Direct;
+                let peer = st
+                    .peers
+                    .entry(peer_id)
+                    .or_insert_with(|| new_peer_entry(peer_id));
+                peer.gossip = Some(GossipStatus::Direct);
                 peer.last_seen = Instant::now();
                 let ui = peer.to_ui();
                 let _ = app.emit("peer-updated", &ui);
+
+                let mut known = load_known_peers(&st.cache_dir);
+                if !known.contains(&peer_id) {
+                    known.push(peer_id);
+                    save_known_peers(&st.cache_dir, &known);
+                }
 
                 if !topic_joined {
                     topic_joined = true;
                     let active = st
                         .peers
                         .values()
-                        .filter(|p| matches!(p.status, PeerStatus::Direct))
+                        .filter(|p| matches!(p.gossip, Some(GossipStatus::Direct)))
                         .count();
                     let _ = app.emit("topic-joined", serde_json::json!({"active_peers": active}));
                 }
@@ -268,7 +368,7 @@ async fn gossip_event_pump(
                 info!(peer = %peer_id.fmt_short(), "NeighborDown");
                 let mut st = state.lock().await;
                 if let Some(peer) = st.peers.get_mut(&peer_id) {
-                    peer.status = PeerStatus::InTopic;
+                    peer.gossip = Some(GossipStatus::InTopic);
                     let ui = peer.to_ui();
                     let _ = app.emit("peer-updated", &ui);
                 }
@@ -284,13 +384,14 @@ async fn gossip_event_pump(
                             continue;
                         }
                         let mut st = state.lock().await;
-                        let peer = st.peers.entry(*from).or_insert_with(|| PeerState {
-                            id: *from,
-                            nickname: None,
-                            status: PeerStatus::InTopic,
-                            last_seen: Instant::now(),
-                        });
+                        let peer = st
+                            .peers
+                            .entry(*from)
+                            .or_insert_with(|| new_peer_entry(*from));
                         peer.nickname = Some(nickname.clone());
+                        if peer.gossip.is_none() {
+                            peer.gossip = Some(GossipStatus::InTopic);
+                        }
                         peer.last_seen = Instant::now();
                         let ui = peer.to_ui();
                         let _ = app.emit("peer-updated", &ui);
@@ -304,13 +405,14 @@ async fn gossip_event_pump(
                             continue;
                         }
                         let mut st = state.lock().await;
-                        let peer = st.peers.entry(*from).or_insert_with(|| PeerState {
-                            id: *from,
-                            nickname: None,
-                            status: PeerStatus::InTopic,
-                            last_seen: Instant::now(),
-                        });
+                        let peer = st
+                            .peers
+                            .entry(*from)
+                            .or_insert_with(|| new_peer_entry(*from));
                         peer.nickname = Some(nickname.clone());
+                        if peer.gossip.is_none() {
+                            peer.gossip = Some(GossipStatus::InTopic);
+                        }
                         peer.last_seen = Instant::now();
                         let ui = peer.to_ui();
                         let _ = app.emit("peer-updated", &ui);
@@ -330,13 +432,14 @@ async fn gossip_event_pump(
                             continue;
                         }
                         let mut st = state.lock().await;
-                        let peer = st.peers.entry(*from).or_insert_with(|| PeerState {
-                            id: *from,
-                            nickname: None,
-                            status: PeerStatus::InTopic,
-                            last_seen: Instant::now(),
-                        });
+                        let peer = st
+                            .peers
+                            .entry(*from)
+                            .or_insert_with(|| new_peer_entry(*from));
                         peer.nickname = Some(new_nickname.clone());
+                        if peer.gossip.is_none() {
+                            peer.gossip = Some(GossipStatus::InTopic);
+                        }
                         peer.last_seen = Instant::now();
                         let ui = peer.to_ui();
                         let _ = app.emit("peer-updated", &ui);
@@ -383,29 +486,68 @@ async fn gossip_event_pump(
     }
 }
 
-async fn bandwidth_tick(app: AppHandle, state: Arc<Mutex<AppState>>) {
-    let mut prev_tx = 0u64;
-    let mut prev_rx = 0u64;
+async fn bandwidth_tick(app: AppHandle, transport: Arc<BleTransport>) {
+    let interval = std::time::Duration::from_secs(1);
+    let mut prev = transport.metrics();
+    let mut prev_instant = Instant::now();
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let transport = {
-            let st = state.lock().await;
-            st.transport.clone()
-        };
-        let Some(transport) = transport else {
-            continue;
-        };
-        let stats = transport.stats();
-        let tx_delta = stats.tx_bytes.saturating_sub(prev_tx);
-        let rx_delta = stats.rx_bytes.saturating_sub(prev_rx);
-        prev_tx = stats.tx_bytes;
-        prev_rx = stats.rx_bytes;
-        let tx_kbps = (tx_delta as f64 * 8.0) / 1000.0;
-        let rx_kbps = (rx_delta as f64 * 8.0) / 1000.0;
+        tokio::time::sleep(interval).await;
+        let now = transport.metrics();
+        let elapsed = prev_instant.elapsed().as_secs_f64().max(0.001);
+        let tx_delta = now.tx_bytes.saturating_sub(prev.tx_bytes);
+        let rx_delta = now.rx_bytes.saturating_sub(prev.rx_bytes);
+        let retransmit_delta = now.retransmits.saturating_sub(prev.retransmits);
+        let truncation_delta = now.truncations.saturating_sub(prev.truncations);
+        let tx_kbps = (tx_delta as f64 * 8.0 / 1000.0) / elapsed;
+        let rx_kbps = (rx_delta as f64 * 8.0 / 1000.0) / elapsed;
         let _ = app.emit(
             "bandwidth",
-            serde_json::json!({ "tx_kbps": tx_kbps, "rx_kbps": rx_kbps }),
+            serde_json::json!({
+                "tx_kbps": tx_kbps,
+                "rx_kbps": rx_kbps,
+                "retransmits": retransmit_delta,
+                "truncations": truncation_delta,
+            }),
         );
+        prev = now;
+        prev_instant = Instant::now();
+    }
+}
+
+/// Periodically nudge gossip to (re)connect to known peers we don't currently
+/// have a direct link to. The transport itself is intentionally passive — it
+/// will not auto-retry dead peers — so reconnect policy lives here.
+async fn reconnect_tick(state: Arc<Mutex<AppState>>) {
+    let interval = std::time::Duration::from_secs(10);
+    loop {
+        tokio::time::sleep(interval).await;
+        let st = state.lock().await;
+        let Some(sender) = st.gossip_sender.clone() else {
+            continue;
+        };
+        let known = load_known_peers(&st.cache_dir);
+        let own = st.own_id();
+        let targets: Vec<EndpointId> = known
+            .into_iter()
+            .filter(|p| *p != own)
+            .filter(|p| {
+                !matches!(
+                    st.peers.get(p).and_then(|s| s.gossip),
+                    Some(GossipStatus::Direct)
+                )
+            })
+            .collect();
+        drop(st);
+
+        if targets.is_empty() {
+            continue;
+        }
+        let count = targets.len();
+        if let Err(e) = sender.join_peers(targets).await {
+            tracing::debug!("reconnect_tick join_peers failed: {e}");
+        } else {
+            tracing::trace!("reconnect_tick nudged {count} peer(s)");
+        }
     }
 }
 
@@ -416,13 +558,116 @@ async fn stale_tick(app: AppHandle, state: Arc<Mutex<AppState>>) {
         let mut st = state.lock().await;
         for peer in st.peers.values_mut() {
             if peer.last_seen.elapsed() > stale_threshold
-                && matches!(peer.status, PeerStatus::InTopic)
+                && matches!(peer.gossip, Some(GossipStatus::InTopic))
             {
-                peer.status = PeerStatus::Stale;
+                peer.gossip = Some(GossipStatus::Stale);
                 let ui = peer.to_ui();
                 let _ = app.emit("peer-updated", &ui);
             }
         }
+    }
+}
+
+fn new_peer_entry(id: EndpointId) -> PeerState {
+    PeerState {
+        id,
+        nickname: None,
+        gossip: None,
+        ble_phase: None,
+        ble_path: None,
+        ble_failures: 0,
+        last_seen: Instant::now(),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct BlePeerDebugUI {
+    device_id: String,
+    phase: String,
+    consecutive_failures: u32,
+    path: Option<String>,
+}
+
+impl BlePeerDebugUI {
+    fn from_info(info: &BlePeerInfo) -> Self {
+        Self {
+            device_id: info.device_id.to_string(),
+            phase: ble_phase_str(info.phase).to_string(),
+            consecutive_failures: info.consecutive_failures,
+            path: info.connect_path.map(|p| {
+                match p {
+                    ConnectPath::Gatt => "gatt",
+                    ConnectPath::L2cap => "l2cap",
+                }
+                .to_string()
+            }),
+        }
+    }
+}
+
+async fn transport_state_tick(
+    app: AppHandle,
+    transport: Arc<BleTransport>,
+    state: Arc<Mutex<AppState>>,
+) {
+    let mut last_emitted: HashMap<String, BlePeerDebugUI> = HashMap::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let snapshot = transport.snapshot_peers();
+
+        let info_by_device: HashMap<String, &BlePeerInfo> = snapshot
+            .iter()
+            .map(|info| (info.device_id.to_string(), info))
+            .collect();
+
+        {
+            let mut st = state.lock().await;
+            for peer in st.peers.values_mut() {
+                let info = transport
+                    .device_for_endpoint(&peer.id)
+                    .and_then(|did| info_by_device.get(&did.to_string()).copied());
+
+                let new_phase = info.map(|i| i.phase);
+                let new_failures = info.map_or(0, |i| i.consecutive_failures);
+                let new_path = info.and_then(|i| i.connect_path).map(|p| match p {
+                    ConnectPath::Gatt => "gatt".to_string(),
+                    ConnectPath::L2cap => "l2cap".to_string(),
+                });
+
+                if peer.ble_phase != new_phase
+                    || peer.ble_failures != new_failures
+                    || peer.ble_path != new_path
+                {
+                    peer.ble_phase = new_phase;
+                    peer.ble_failures = new_failures;
+                    peer.ble_path = new_path;
+                    let _ = app.emit("peer-updated", &peer.to_ui());
+                }
+            }
+        }
+
+        let mut current: HashMap<String, BlePeerDebugUI> = HashMap::with_capacity(snapshot.len());
+        for info in &snapshot {
+            current.insert(info.device_id.to_string(), BlePeerDebugUI::from_info(info));
+        }
+
+        for (device_id, ui) in &current {
+            if last_emitted.get(device_id) == Some(ui) {
+                continue;
+            }
+            let _ = app.emit("ble-peer-updated", ui);
+        }
+
+        for device_id in last_emitted.keys() {
+            if !current.contains_key(device_id) {
+                let _ = app.emit(
+                    "ble-peer-removed",
+                    serde_json::json!({ "device_id": device_id }),
+                );
+            }
+        }
+
+        last_emitted = current;
     }
 }
 struct DebugLogLayer {
@@ -514,12 +759,8 @@ async fn add_peer(
     let sender = st.gossip_sender.as_ref().ok_or("Node not started")?.clone();
 
     st.peers.entry(peer_id).or_insert_with(|| {
-        let peer = PeerState {
-            id: peer_id,
-            nickname: None,
-            status: PeerStatus::InTopic,
-            last_seen: Instant::now(),
-        };
+        let mut peer = new_peer_entry(peer_id);
+        peer.ble_phase = Some(BlePeerPhase::Connecting);
         let _ = app.emit("peer-updated", &peer.to_ui());
         peer
     });
@@ -536,6 +777,34 @@ async fn add_peer(
         .await
         .map_err(|e| format!("join_peers: {e}"))?;
 
+    Ok(())
+}
+
+#[tauri::command]
+async fn remove_peer(
+    id_str: String,
+    app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
+    let peer_id: EndpointId = id_str.parse().map_err(|e| format!("{e}"))?;
+
+    let mut st = state.lock().await;
+    if peer_id == st.own_id() {
+        return Err("cannot remove self".into());
+    }
+    st.peers.remove(&peer_id);
+    let mut known = load_known_peers(&st.cache_dir);
+    let before = known.len();
+    known.retain(|p| p != &peer_id);
+    if known.len() != before {
+        save_known_peers(&st.cache_dir, &known);
+    }
+    drop(st);
+
+    let _ = app.emit(
+        "peer-removed",
+        serde_json::json!({ "id": peer_id.to_string() }),
+    );
     Ok(())
 }
 
@@ -626,7 +895,7 @@ async fn send_image(app: AppHandle, state: State<'_, Arc<Mutex<AppState>>>) -> R
     let peer_ids: Vec<EndpointId> = st
         .peers
         .values()
-        .filter(|p| matches!(p.status, PeerStatus::Direct))
+        .filter(|p| matches!(p.gossip, Some(GossipStatus::Direct)))
         .map(|p| p.id)
         .collect();
     drop(st);
@@ -778,16 +1047,25 @@ async fn get_peers(state: State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<PeerSta
         id: own_id.to_string(),
         nickname: Some(st.nickname.clone()),
         status: "self".to_string(),
+        ble_phase: None,
+        ble_path: None,
+        ble_failures: 0,
         last_seen_secs_ago: 0,
     }];
 
-    let mut others: Vec<PeerStateUI> = st.peers.values().map(|p| p.to_ui()).collect();
+    let mut others: Vec<PeerStateUI> = st.peers.values().map(PeerState::to_ui).collect();
     others.sort_by(|a, b| {
         let rank = |s: &str| match s {
-            "direct" => 0,
-            "in_topic" => 1,
-            "stale" => 2,
-            _ => 3,
+            "connected" => 0,
+            "handshaking" => 1,
+            "connecting" => 2,
+            "reconnecting" => 3,
+            "in_topic" => 4,
+            "nearby" => 5,
+            "draining" => 6,
+            "stale" => 7,
+            "dead" => 8,
+            _ => 9,
         };
         rank(&a.status)
             .cmp(&rank(&b.status))
@@ -843,10 +1121,10 @@ pub fn run() {
                 endpoint: None,
                 _router: None,
                 gossip_sender: None,
+                ble_transport: None,
                 peers: HashMap::new(),
                 debug_enabled: debug_enabled2.clone(),
                 pending_images: Default::default(),
-                transport: None,
             }));
             app.manage(state);
 
@@ -858,7 +1136,7 @@ pub fn run() {
             let env_filter =
                 tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new(
-                        "iroh_ble_transport=debug,iroh_gossip=info,iroh_ble_chat=info,blew=info,warn",
+                        "iroh_ble_transport=debug,iroh_gossip=info,iroh_ble_chat=debug,iroh_ble_chat_lib=debug,blew=info,warn",
                     )
                 });
             tracing_subscriber::registry()
@@ -872,6 +1150,7 @@ pub fn run() {
             get_node_id,
             start_node,
             add_peer,
+            remove_peer,
             send_message,
             send_image,
             set_nickname,
