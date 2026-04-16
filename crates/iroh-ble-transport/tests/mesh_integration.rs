@@ -236,3 +236,114 @@ async fn symmetric_connect_converges_to_one_channel() {
         b_view_of_a.phase_kind,
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_peer_flapping_does_not_disturb_others() {
+    use blew::DisconnectCause;
+    use iroh_ble_transport::transport::registry::PhaseKind;
+
+    let fabric = MockFabric::new();
+    let a = spawn_node(&fabric, DeviceId::from("a"), L2capPolicy::Disabled);
+    let mut b = spawn_node(&fabric, DeviceId::from("b"), L2capPolicy::Disabled);
+    let mut c = spawn_node(&fabric, DeviceId::from("c"), L2capPolicy::Disabled);
+
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(8);
+    let waker = waker_from_channel(waker_tx);
+
+    // Bring A into Connected with both B and C.
+    for (peer, prefix_byte, payload) in [
+        (&b.device_id, 0xB1_u8, &b"to-b"[..]),
+        (&c.device_id, 0xC1_u8, &b"to-c"[..]),
+    ] {
+        a.inbox_tx
+            .send(PeerCommand::Advertised {
+                prefix: prefix_for(prefix_byte),
+                device: ble_device(peer),
+                rssi: None,
+            })
+            .await
+            .unwrap();
+        a.inbox_tx
+            .send(PeerCommand::SendDatagram {
+                device_id: peer.clone(),
+                tx_gen: 0,
+                datagram: Bytes::copy_from_slice(payload),
+                waker: waker.clone(),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Drain the initial datagrams so the triangle is known to be live.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), b.incoming_rx.recv())
+        .await
+        .expect("B never got A's initial datagram");
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), c.incoming_rx.recv())
+        .await
+        .expect("C never got A's initial datagram");
+
+    let snap_before = a.snapshots.load();
+    let tx_gen_c_before = snap_before
+        .peer_states
+        .get(&c.device_id)
+        .expect("A has no C")
+        .tx_gen;
+    assert_eq!(
+        snap_before
+            .peer_states
+            .get(&c.device_id)
+            .unwrap()
+            .phase_kind,
+        PhaseKind::Connected,
+    );
+    drop(snap_before);
+
+    // Flap the A<->B edge: tell A that B disconnected (link loss).
+    a.inbox_tx
+        .send(PeerCommand::CentralDisconnected {
+            device_id: b.device_id.clone(),
+            cause: DisconnectCause::LinkLoss,
+        })
+        .await
+        .unwrap();
+
+    // Meanwhile, A can still send to C successfully.
+    a.inbox_tx
+        .send(PeerCommand::SendDatagram {
+            device_id: c.device_id.clone(),
+            tx_gen: tx_gen_c_before,
+            datagram: Bytes::from_static(b"still-talking-to-c"),
+            waker: waker.clone(),
+        })
+        .await
+        .unwrap();
+
+    let got_on_c = tokio::time::timeout(std::time::Duration::from_secs(10), c.incoming_rx.recv())
+        .await
+        .expect("C never got A's follow-up datagram")
+        .expect("C incoming closed");
+    assert_eq!(got_on_c.data.as_ref(), b"still-talking-to-c");
+
+    // A's view of C stays Connected with unchanged tx_gen; A's view of B has
+    // left Connected.
+    let snap_after = a.snapshots.load();
+    let state_b = snap_after
+        .peer_states
+        .get(&b.device_id)
+        .expect("A has no B");
+    let state_c = snap_after
+        .peer_states
+        .get(&c.device_id)
+        .expect("A has no C");
+    assert_ne!(
+        state_b.phase_kind,
+        PhaseKind::Connected,
+        "A's B entry should have left Connected after LinkLoss, found {:?}",
+        state_b.phase_kind,
+    );
+    assert_eq!(state_c.phase_kind, PhaseKind::Connected);
+    assert_eq!(
+        state_c.tx_gen, tx_gen_c_before,
+        "A's tx_gen for C must not shift when the unrelated B edge flaps"
+    );
+}
