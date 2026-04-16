@@ -4,7 +4,7 @@
 
 A Rust crate providing BLE (Bluetooth Low Energy) as a custom transport for the [iroh](https://github.com/n0-computer/iroh) peer-to-peer networking stack. Every node acts as **both** central (scanner/client) and peripheral (advertiser/server) simultaneously so peers can discover and dial each other symmetrically.
 
-Built on [blew](https://github.com/mcginty/blew) (git dependency) for cross-platform BLE. Wraps a state-machine "registry" that owns per-peer lifecycle, an action "driver" that talks to blew, and a Selective-Repeat ARQ "reliable" channel that fragments QUIC datagrams across GATT writes/notifications.
+Built on [blew](https://github.com/mcginty/blew) for cross-platform BLE. Wraps a state-machine "registry" that owns per-peer lifecycle, an action "driver" that talks to blew, and two data paths: **L2CAP CoC** (preferred — reliable stream, no fragmentation needed) and **GATT** (fallback — Selective-Repeat ARQ fragments QUIC datagrams across characteristic writes/notifications).
 
 ## Commands
 
@@ -78,7 +78,7 @@ crates/iroh-ble-transport/src/
     ├── pipe.rs              # Per-peer data pipe: ReliableChannel ↔ inbox/outbox channels
     ├── reliable.rs          # Selective-Repeat ARQ sliding-window protocol + fragment canary
     ├── mtu.rs               # MTU resolution (resolve_chunk_size, MIN_SANE_MTU floor)
-    ├── l2cap.rs             # L2CAP framing helpers (currently dormant — see below)
+    ├── l2cap.rs             # L2CAP framing + I/O task spawning (used by pipe.rs for L2CAP path)
     ├── store.rs             # PeerStore trait + InMemoryPeerStore
     ├── watchdog.rs          # 250 ms PeerCommand::Tick pump
     └── test_util.rs         # `testing` feature: in-process mock BleInterface
@@ -88,7 +88,7 @@ crates/iroh-ble-transport/src/
 
 ## Transport architecture
 
-`BleTransport` implements iroh's `CustomTransport` trait, tunnelling QUIC datagrams over GATT.
+`BleTransport` implements iroh's `CustomTransport` trait, tunnelling QUIC datagrams over BLE. It prefers L2CAP CoC when available and falls back to GATT fragmentation.
 
 ### Discovery
 
@@ -129,9 +129,28 @@ Service: 69726f01-8e45-4c2c-b3a5-331f3098b5c2  (IROH_SERVICE_UUID)
 3. Registry emits `StartDataPipe` → `pipe.rs` spins up a `ReliableChannel` and the per-peer outbound/inbound mpsc channels.
 4. Both sides are ready for QUIC datagrams. **No identity exchange on the data path** — QUIC's connection IDs handle endpoint identity.
 
-### Connection handshake (L2CAP path)
+### Connection handshake (L2CAP path — preferred)
 
-Currently **dormant**. `l2cap.rs` contains length-prefixed `[u16 LE][payload]` framing helpers and an `OpenL2cap` action exists in `peer.rs` / `driver.rs`, but the registry never issues `OpenL2cap` today — every peer rides the GATT path. Wiring L2CAP back in is on the roadmap; the framing primitives are kept ready so the path can be lit up without rewriting them. There is no pre-handshake identity exchange on this path either: the I/O task is told the peer's `DeviceId` up front by the caller (this avoids the old "L2CAP accept doesn't expose remote DeviceId" problem at the cost of the accept-side path needing some other tagging strategy).
+When `L2capPolicy::PreferL2cap` (the default), the central side attempts L2CAP after GATT connect succeeds:
+
+1. Central connects via GATT (same as above: `Discovered → Connecting → Handshaking`).
+2. In `Handshaking`, the registry sets `l2cap_deadline` and emits `OpenL2cap`.
+3. Driver reads the PSM characteristic, then calls `blew::Central::open_l2cap_channel`. The entire sequence is wrapped in a 1.5 s timeout (`L2CAP_SELECT_TIMEOUT`).
+4. On success → `OpenL2capSucceeded` → registry transitions to `Connected { path: L2cap }`, emits `StartDataPipe` with the L2CAP channel. `pipe.rs` runs `run_l2cap_pipe` which uses `spawn_l2cap_io_tasks` (length-prefixed `[u16 LE][payload]` framing, no `ReliableChannel`).
+5. On failure/timeout → `OpenL2capFailed` → falls back to `Connected { path: Gatt }`, uses the GATT pipe with `ReliableChannel` as before.
+
+The **peripheral side** runs `run_l2cap_accept`, draining the `blew::Peripheral::l2cap_listener` stream. Each accepted `(DeviceId, L2capChannel)` is sent as `PeerCommand::InboundL2capChannel`. The registry matches it to the peer by `DeviceId` and, if no data pipe is running yet, transitions to `Connected { path: L2cap }`.
+
+The PSM characteristic (`69726f04`) is served dynamically via `PeripheralEvent::ReadRequest` in `run_peripheral_events` — the value comes from the L2CAP listener's assigned PSM.
+
+`L2capPolicy::Disabled` skips the L2CAP attempt entirely and goes straight to GATT.
+
+Key constants (registry.rs):
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `L2CAP_SELECT_TIMEOUT` | 1.5 s | Max time for the PSM-read + L2CAP-open sequence |
+| `HANDSHAKING_L2CAP_WALL` | 2 s | Safety-net tick timeout if `OpenL2cap` result never arrives |
 
 ### Per-peer state machine
 
@@ -174,12 +193,18 @@ Owns two pieces of state above the per-peer state machine:
 
 ### Per-peer data pipe
 
-`pipe.rs` owns the runtime side of a connected peer:
+`pipe.rs` owns the runtime side of a connected peer. `run_data_pipe` branches on `ConnectPath`:
 
-- An `Arc<ReliableChannel>` for the ARQ protocol
+**GATT path (`run_gatt_pipe`):**
+- An `Arc<ReliableChannel>` for the Selective-Repeat ARQ protocol
 - A background send loop draining the outbound mpsc → ReliableChannel
 - A datagram delivery task routing reassembled datagrams → `incoming_tx` (which feeds iroh)
 - An MTU resolver (`resolve_chunk_size`) that asks blew for the negotiated ATT MTU at startup, falls back if it never reaches `MIN_SANE_MTU=24`
+
+**L2CAP path (`run_l2cap_pipe`):**
+- Uses `spawn_l2cap_io_tasks` from `l2cap.rs` — length-prefixed `[u16 LE][payload]` framing over `AsyncRead + AsyncWrite`
+- No `ReliableChannel` — L2CAP CoC is already reliable and stream-oriented
+- Outbound datagrams are framed and written directly; inbound frames are read and delivered to `incoming_tx`
 
 ### QUIC configuration (BlePreset)
 
@@ -244,35 +269,18 @@ Chunk size is **not** a fixed constant — it is resolved per peer at handshake 
 The transport exposes two snapshot APIs:
 
 - `BleTransport::metrics() -> BleMetricsSnapshot` — `tx_bytes`, `rx_bytes`, `retransmits`, `truncations` (cumulative atomics).
-- `BleTransport::snapshot_peers() -> Vec<BlePeerInfo>` — current `(device_id, phase, consecutive_failures)` for every peer in the registry. Backed by an `arc_swap::ArcSwap<SnapshotMaps>` that the registry republishes on every state change.
+- `BleTransport::snapshot_peers() -> Vec<BlePeerInfo>` — current `(device_id, phase, consecutive_failures, connect_path)` for every peer in the registry. Backed by an `arc_swap::ArcSwap<SnapshotMaps>` that the registry republishes on every state change.
+- `BleTransport::device_for_endpoint(EndpointId) -> Option<DeviceId>` — resolves an iroh endpoint to a BLE device via the routing table's prefix map.
 
 The chat app polls these from `bandwidth_tick` (1 s) and `transport_state_tick` (1 s) and forwards diffs to the frontend as `bandwidth` and `ble-peer-updated`/`ble-peer-removed` Tauri events.
 
 ## Known limitations / open issues
 
-- **L2CAP path dormant**: GATT-only in practice. L2CAP framing primitives, driver actions, and PSM characteristic still exist but the registry never selects the L2CAP path. Re-enabling it is a known follow-up — see "L2CAP revival follow-up" below.
-- **No out-of-order ACK (SACK)**: Receiver sends cumulative ACKs only; out-of-order fragments are buffered but never explicitly acknowledged.
+- **No out-of-order ACK (SACK)**: GATT path's `ReliableChannel` sends cumulative ACKs only; out-of-order fragments are buffered but never explicitly acknowledged. (Not relevant for L2CAP path.)
 - **Same-machine BLE on macOS**: BLE discovery does not work between two processes on the same macOS host (CoreBluetooth limitation). Always test on separate devices.
-
-## L2CAP revival follow-up
-
-Stub — needs a proper spec before implementation. Capturing what we know:
-
-**What already exists:**
-- `transport/l2cap.rs` — `[u16 LE length][payload]` framing helpers, `spawn_l2cap_io_tasks`, `MAX_DATAGRAM_SIZE` matched to the GATT path. `#![allow(dead_code)]` today.
-- `peer.rs` defines an `OpenL2cap` action; `driver.rs` has the matching execute arm. The registry never emits it.
-- PSM characteristic (`69726f04`) is published by the peripheral whenever `blew::Peripheral::l2cap_listener` succeeds; central reads it after GATT connect but does nothing with the value.
-- `tests/l2cap_mock.rs` exercises the mock peripheral's PSM advertisement and policy-driven failure injection.
-
-**Known blockers / open questions:**
-- **Accept-side identity tagging**: `blew::Peripheral::l2cap_listener` does not expose a remote `DeviceId` on accept (see comment at `l2cap.rs:13`). The dialer side is fine — caller passes the `DeviceId` in — but the listener side has no way to associate an inbound L2CAP stream with a peer in the registry. Options: (a) extend blew's accept API upstream; (b) require a tiny in-band identity preamble on the L2CAP stream before it counts as established.
-- **Path selection policy**: when do we prefer L2CAP over GATT? On every Connected peer if PSM is present? Only above some MTU floor? Fall back to GATT on L2CAP failure? Needs a decision before wiring `OpenL2cap` into the registry.
-- **State-machine interaction**: where does L2CAP setup live in the phase graph? A new `OpeningL2cap` sub-phase between `Connected` and a hypothetical `ConnectedL2cap`, or a parallel pipe that swaps in once ready? Affects pipe.rs and the ReliableChannel ownership.
-- **ReliableChannel reuse**: L2CAP is stream-oriented and reliable already, so the SR-ARQ layer is unnecessary on that path. The pipe layer needs a way to bypass `ReliableChannel` for L2CAP and feed datagrams straight through the framed reader/writer.
-- **Backpressure / MTU**: confirm `MAX_DATAGRAM_SIZE = 1472` is right for L2CAP CoC on all platforms; check whether iroh's `initial_mtu(1200)` needs revisiting if L2CAP can carry larger.
-- **Teardown semantics**: how does an L2CAP failure interact with the GATT subscription? Today both characteristics are the canary for liveness. If L2CAP is the data path, do we still need C2P/P2C subscribed for keepalive, or do we tear down on L2CAP-only signals?
-
-**Suggested first step:** brainstorm a spec covering accept-side identity, path selection, and where in the phase graph L2CAP setup lands. Then write a plan and revive `OpenL2cap` end-to-end behind a feature flag so the GATT path stays the default until L2CAP is proven on real hardware.
+- **L2CAP not yet validated on real hardware**: The L2CAP data path is implemented and tested via mocks, but has not yet been exercised on physical BLE devices. Set `L2capPolicy::Disabled` to force GATT-only if L2CAP causes issues on a specific platform.
+- **L2CAP MTU**: `MAX_DATAGRAM_SIZE = 1472` is shared between both paths. This may be conservative for L2CAP CoC which can negotiate larger MTUs. iroh's `initial_mtu(1200)` may also be revisitable once L2CAP performance is characterized on hardware.
+- **No end-to-end integration test for L2CAP through driver + pipe**: Registry state machine tests cover L2CAP transitions thoroughly, but there is no mock integration test that exercises the full `PreferL2cap` chain (registry → driver → pipe → l2cap I/O).
 
 ## demos/iroh-ble-chat
 
@@ -286,7 +294,7 @@ A Tauri 2 cross-platform chat app (`demos/iroh-ble-chat`). Desktop + iOS + Andro
 - `gossip_event_pump` — drains gossip events, updates `PeerState`, emits `peer-updated`
 - `bandwidth_tick` (1 s) — polls `BleTransport::metrics()`, emits `bandwidth`
 - `stale_tick` (30 s) — flips peers to `GossipStatus::Stale` after 120 s without a sighting
-- `transport_state_tick` (1 s) — diffs `snapshot_peers()`, emits `ble-peer-updated` / `ble-peer-removed`
+- `transport_state_tick` (1 s) — diffs `snapshot_peers()`, emits `ble-peer-updated` / `ble-peer-removed`; also updates `PeerState.ble_path` (L2CAP/GATT) via `device_for_endpoint` and emits `peer-updated` when it changes
 - `reconnect_tick` (10 s) — for every known peer not currently `GossipStatus::Direct`, calls `sender.join_peers([peer_id])`. **This is where reconnect policy lives** — the transport itself is passive.
 
 **Frontend events:** `peer-updated`, `peer-removed`, `topic-joined`, `chat-msg`, `bandwidth`, `ble-peer-updated`, `ble-peer-removed`, image-stream events.
