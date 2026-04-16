@@ -9,6 +9,6 @@ pub use blew::peripheral::{AdvertisingConfig, PeripheralEvent};
 pub use blew::{BleDevice, Central, CentralConfig, DeviceId, Peripheral};
 pub use error::{BleError, BleResult};
 pub use transport::{
-    BlePeerInfo, BlePeerPhase, BleTransport, InMemoryPeerStore, IncomingPacket, KEY_PREFIX_LEN,
-    KeyPrefix, PeerSnapshot, PeerStore,
+    BlePeerInfo, BlePeerPhase, BleTransport, BleTransportConfig, ConnectPath, InMemoryPeerStore,
+    IncomingPacket, KEY_PREFIX_LEN, KeyPrefix, L2capPolicy, PeerSnapshot, PeerStore,
 };

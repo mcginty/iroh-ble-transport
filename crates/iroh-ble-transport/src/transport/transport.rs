@@ -23,8 +23,8 @@ use uuid::{Uuid, uuid};
 
 use crate::error::{BleError, BleResult};
 use crate::transport::driver::{BlewDriver, Driver, IncomingPacket};
-use crate::transport::events::{run_central_events, run_peripheral_events};
-use crate::transport::peer::{KEY_PREFIX_LEN, PeerCommand};
+use crate::transport::events::{run_central_events, run_l2cap_accept, run_peripheral_events};
+use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
 use crate::transport::routing::{TOKEN_LEN, TransportRouting, parse_token_addr, token_custom_addr};
 use crate::transport::watchdog::run_watchdog;
@@ -35,10 +35,22 @@ pub const BLE_TRANSPORT_ID: u64 = 0x42_4C_45;
 const IROH_SERVICE_UUID: Uuid = uuid!("69726f01-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_C2P_CHAR_UUID: Uuid = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_P2C_CHAR_UUID: Uuid = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
-const IROH_PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
+pub(crate) const IROH_PSM_CHAR_UUID: Uuid = uuid!("69726f04-8e45-4c2c-b3a5-331f3098b5c2");
 const IROH_VERSION_CHAR_UUID: Uuid = uuid!("69726f05-8e45-4c2c-b3a5-331f3098b5c2");
 
 const KEY_UUID_PREFIX: [u8; 4] = [0x69, 0x72, 0x6f, 0x00];
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum L2capPolicy {
+    Disabled,
+    #[default]
+    PreferL2cap,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct BleTransportConfig {
+    pub l2cap_policy: L2capPolicy,
+}
 
 fn iroh_key_uuid(endpoint_id: &EndpointId) -> Uuid {
     let key = endpoint_id.as_bytes();
@@ -128,6 +140,15 @@ impl BleTransport {
         central: Arc<Central>,
         peripheral: Arc<Peripheral>,
     ) -> BleResult<Self> {
+        Self::with_config(local_id, central, peripheral, BleTransportConfig::default()).await
+    }
+
+    pub async fn with_config(
+        local_id: EndpointId,
+        central: Arc<Central>,
+        peripheral: Arc<Peripheral>,
+        config: BleTransportConfig,
+    ) -> BleResult<Self> {
         central
             .wait_ready(std::time::Duration::from_secs(5))
             .await
@@ -183,7 +204,21 @@ impl BleTransport {
             Arc::clone(&truncations),
         );
 
-        let registry = Registry::new();
+        let mut psm = None;
+        if config.l2cap_policy == L2capPolicy::PreferL2cap {
+            match peripheral.l2cap_listener().await {
+                Ok((assigned_psm, listener)) => {
+                    info!(psm = assigned_psm.value(), "L2CAP listener started");
+                    psm = Some(assigned_psm.value());
+                    tokio::spawn(run_l2cap_accept(listener, inbox_tx.clone()));
+                }
+                Err(e) => {
+                    warn!(error = %e, "L2CAP listener failed, falling back to GATT-only");
+                }
+            }
+        }
+
+        let registry = Registry::new(config.l2cap_policy);
         let snap_for_actor = Arc::clone(&snapshots);
         tokio::spawn(async move {
             registry.run(inbox_rx, driver, snap_for_actor).await;
@@ -198,6 +233,7 @@ impl BleTransport {
             Arc::clone(&peripheral),
             Arc::clone(&routing),
             inbox_tx.clone(),
+            psm,
         ));
         tokio::spawn(run_watchdog(inbox_tx.clone()));
 
@@ -240,6 +276,7 @@ impl BleTransport {
                 device_id: device_id.clone(),
                 phase: BlePeerPhase::from(state.phase_kind),
                 consecutive_failures: state.consecutive_failures,
+                connect_path: state.connect_path,
             })
             .collect()
     }
@@ -250,6 +287,7 @@ pub struct BlePeerInfo {
     pub device_id: blew::DeviceId,
     pub phase: BlePeerPhase,
     pub consecutive_failures: u32,
+    pub connect_path: Option<ConnectPath>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

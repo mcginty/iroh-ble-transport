@@ -1,20 +1,11 @@
 //! L2CAP data-path primitives for `BleTransport`.
 //!
-//! This module contains pure helpers (framing, I/O task spawning) that
-//! operate on `AsyncRead + AsyncWrite` streams. The new actor-based driver
-//! does not yet wire the L2CAP data path end-to-end; the helpers live here
-//! so the wiring can be picked up later without rewriting the framing
-//! primitives.
+//! Framing and I/O task spawning for L2CAP CoC streams (`AsyncRead +
+//! AsyncWrite`). Used by `pipe.rs` when a peer's `ConnectPath` is `L2cap`.
 //!
 //! Wire format: each datagram is `[u16 LE length] [payload bytes]`. There is
 //! no pre-handshake identity exchange — the I/O task is told the peer's
 //! `blew::DeviceId` up front by the caller.
-//!
-//! Note: `blew::Peripheral::l2cap_listener` does not expose a remote device
-//! id on accept, so the accept-side path needs a separate strategy for
-//! tagging incoming frames before it can be wired into the driver.
-
-#![allow(dead_code)]
 
 use std::io;
 use std::sync::Arc;

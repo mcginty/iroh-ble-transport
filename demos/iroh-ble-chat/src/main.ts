@@ -41,6 +41,7 @@ interface BlePeerDebugUI {
   device_id: string;
   phase: string;
   consecutive_failures: number;
+  path: string | null;
 }
 
 interface ChatMsgPayload {
@@ -467,9 +468,10 @@ function renderBlePeers() {
     const failureBadge = peer.consecutive_failures > 0
       ? ` · ${peer.consecutive_failures} fail${peer.consecutive_failures === 1 ? "" : "s"}`
       : "";
+    const pathBadge = peer.path ? ` · ${peer.path}` : "";
     row.innerHTML = `
       <div class="ble-peer-id" title="${escapeHtml(peer.device_id)}">${escapeHtml(peer.device_id)}</div>
-      <div class="ble-peer-phase">${escapeHtml(peer.phase)}${escapeHtml(failureBadge)}</div>
+      <div class="ble-peer-phase">${escapeHtml(peer.phase)}${escapeHtml(pathBadge)}${escapeHtml(failureBadge)}</div>
     `;
     blePeersList.appendChild(row);
   }

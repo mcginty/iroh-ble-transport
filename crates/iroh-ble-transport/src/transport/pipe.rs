@@ -11,22 +11,50 @@ use tokio::sync::mpsc;
 use crate::transport::driver::IncomingPacket;
 use crate::transport::interface::BleInterface;
 use crate::transport::mtu::resolve_chunk_size;
-use crate::transport::peer::{ConnectRole, PeerCommand, PendingSend};
+use crate::transport::peer::{ConnectPath, ConnectRole, PeerCommand, PendingSend};
 use crate::transport::reliable::ReliableChannel;
 
-/// Run one peer's data pipe.
-///
-/// Drives three streams in a `tokio::select!`:
-/// - outbound datagrams from the registry → `ReliableChannel::enqueue_datagram`
-/// - inbound GATT fragments from the registry → `ReliableChannel::receive_fragment`
-/// - reassembled datagrams from the channel → `incoming_tx`
-///
-/// The reliable send loop runs as a sub-task; when it exits with `LinkDead`,
-/// we report `PeerCommand::Stalled { device_id }` to the registry and return.
-/// Any registry-initiated tear-down closes the two mpsc senders on
-/// `PeerEntry.pipe`, which wakes the select! and exits cleanly.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_data_pipe(
+    iface: Arc<dyn BleInterface>,
+    device_id: blew::DeviceId,
+    role: ConnectRole,
+    path: ConnectPath,
+    l2cap_channel: Option<blew::L2capChannel>,
+    outbound_rx: mpsc::Receiver<PendingSend>,
+    inbound_rx: mpsc::Receiver<Bytes>,
+    incoming_tx: mpsc::Sender<IncomingPacket>,
+    registry_tx: mpsc::Sender<PeerCommand>,
+    retransmit_counter: Arc<AtomicU64>,
+    truncation_counter: Arc<AtomicU64>,
+) {
+    match path {
+        ConnectPath::L2cap => {
+            if let Some(channel) = l2cap_channel {
+                run_l2cap_pipe(device_id, channel, outbound_rx, incoming_tx, registry_tx).await;
+            } else {
+                tracing::error!(device = %device_id, "StartDataPipe(L2cap) without channel");
+            }
+        }
+        ConnectPath::Gatt => {
+            run_gatt_pipe(
+                iface,
+                device_id,
+                role,
+                outbound_rx,
+                inbound_rx,
+                incoming_tx,
+                registry_tx,
+                retransmit_counter,
+                truncation_counter,
+            )
+            .await;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_gatt_pipe(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
     role: ConnectRole,
@@ -137,6 +165,54 @@ pub async fn run_data_pipe(
     }
 }
 
+async fn run_l2cap_pipe(
+    device_id: blew::DeviceId,
+    channel: blew::L2capChannel,
+    mut outbound_rx: mpsc::Receiver<PendingSend>,
+    incoming_tx: mpsc::Sender<IncomingPacket>,
+    registry_tx: mpsc::Sender<PeerCommand>,
+) {
+    let (reader, writer) = tokio::io::split(channel);
+    let tx_bytes = Arc::new(AtomicU64::new(0));
+    let rx_bytes = Arc::new(AtomicU64::new(0));
+
+    let (l2cap_tx, _send_task, _recv_task, done) = crate::transport::l2cap::spawn_l2cap_io_tasks(
+        reader,
+        writer,
+        device_id.clone(),
+        incoming_tx,
+        tx_bytes,
+        rx_bytes,
+    );
+
+    let mut io_died = false;
+    loop {
+        tokio::select! {
+            maybe_send = outbound_rx.recv() => {
+                match maybe_send {
+                    Some(send) => {
+                        let _ = l2cap_tx.send(send.datagram.to_vec()).await;
+                        send.waker.wake();
+                    }
+                    None => break,
+                }
+            }
+            _ = done.notified() => {
+                io_died = true;
+                break;
+            }
+        }
+    }
+
+    if io_died {
+        let _ = registry_tx
+            .send(PeerCommand::Stalled {
+                device_id: device_id.clone(),
+            })
+            .await;
+    }
+}
+
 #[cfg(all(test, feature = "testing"))]
 mod tests {
     use super::*;
@@ -166,6 +242,8 @@ mod tests {
             iface.clone() as Arc<dyn BleInterface>,
             device_id.clone(),
             ConnectRole::Central,
+            ConnectPath::Gatt,
+            None,
             outbound_rx,
             inbound_rx,
             incoming_tx,
@@ -208,6 +286,8 @@ mod tests {
             iface.clone() as Arc<dyn BleInterface>,
             blew::DeviceId::from("pipe-peri"),
             ConnectRole::Peripheral,
+            ConnectPath::Gatt,
+            None,
             outbound_rx,
             inbound_rx,
             incoming_tx,
