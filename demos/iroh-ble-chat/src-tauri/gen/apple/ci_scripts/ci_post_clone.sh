@@ -47,7 +47,7 @@ cp -r "$CHAT_DIR/dist" "$CHAT_DIR/src-tauri/gen/apple/assets"
 echo "==> Building Rust static library for iOS"
 cd "$CHAT_DIR/src-tauri"
 export IPHONEOS_DEPLOYMENT_TARGET=16.0
-cargo build --release --target aarch64-apple-ios --lib --features custom-protocol
+cargo build --release --target aarch64-apple-ios --lib --features tauri/custom-protocol
 
 echo "==> Copying libapp.a into Externals"
 EXTERNALS="$CI_PRIMARY_REPOSITORY_PATH/demos/iroh-ble-chat/src-tauri/gen/apple/Externals/arm64/release"
