@@ -365,7 +365,10 @@ impl Registry {
                 if promoting {
                     let channel = match &entry.phase {
                         PeerPhase::Handshaking { channel, .. } => channel.clone(),
-                        _ => unreachable!("promoting implies Handshaking"),
+                        _ => {
+                            tracing::warn!(device = %device_id, "phase changed unexpectedly during fragment promotion");
+                            return actions;
+                        }
                     };
                     entry.tx_gen += 1;
                     let tx_gen = entry.tx_gen;
@@ -696,7 +699,10 @@ impl Registry {
                 {
                     let gatt_channel = match &entry.phase {
                         PeerPhase::Handshaking { channel, .. } => channel.clone(),
-                        _ => unreachable!(),
+                        _ => {
+                            tracing::warn!(device = %device_id, "phase changed unexpectedly during L2CAP success");
+                            return actions;
+                        }
                     };
                     let l2cap_handle = crate::transport::peer::ChannelHandle {
                         id: gatt_channel.id,
@@ -725,7 +731,10 @@ impl Registry {
                 {
                     let channel = match &entry.phase {
                         PeerPhase::Handshaking { channel, .. } => channel.clone(),
-                        _ => unreachable!(),
+                        _ => {
+                            tracing::warn!(device = %device_id, "phase changed unexpectedly during L2CAP failure");
+                            return actions;
+                        }
                     };
                     entry.tx_gen += 1;
                     let tx_gen = entry.tx_gen;
