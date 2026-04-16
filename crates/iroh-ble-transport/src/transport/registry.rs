@@ -156,6 +156,31 @@ impl Registry {
                 );
                 match decision {
                     SendDecision::Enqueue => {
+                        if entry.pipe.is_some() && !entry.pending_sends.is_empty() {
+                            // Drain pre-buffered sends first to preserve FIFO ordering.
+                            while let Some(old) = entry.pending_sends.pop_front() {
+                                let pipe = match entry.pipe.as_ref() {
+                                    Some(p) => p,
+                                    None => {
+                                        entry.pending_sends.push_front(old);
+                                        break;
+                                    }
+                                };
+                                match pipe.outbound_tx.try_send(old) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(old)) => {
+                                        entry.pending_sends.push_front(old);
+                                        break;
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(old)) => {
+                                        entry.pipe = None;
+                                        entry.pending_sends.push_front(old);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+
                         if let Some(pipe) = entry.pipe.as_ref() {
                             let send = crate::transport::peer::PendingSend {
                                 tx_gen,
@@ -2673,6 +2698,60 @@ mod tests {
             )),
             "expected StartDataPipe(L2cap, Peripheral) with channel; got {actions:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn send_datagram_drains_pending_before_new_data() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PendingSend, PipeHandles};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-ordering");
+
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(8);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.tx_gen = 5;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 5,
+            };
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+            });
+            e.pending_sends.push_back(PendingSend {
+                tx_gen: 5,
+                datagram: bytes::Bytes::from_static(b"old"),
+                waker: noop_waker(),
+            });
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            tx_gen: 5,
+            datagram: bytes::Bytes::from_static(b"new"),
+            waker: noop_waker(),
+        });
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::AckSend { result: Ok(()), .. })),
+            "expected AckSend(Ok) for new datagram; got {actions:?}"
+        );
+
+        let first = outbound_rx.recv().await.expect("first item");
+        let second = outbound_rx.recv().await.expect("second item");
+        assert_eq!(&first.datagram[..], b"old", "old (pre-buffered) must arrive first");
+        assert_eq!(&second.datagram[..], b"new", "new datagram must arrive second");
+        assert_eq!(reg.peer(&device_id).unwrap().pending_sends.len(), 0);
     }
 
     #[test]
