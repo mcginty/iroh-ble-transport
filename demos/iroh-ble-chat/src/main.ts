@@ -33,6 +33,7 @@ interface PeerStateUI {
   nickname: string | null;
   status: PeerStatus;
   ble_phase: string | null;
+  ble_path: string | null;
   ble_failures: number;
   last_seen_secs_ago: number;
 }
@@ -406,7 +407,8 @@ function renderDetailStats(container: HTMLElement, peer: PeerStateUI) {
 
     if (peer.ble_phase) {
       const phase = BLE_PHASE_LABEL[peer.ble_phase] ?? peer.ble_phase;
-      rows.push(["BLE", phase]);
+      const pathSuffix = peer.ble_path ? ` (${peer.ble_path.toUpperCase()})` : "";
+      rows.push(["BLE", phase + pathSuffix]);
     }
     if (peer.ble_failures > 0) {
       rows.push([

@@ -268,6 +268,11 @@ impl BleTransport {
     }
 
     #[must_use]
+    pub fn device_for_endpoint(&self, endpoint_id: &EndpointId) -> Option<blew::DeviceId> {
+        self.routing.device_for_endpoint(endpoint_id)
+    }
+
+    #[must_use]
     pub fn snapshot_peers(&self) -> Vec<BlePeerInfo> {
         let snap = self.handle.snapshots.load();
         snap.peer_states

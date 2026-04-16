@@ -44,6 +44,7 @@ struct PeerState {
     nickname: Option<String>,
     gossip: Option<GossipStatus>,
     ble_phase: Option<BlePeerPhase>,
+    ble_path: Option<String>,
     ble_failures: u32,
     last_seen: Instant,
 }
@@ -54,6 +55,7 @@ struct PeerStateUI {
     nickname: Option<String>,
     status: String,
     ble_phase: Option<String>,
+    ble_path: Option<String>,
     ble_failures: u32,
     last_seen_secs_ago: u64,
 }
@@ -105,6 +107,7 @@ impl PeerState {
             nickname: self.nickname.clone(),
             status: self.ui_status().to_string(),
             ble_phase: self.ble_phase.map(|p| ble_phase_str(p).to_string()),
+            ble_path: self.ble_path.clone(),
             ble_failures: self.ble_failures,
             last_seen_secs_ago: self.last_seen.elapsed().as_secs(),
         }
@@ -308,7 +311,11 @@ async fn start_node(
 
     tauri::async_runtime::spawn(stale_tick(app.clone(), state_arc.clone()));
     tauri::async_runtime::spawn(bandwidth_tick(app.clone(), ble_transport.clone()));
-    tauri::async_runtime::spawn(transport_state_tick(app.clone(), ble_transport));
+    tauri::async_runtime::spawn(transport_state_tick(
+        app.clone(),
+        ble_transport,
+        state_arc.clone(),
+    ));
     tauri::async_runtime::spawn(reconnect_tick(state_arc));
 
     Ok(result)
@@ -567,6 +574,7 @@ fn new_peer_entry(id: EndpointId) -> PeerState {
         nickname: None,
         gossip: None,
         ble_phase: None,
+        ble_path: None,
         ble_failures: 0,
         last_seen: Instant::now(),
     }
@@ -597,11 +605,41 @@ impl BlePeerDebugUI {
     }
 }
 
-async fn transport_state_tick(app: AppHandle, transport: Arc<BleTransport>) {
+async fn transport_state_tick(
+    app: AppHandle,
+    transport: Arc<BleTransport>,
+    state: Arc<Mutex<AppState>>,
+) {
     let mut last_emitted: HashMap<String, BlePeerDebugUI> = HashMap::new();
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         let snapshot = transport.snapshot_peers();
+
+        let path_by_device: HashMap<String, Option<ConnectPath>> = snapshot
+            .iter()
+            .map(|info| (info.device_id.to_string(), info.connect_path))
+            .collect();
+
+        {
+            let mut st = state.lock().await;
+            let mut changed = false;
+            for peer in st.peers.values_mut() {
+                let new_path = transport
+                    .device_for_endpoint(&peer.id)
+                    .and_then(|did| path_by_device.get(&did.to_string()).copied().flatten())
+                    .map(|p| match p {
+                        ConnectPath::Gatt => "gatt".to_string(),
+                        ConnectPath::L2cap => "l2cap".to_string(),
+                    });
+                if peer.ble_path != new_path {
+                    peer.ble_path = new_path;
+                    changed = true;
+                    let _ = app.emit("peer-updated", &peer.to_ui());
+                }
+            }
+            drop(st);
+            let _ = changed;
+        }
 
         let mut current: HashMap<String, BlePeerDebugUI> = HashMap::with_capacity(snapshot.len());
         for info in &snapshot {
@@ -1005,6 +1043,7 @@ async fn get_peers(state: State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<PeerSta
         nickname: Some(st.nickname.clone()),
         status: "self".to_string(),
         ble_phase: None,
+        ble_path: None,
         ble_failures: 0,
         last_seen_secs_ago: 0,
     }];
