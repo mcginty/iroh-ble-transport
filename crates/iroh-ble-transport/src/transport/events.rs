@@ -124,6 +124,7 @@ pub async fn run_peripheral_events(
     peripheral: Arc<Peripheral>,
     _routing: Arc<TransportRouting>,
     inbox: mpsc::Sender<PeerCommand>,
+    psm: Option<u16>,
 ) {
     use tokio_stream::StreamExt as _;
     let mut events = peripheral.events();
@@ -166,13 +167,50 @@ pub async fn run_peripheral_events(
                 );
                 continue;
             }
-            PeripheralEvent::ReadRequest { responder, .. } => {
-                responder.respond(Vec::new());
+            PeripheralEvent::ReadRequest {
+                char_uuid,
+                responder,
+                ..
+            } => {
+                if char_uuid == crate::transport::transport::IROH_PSM_CHAR_UUID {
+                    if let Some(psm_val) = psm {
+                        responder.respond(psm_val.to_le_bytes().to_vec());
+                    } else {
+                        responder.respond(Vec::new());
+                    }
+                } else {
+                    responder.respond(Vec::new());
+                }
                 continue;
             }
         };
         if inbox.send(cmd).await.is_err() {
             break;
+        }
+    }
+}
+
+pub async fn run_l2cap_accept(
+    mut listener: impl tokio_stream::Stream<Item = blew::error::BlewResult<(blew::DeviceId, blew::L2capChannel)>>
+        + Send
+        + Unpin
+        + 'static,
+    inbox: mpsc::Sender<PeerCommand>,
+) {
+    use tokio_stream::StreamExt as _;
+    while let Some(result) = listener.next().await {
+        match result {
+            Ok((device_id, channel)) => {
+                tracing::debug!(device = %device_id, "L2CAP accept: incoming channel");
+                let cmd = PeerCommand::InboundL2capChannel { device_id, channel };
+                if inbox.send(cmd).await.is_err() {
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "L2CAP accept error");
+                break;
+            }
         }
     }
 }
