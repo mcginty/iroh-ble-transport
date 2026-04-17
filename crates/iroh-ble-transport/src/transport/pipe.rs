@@ -1,56 +1,307 @@
-//! Per-peer data pipe task. Owns one `ReliableChannel` + byte I/O, spawned
-//! by the driver on `PeerAction::StartDataPipe` and torn down when either
-//! channel closes or the reliable send loop exits with `LinkDead`.
+//! Per-peer data pipe task. A supervisor owns `outbound_rx` and `inbound_rx`,
+//! forwarding each item to whichever worker (GATT or L2CAP) is currently
+//! active. On `swap_rx.recv()`, the supervisor spawns the L2CAP worker,
+//! drops the GATT worker's forwarding senders (so it flushes and exits), and
+//! schedules a delayed abort after `L2CAP_HANDOVER_TIMEOUT` to bound the
+//! drain tail.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tokio::time::Duration;
 
+use crate::transport::dedup::L2CAP_HANDOVER_TIMEOUT;
 use crate::transport::driver::IncomingPacket;
 use crate::transport::interface::BleInterface;
 use crate::transport::mtu::resolve_chunk_size;
 use crate::transport::peer::{ConnectPath, ConnectRole, PeerCommand, PendingSend};
 use crate::transport::reliable::ReliableChannel;
 
+enum ActiveWorker {
+    Gatt {
+        outbound_fwd_tx: mpsc::Sender<PendingSend>,
+        inbound_fwd_tx: mpsc::Sender<Bytes>,
+        handle: JoinHandle<()>,
+    },
+    L2cap {
+        outbound_fwd_tx: mpsc::Sender<PendingSend>,
+        handle: JoinHandle<()>,
+    },
+}
+
+impl ActiveWorker {
+    fn is_l2cap(&self) -> bool {
+        matches!(self, ActiveWorker::L2cap { .. })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_data_pipe(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
     role: ConnectRole,
-    path: ConnectPath,
-    l2cap_channel: Option<blew::L2capChannel>,
+    initial_path: ConnectPath,
+    initial_l2cap: Option<blew::L2capChannel>,
     outbound_rx: mpsc::Receiver<PendingSend>,
     inbound_rx: mpsc::Receiver<Bytes>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
+    swap_rx: mpsc::Receiver<blew::L2capChannel>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
 ) {
-    match path {
+    run_pipe_supervisor(
+        iface,
+        device_id,
+        role,
+        initial_path,
+        initial_l2cap,
+        outbound_rx,
+        inbound_rx,
+        incoming_tx,
+        registry_tx,
+        swap_rx,
+        retransmit_counter,
+        truncation_counter,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_pipe_supervisor(
+    iface: Arc<dyn BleInterface>,
+    device_id: blew::DeviceId,
+    role: ConnectRole,
+    initial_path: ConnectPath,
+    initial_l2cap: Option<blew::L2capChannel>,
+    mut outbound_rx: mpsc::Receiver<PendingSend>,
+    mut inbound_rx: mpsc::Receiver<Bytes>,
+    incoming_tx: mpsc::Sender<IncomingPacket>,
+    registry_tx: mpsc::Sender<PeerCommand>,
+    swap_rx: mpsc::Receiver<blew::L2capChannel>,
+    retransmit_counter: Arc<AtomicU64>,
+    truncation_counter: Arc<AtomicU64>,
+) {
+    let mut swap_rx: Option<mpsc::Receiver<blew::L2capChannel>> = Some(swap_rx);
+    let mut active = match initial_path {
+        ConnectPath::Gatt => spawn_gatt_worker(
+            Arc::clone(&iface),
+            device_id.clone(),
+            role,
+            incoming_tx.clone(),
+            registry_tx.clone(),
+            Arc::clone(&retransmit_counter),
+            Arc::clone(&truncation_counter),
+        ),
         ConnectPath::L2cap => {
-            if let Some(channel) = l2cap_channel {
-                run_l2cap_pipe(device_id, channel, outbound_rx, incoming_tx, registry_tx).await;
-            } else {
+            let Some(channel) = initial_l2cap else {
                 tracing::error!(device = %device_id, "StartDataPipe(L2cap) without channel");
+                return;
+            };
+            spawn_l2cap_worker(
+                device_id.clone(),
+                channel,
+                incoming_tx.clone(),
+                registry_tx.clone(),
+            )
+        }
+    };
+
+    let mut l2cap_timeout_reported = false;
+
+    loop {
+        tokio::select! {
+            maybe_send = outbound_rx.recv() => {
+                let Some(send) = maybe_send else { break; };
+                match forward_outbound(&active, send, &device_id, &registry_tx, &mut l2cap_timeout_reported).await {
+                    ForwardResult::Ok => {}
+                    ForwardResult::WorkerGone => break,
+                    ForwardResult::L2capTimeout => break,
+                }
+            }
+            maybe_bytes = inbound_rx.recv() => {
+                let Some(bytes) = maybe_bytes else { break; };
+                match &active {
+                    ActiveWorker::Gatt { inbound_fwd_tx, .. } => {
+                        if inbound_fwd_tx.send(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    // L2CAP reads from the channel directly; inbound GATT
+                    // fragments post-swap are no longer meaningful.
+                    ActiveWorker::L2cap { .. } => {}
+                }
+            }
+            maybe_chan = recv_swap(&mut swap_rx) => {
+                let Some(channel) = maybe_chan else {
+                    // swap_tx was dropped; disable the swap arm permanently so
+                    // the select loop does not busy-poll on a closed recv.
+                    swap_rx = None;
+                    continue;
+                };
+                if active.is_l2cap() {
+                    tracing::warn!(device = %device_id, "swap requested but already on L2CAP; ignoring");
+                    continue;
+                }
+                let new_active = spawn_l2cap_worker(
+                    device_id.clone(),
+                    channel,
+                    incoming_tx.clone(),
+                    registry_tx.clone(),
+                );
+                let old = std::mem::replace(&mut active, new_active);
+                spawn_drain_old_worker(old, device_id.clone(), L2CAP_HANDOVER_TIMEOUT);
             }
         }
-        ConnectPath::Gatt => {
-            run_gatt_pipe(
-                iface,
-                device_id,
-                role,
-                outbound_rx,
-                inbound_rx,
-                incoming_tx,
-                registry_tx,
-                retransmit_counter,
-                truncation_counter,
-            )
-            .await;
-        }
     }
+
+    // Supervisor exiting: drop the forwarding senders so the active worker
+    // observes outbound/inbound EOF and tears itself down, then wait briefly
+    // for it to exit (so its send sub-tasks and any outstanding ACK flushes
+    // are joined) before returning. The join is bounded so a wedged worker
+    // cannot hold the caller hostage.
+    let handle = match active {
+        ActiveWorker::Gatt { handle, .. } => handle,
+        ActiveWorker::L2cap { handle, .. } => handle,
+    };
+    if tokio::time::timeout(L2CAP_HANDOVER_TIMEOUT, handle)
+        .await
+        .is_err()
+    {
+        tracing::debug!(device = %device_id, "pipe supervisor: worker did not exit within handover timeout");
+    }
+}
+
+/// Poll the optional swap receiver. If `None`, never resolves — lets the
+/// supervisor's `select!` ignore the arm without busy-looping.
+async fn recv_swap(
+    rx: &mut Option<mpsc::Receiver<blew::L2capChannel>>,
+) -> Option<blew::L2capChannel> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+enum ForwardResult {
+    Ok,
+    WorkerGone,
+    L2capTimeout,
+}
+
+async fn forward_outbound(
+    active: &ActiveWorker,
+    send: PendingSend,
+    device_id: &blew::DeviceId,
+    registry_tx: &mpsc::Sender<PeerCommand>,
+    l2cap_timeout_reported: &mut bool,
+) -> ForwardResult {
+    match active {
+        ActiveWorker::Gatt {
+            outbound_fwd_tx, ..
+        } => {
+            if outbound_fwd_tx.send(send).await.is_err() {
+                return ForwardResult::WorkerGone;
+            }
+            ForwardResult::Ok
+        }
+        ActiveWorker::L2cap {
+            outbound_fwd_tx, ..
+        } => match tokio::time::timeout(L2CAP_HANDOVER_TIMEOUT, outbound_fwd_tx.send(send)).await {
+            Ok(Ok(())) => ForwardResult::Ok,
+            Ok(Err(_closed)) => ForwardResult::WorkerGone,
+            Err(_elapsed) => {
+                if !*l2cap_timeout_reported {
+                    *l2cap_timeout_reported = true;
+                    let _ = registry_tx
+                        .send(PeerCommand::L2capHandoverTimeout {
+                            device_id: device_id.clone(),
+                        })
+                        .await;
+                }
+                ForwardResult::L2capTimeout
+            }
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_gatt_worker(
+    iface: Arc<dyn BleInterface>,
+    device_id: blew::DeviceId,
+    role: ConnectRole,
+    incoming_tx: mpsc::Sender<IncomingPacket>,
+    registry_tx: mpsc::Sender<PeerCommand>,
+    retransmit_counter: Arc<AtomicU64>,
+    truncation_counter: Arc<AtomicU64>,
+) -> ActiveWorker {
+    let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(32);
+    let (inbound_fwd_tx, inbound_fwd_rx) = mpsc::channel::<Bytes>(64);
+    let handle = tokio::spawn(run_gatt_pipe(
+        iface,
+        device_id,
+        role,
+        outbound_fwd_rx,
+        inbound_fwd_rx,
+        incoming_tx,
+        registry_tx,
+        retransmit_counter,
+        truncation_counter,
+    ));
+    ActiveWorker::Gatt {
+        outbound_fwd_tx,
+        inbound_fwd_tx,
+        handle,
+    }
+}
+
+fn spawn_l2cap_worker(
+    device_id: blew::DeviceId,
+    channel: blew::L2capChannel,
+    incoming_tx: mpsc::Sender<IncomingPacket>,
+    registry_tx: mpsc::Sender<PeerCommand>,
+) -> ActiveWorker {
+    let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(32);
+    let handle = tokio::spawn(run_l2cap_pipe(
+        device_id,
+        channel,
+        outbound_fwd_rx,
+        incoming_tx,
+        registry_tx,
+    ));
+    ActiveWorker::L2cap {
+        outbound_fwd_tx,
+        handle,
+    }
+}
+
+fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout: Duration) {
+    tokio::spawn(async move {
+        // Dropping the forwarding senders closes the worker's input channels;
+        // the GATT worker's select loop then breaks, marks the ReliableChannel
+        // dead, and joins its send sub-task before returning.
+        let handle = match old {
+            ActiveWorker::Gatt { handle, .. } => handle,
+            ActiveWorker::L2cap { handle, .. } => handle,
+        };
+        match tokio::time::timeout(timeout, handle).await {
+            Ok(Ok(())) => {
+                tracing::debug!(device = %device_id, "old pipe worker drained cleanly");
+            }
+            Ok(Err(join_err)) => {
+                tracing::debug!(device = %device_id, ?join_err, "old pipe worker join error");
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    device = %device_id,
+                    "old pipe worker did not drain within handover timeout"
+                );
+            }
+        }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -145,12 +396,6 @@ async fn run_gatt_pipe(
         }
     }
 
-    // If we exited because the registry dropped our mpsc handles (the
-    // registry-initiated teardown path: `CentralDisconnected`, `Stalled`,
-    // explicit disconnect), the send loop sub-task is still parked on its
-    // `wake.notified()` future. Mark the channel dead so it exits promptly
-    // instead of leaking for up to `LINK_DEAD_DEADLINE`, and join it so the
-    // task is collected before we return.
     if !send_loop_done {
         channel.mark_dead().await;
         let _ = (&mut send_loop_handle).await;
@@ -232,6 +477,7 @@ mod tests {
         let (_inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(4);
         let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
         let (registry_tx, _registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (_swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
 
         let device_id = blew::DeviceId::from("pipe-central");
         tokio::spawn(run_data_pipe(
@@ -244,6 +490,7 @@ mod tests {
             inbound_rx,
             incoming_tx,
             registry_tx,
+            swap_rx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         ));
@@ -277,6 +524,7 @@ mod tests {
         let (_inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(4);
         let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
         let (registry_tx, _registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (_swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
 
         tokio::spawn(run_data_pipe(
             iface.clone() as Arc<dyn BleInterface>,
@@ -288,6 +536,7 @@ mod tests {
             inbound_rx,
             incoming_tx,
             registry_tx,
+            swap_rx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         ));

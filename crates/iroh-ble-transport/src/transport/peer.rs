@@ -33,6 +33,7 @@ pub enum ConnectRole {
 pub struct PipeHandles {
     pub outbound_tx: tokio::sync::mpsc::Sender<PendingSend>,
     pub inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    pub swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
 }
 
 #[derive(Debug)]
@@ -264,6 +265,7 @@ pub enum PeerCommand {
         device_id: DeviceId,
         outbound_tx: tokio::sync::mpsc::Sender<PendingSend>,
         inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
     },
     /// Emitted when `EndpointHooks::after_handshake` fires. The registry
     /// stamps all PeerEntries whose prefix matches and runs the dedup pass.
@@ -389,10 +391,12 @@ mod tests {
     fn data_pipe_variants_are_constructible() {
         let (outbound_tx, _) = tokio::sync::mpsc::channel::<PendingSend>(1);
         let (inbound_tx, _) = tokio::sync::mpsc::channel::<Bytes>(1);
+        let (swap_tx, _) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
         let _cmd = PeerCommand::DataPipeReady {
             device_id: DeviceId::from("x"),
             outbound_tx,
             inbound_tx,
+            swap_tx,
         };
         let _act = PeerAction::StartDataPipe {
             device_id: DeviceId::from("x"),

@@ -118,7 +118,8 @@ impl Registry {
                 device_id,
                 outbound_tx,
                 inbound_tx,
-            } => self.handle_data_pipe_ready(device_id, outbound_tx, inbound_tx),
+                swap_tx,
+            } => self.handle_data_pipe_ready(device_id, outbound_tx, inbound_tx, swap_tx),
             PeerCommand::OpenL2capSucceeded {
                 device_id,
                 channel: l2cap_chan,
@@ -1006,6 +1007,7 @@ impl Registry {
         device_id: DeviceId,
         outbound_tx: tokio::sync::mpsc::Sender<crate::transport::peer::PendingSend>,
         inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
     ) {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
@@ -1029,6 +1031,7 @@ impl Registry {
         entry.pipe = Some(crate::transport::peer::PipeHandles {
             outbound_tx,
             inbound_tx,
+            swap_tx,
         });
     }
 
@@ -2371,11 +2374,13 @@ mod tests {
 
         let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(8);
         let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
 
         let actions = reg.handle(PeerCommand::DataPipeReady {
             device_id: device_id.clone(),
             outbound_tx,
             inbound_tx,
+            swap_tx,
         });
         assert!(actions.is_empty());
 
@@ -2412,11 +2417,13 @@ mod tests {
 
         let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(8);
         let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
 
         let actions = reg.handle(PeerCommand::DataPipeReady {
             device_id: device_id.clone(),
             outbound_tx,
             inbound_tx,
+            swap_tx,
         });
         assert!(actions.is_empty());
         assert_eq!(reg.peer(&device_id).unwrap().rx_backlog.len(), 0);
@@ -2446,9 +2453,11 @@ mod tests {
                 tx_gen: 9,
                 upgrading: false,
             };
+            let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
             e.pipe = Some(PipeHandles {
                 outbound_tx,
                 inbound_tx,
+                swap_tx,
             });
             e
         });
@@ -2491,9 +2500,11 @@ mod tests {
                     tx_gen: 8,
                     upgrading: false,
                 };
+                let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
                 e.pipe = Some(PipeHandles {
                     outbound_tx,
                     inbound_tx,
+                    swap_tx,
                 });
                 e
             });
@@ -2540,9 +2551,11 @@ mod tests {
                     tx_gen: 7,
                     upgrading: false,
                 };
+                let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
                 e.pipe = Some(PipeHandles {
                     outbound_tx,
                     inbound_tx,
+                    swap_tx,
                 });
                 e
             });
@@ -2677,9 +2690,11 @@ mod tests {
                 tx_gen: 1,
                 upgrading: false,
             };
+            let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
             e.pipe = Some(PipeHandles {
                 outbound_tx,
                 inbound_tx,
+                swap_tx,
             });
             e
         });
@@ -2778,9 +2793,11 @@ mod tests {
                 tx_gen: 4,
                 upgrading: false,
             };
+            let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
             e.pipe = Some(PipeHandles {
                 outbound_tx,
                 inbound_tx,
+                swap_tx,
             });
             e.pending_sends.push_back(PendingSend {
                 tx_gen: 4,
@@ -2884,9 +2901,11 @@ mod tests {
                 tx_gen: 1,
                 upgrading: false,
             };
+            let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
             e.pipe = Some(PipeHandles {
                 outbound_tx,
                 inbound_tx,
+                swap_tx,
             });
             e.pending_sends.push_back(PendingSend {
                 tx_gen: 1,
@@ -3135,9 +3154,11 @@ mod tests {
                 tx_gen: 5,
                 upgrading: false,
             };
+            let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
             e.pipe = Some(PipeHandles {
                 outbound_tx,
                 inbound_tx,
+                swap_tx,
             });
             e.pending_sends.push_back(PendingSend {
                 tx_gen: 5,
@@ -3198,9 +3219,11 @@ mod tests {
                 tx_gen: 3,
                 upgrading: false,
             };
+            let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
             e.pipe = Some(PipeHandles {
                 outbound_tx,
                 inbound_tx,
+                swap_tx,
             });
             e
         });

@@ -175,6 +175,7 @@ impl<I: BleInterface> Driver<I> {
                 let (outbound_tx, outbound_rx) =
                     mpsc::channel::<crate::transport::peer::PendingSend>(32);
                 let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(64);
+                let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
                 let iface: Arc<dyn BleInterface> = Arc::clone(&self.iface) as Arc<dyn BleInterface>;
                 let incoming_tx = self.incoming_tx.clone();
                 let inbox = self.inbox.clone();
@@ -192,6 +193,7 @@ impl<I: BleInterface> Driver<I> {
                         inbound_rx,
                         incoming_tx,
                         inbox,
+                        swap_rx,
                         retransmit_counter,
                         truncation_counter,
                     )
@@ -201,6 +203,7 @@ impl<I: BleInterface> Driver<I> {
                     device_id: dev_for_ready,
                     outbound_tx,
                     inbound_tx,
+                    swap_tx,
                 };
                 if self.inbox.send(ready).await.is_err() {
                     tracing::debug!("inbox closed before DataPipeReady forwarded");
