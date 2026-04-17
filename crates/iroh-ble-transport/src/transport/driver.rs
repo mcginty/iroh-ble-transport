@@ -17,6 +17,51 @@ pub struct IncomingPacket {
     pub data: Bytes,
 }
 
+/// Backoff schedule (ms) for retrying `read_psm` after a GATT subscribe.
+/// Android's GATT layer needs ~100-200 ms to settle before another op can
+/// succeed; the first attempt is immediate, the remaining two cover the
+/// slow-path before we give up and fall back to GATT.
+const READ_PSM_BACKOFFS_MS: [u64; 3] = [0, 150, 400];
+
+/// Retry `read_psm` using the given backoff schedule.
+///
+/// Returns `Ok(psm)` on first success, `Err("no psm advertised")` if the
+/// remote reports no PSM (no point retrying — they don't support L2CAP),
+/// and `Err("read_psm: ...")` if every attempt failed with an error.
+async fn read_psm_with_retry<F, Fut>(
+    backoffs_ms: &[u64],
+    device_label: &blew::DeviceId,
+    mut read: F,
+) -> Result<u16, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = crate::error::BleResult<Option<u16>>>,
+{
+    let mut last_err: Option<String> = None;
+    for (i, delay_ms) in backoffs_ms.iter().enumerate() {
+        if *delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+        }
+        match read().await {
+            Ok(Some(psm)) => return Ok(psm),
+            Ok(None) => return Err("no psm advertised".to_string()),
+            Err(e) => {
+                tracing::debug!(
+                    device = %device_label,
+                    attempt = i + 1,
+                    ?e,
+                    "read_psm failed; will retry"
+                );
+                last_err = Some(format!("{e}"));
+            }
+        }
+    }
+    Err(format!(
+        "read_psm: {}",
+        last_err.unwrap_or_else(|| "unknown".into())
+    ))
+}
+
 pub struct Driver<I: BleInterface> {
     iface: Arc<I>,
     inbox: mpsc::Sender<PeerCommand>,
@@ -271,11 +316,12 @@ impl<I: BleInterface> Driver<I> {
         let dev_for_msg = device_id.clone();
         tokio::spawn(async move {
             let result = tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
-                let psm = match iface.read_psm(&device_id).await {
-                    Ok(Some(psm)) => psm,
-                    Ok(None) => return Err("no psm advertised".to_string()),
-                    Err(e) => return Err(format!("read_psm: {e}")),
-                };
+                let psm = read_psm_with_retry(&READ_PSM_BACKOFFS_MS, &device_id, || {
+                    let iface = Arc::clone(&iface);
+                    let dev = device_id.clone();
+                    async move { iface.read_psm(&dev).await }
+                })
+                .await?;
                 iface
                     .open_l2cap(&device_id, psm)
                     .await
@@ -538,6 +584,90 @@ impl BleInterface for BlewDriver {
 
     async fn mtu(&self, device_id: &blew::DeviceId) -> u16 {
         self.central.mtu(device_id).await
+    }
+}
+
+#[cfg(test)]
+mod read_psm_tests {
+    use super::*;
+    use crate::error::BleError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn succeeds_on_first_attempt_without_sleeping() {
+        let dev = blew::DeviceId::from("dev");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let psm = read_psm_with_retry(&[0, 150, 400], &dev, || {
+            let calls = Arc::clone(&calls_c);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Some(0x0080u16))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(psm, 0x0080);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn retries_transient_errors_then_succeeds() {
+        let dev = blew::DeviceId::from("dev");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let psm = read_psm_with_retry(&[0, 150, 400], &dev, || {
+            let calls = Arc::clone(&calls_c);
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(BleError::Protocol(format!("busy {n}")))
+                } else {
+                    Ok(Some(0x0081u16))
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(psm, 0x0081);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn no_psm_advertised_does_not_retry() {
+        let dev = blew::DeviceId::from("dev");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let err = read_psm_with_retry(&[0, 150, 400], &dev, || {
+            let calls = Arc::clone(&calls_c);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err, "no psm advertised");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn all_attempts_fail_returns_last_error() {
+        let dev = blew::DeviceId::from("dev");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_c = Arc::clone(&calls);
+        let err = read_psm_with_retry(&[0, 150, 400], &dev, || {
+            let calls = Arc::clone(&calls_c);
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                Err::<Option<u16>, _>(BleError::Protocol(format!("boom {n}")))
+            }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert!(err.starts_with("read_psm:"), "unexpected: {err}");
+        assert!(err.contains("boom 2"), "expected last error, got: {err}");
     }
 }
 
