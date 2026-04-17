@@ -38,8 +38,8 @@ depends = ["fmt"]
 run = "cargo clippy --workspace --fix"
 
 [tasks.test]
-description = "Run all tests"
-run = "cargo nextest run --workspace"
+description = "Run all tests (includes feature-gated integration tests)"
+run = "cargo nextest run --workspace --all-features"
 
 [tasks.fmt]
 description = "Format all Rust code"

@@ -7,15 +7,18 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::task::Waker;
 
 use arc_swap::ArcSwap;
-use atomic_waker::AtomicWaker;
 use blew::{BleDevice, DeviceId};
 use bytes::Bytes;
+use parking_lot::Mutex;
+
 use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{KEY_PREFIX_LEN, KeyPrefix, PeerCommand},
     registry::{Registry, SnapshotMaps},
+    routing::TransportRouting,
     store::InMemoryPeerStore,
     test_util::MockFabric,
     transport::L2capPolicy,
@@ -74,10 +77,10 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
     );
     let registry = Registry::new_for_test_with_policy(policy);
     let snap = snapshots.clone();
+    let routing = Arc::new(TransportRouting::new());
+    let wakers = Arc::new(Mutex::new(Vec::<Waker>::new()));
     tokio::spawn(async move {
-        registry
-            .run(inbox_rx, driver, snap, Arc::new(AtomicWaker::new()))
-            .await;
+        registry.run(inbox_rx, driver, snap, wakers, routing).await;
     });
 
     TestNode {
