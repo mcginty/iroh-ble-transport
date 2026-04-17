@@ -32,8 +32,6 @@ pub struct Registry {
     /// Populated by VerifiedEndpoint; consulted by handle_advertised (Task 4)
     /// and the dedup pass (Task 7).
     verified_prefixes: HashMap<crate::transport::peer::KeyPrefix, iroh_base::EndpointId>,
-    #[allow(dead_code)]
-    my_endpoint: iroh_base::EndpointId,
     my_prefix: crate::transport::peer::KeyPrefix,
 }
 
@@ -44,7 +42,6 @@ impl Registry {
             peers: HashMap::new(),
             l2cap_policy,
             verified_prefixes: HashMap::new(),
-            my_endpoint,
             my_prefix,
         }
     }
