@@ -1154,6 +1154,16 @@ impl Registry {
                     PeerPhase::Handshaking { channel, .. } => channel.clone(),
                     _ => unreachable!(),
                 };
+                tracing::warn!(
+                    device = %device_id,
+                    %error,
+                    "L2CAP handshake failed; falling back to GATT for this connection"
+                );
+                // Remember the failure for the remainder of this session so
+                // `handle_verified_endpoint` does not re-emit `UpgradeToL2cap`
+                // and thrash the same attempt. Cleared on teardown by
+                // `drain_to_draining` so a future reconnect retries L2CAP.
+                entry.l2cap_upgrade_failed = true;
                 entry.tx_gen += 1;
                 let tx_gen = entry.tx_gen;
                 entry.phase = PeerPhase::Connected {
@@ -1195,6 +1205,10 @@ impl Registry {
             entry.l2cap_upgrade_failed = true;
             if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
                 *upgrading = false;
+                tracing::warn!(
+                    device = %device_id,
+                    "L2CAP pipe handover timed out; reverting to GATT for this connection"
+                );
                 actions.push(PeerAction::RevertToGattPipe { device_id });
             }
         }
@@ -1358,6 +1372,9 @@ impl Registry {
         let mut out = Vec::new();
         let was_connected = matches!(entry.phase, PeerPhase::Connected { .. });
         entry.pipe = None;
+        // Scope the no-retry sticky bit to the current connection: future
+        // reconnects start fresh and are allowed to attempt L2CAP again.
+        entry.l2cap_upgrade_failed = false;
         for send in entry.pending_sends.drain(..) {
             out.push(PeerAction::AckSend {
                 tx_gen: send.tx_gen,
@@ -4752,5 +4769,82 @@ mod tests {
             PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
             other => panic!("expected Connected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_l2cap_failed_during_handshake_sets_upgrade_failed_flag() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x11u8; 32]).public();
+        let mut reg = Registry::new(L2capPolicy::PreferL2cap, my_ep);
+        let dev = DeviceId::from("handshake-l2cap-fail");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        {
+            let e = reg.peers.get_mut(&dev).unwrap();
+            e.role = ConnectRole::Central;
+            e.phase = PeerPhase::Handshaking {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 9,
+                    path: ConnectPath::Gatt,
+                },
+            };
+        }
+
+        let actions = reg.handle(PeerCommand::OpenL2capFailed {
+            device_id: dev.clone(),
+            error: "psm read failed".into(),
+        });
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::StartDataPipe {
+                    path: ConnectPath::Gatt,
+                    ..
+                }
+            )),
+            "expected GATT fallback pipe; got {actions:?}"
+        );
+        let e = &reg.peers[&dev];
+        assert!(
+            e.l2cap_upgrade_failed,
+            "flag must be set so later VerifiedEndpoint does not re-trigger UpgradeToL2cap"
+        );
+    }
+
+    #[test]
+    fn drain_to_draining_clears_l2cap_upgrade_failed() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x22u8; 32]).public();
+        let mut reg = Registry::new(L2capPolicy::PreferL2cap, my_ep);
+        let dev = DeviceId::from("drain-clears-flag");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        {
+            let e = reg.peers.get_mut(&dev).unwrap();
+            e.role = ConnectRole::Central;
+            e.l2cap_upgrade_failed = true;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let _ = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: dev.clone(),
+            cause: blew::DisconnectCause::RemoteClose,
+        });
+
+        let e = &reg.peers[&dev];
+        assert!(
+            !e.l2cap_upgrade_failed,
+            "drain_to_draining must reset the flag so reconnect can retry L2CAP"
+        );
     }
 }
