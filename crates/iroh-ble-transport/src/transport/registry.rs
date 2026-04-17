@@ -151,7 +151,9 @@ impl Registry {
             } => {
                 self.handle_peripheral_client_subscribed(&mut actions, now, client_id, char_uuid);
             }
-            PeerCommand::L2capHandoverTimeout { .. } => {}
+            PeerCommand::L2capHandoverTimeout { device_id } => {
+                self.handle_l2cap_handover_timeout(&mut actions, device_id);
+            }
         }
         actions
     }
@@ -1149,6 +1151,20 @@ impl Registry {
             }
             _ => {}
         }
+    }
+
+    fn handle_l2cap_handover_timeout(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        device_id: DeviceId,
+    ) {
+        if let Some(entry) = self.peers.get_mut(&device_id) {
+            entry.l2cap_upgrade_failed = true;
+            if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                *upgrading = false;
+            }
+        }
+        actions.push(PeerAction::RevertToGattPipe { device_id });
     }
 
     fn handle_inbound_l2cap_channel(
@@ -4408,6 +4424,35 @@ mod tests {
             "l2cap_upgrade_failed should be set"
         );
         match &entry.phase {
+            PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
+            other => panic!("expected Connected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn l2cap_handover_timeout_reverts_and_marks_failed() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let mut reg = Registry::new(L2capPolicy::PreferL2cap, my_ep);
+        let dev = DeviceId::from("peer");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        {
+            let e = reg.peers.get_mut(&dev).unwrap();
+            e.role = ConnectRole::Central;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle { id: 1, path: ConnectPath::Gatt },
+                tx_gen: 1,
+                upgrading: true,
+            };
+        }
+        let actions = reg.handle(PeerCommand::L2capHandoverTimeout { device_id: dev.clone() });
+
+        assert!(actions.iter().any(|a| matches!(a, PeerAction::RevertToGattPipe { device_id } if device_id == &dev)));
+        let e = &reg.peers[&dev];
+        assert!(e.l2cap_upgrade_failed);
+        match &e.phase {
             PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
             other => panic!("expected Connected, got {other:?}"),
         }
