@@ -101,11 +101,7 @@ fn spawn_node_with_endpoint(
 
 /// Wait until both nodes have exactly one peer in the given phase, then
 /// return the summaries.
-async fn wait_both_connected(
-    a: &TestNode,
-    b: &TestNode,
-    timeout: Duration,
-) {
+async fn wait_both_connected(a: &TestNode, b: &TestNode, timeout: Duration) {
     tokio::time::timeout(timeout, async {
         loop {
             let a_snap = a.snapshots.load();
@@ -249,15 +245,11 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     // InboundGattFragment). B's should_win(Peripheral, ep_b, ep_a) → ep_b < ep_a
     // → keeps Peripheral → no prune.
     a.inbox_tx
-        .send(PeerCommand::VerifiedEndpoint {
-            endpoint_id: ep_b,
-        })
+        .send(PeerCommand::VerifiedEndpoint { endpoint_id: ep_b })
         .await
         .unwrap();
     b.inbox_tx
-        .send(PeerCommand::VerifiedEndpoint {
-            endpoint_id: ep_a,
-        })
+        .send(PeerCommand::VerifiedEndpoint { endpoint_id: ep_a })
         .await
         .unwrap();
 
@@ -292,7 +284,10 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     );
 
     // A's Connected entry must be the Central role (A has higher endpoint).
-    let a_peer = a_snap.peer_states.get(&dev_b).expect("A has no entry for B");
+    let a_peer = a_snap
+        .peer_states
+        .get(&dev_b)
+        .expect("A has no entry for B");
     assert_eq!(
         a_peer.phase_kind,
         PhaseKind::Connected,
@@ -305,7 +300,10 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     );
 
     // B's Connected entry must be the Peripheral role.
-    let b_peer = b_snap.peer_states.get(&dev_a).expect("B has no entry for A");
+    let b_peer = b_snap
+        .peer_states
+        .get(&dev_a)
+        .expect("B has no entry for A");
     assert_eq!(
         b_peer.phase_kind,
         PhaseKind::Connected,
@@ -419,9 +417,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
 
     // Mark B's prefix as verified.
     a.inbox_tx
-        .send(PeerCommand::VerifiedEndpoint {
-            endpoint_id: ep_b,
-        })
+        .send(PeerCommand::VerifiedEndpoint { endpoint_id: ep_b })
         .await
         .unwrap();
 
@@ -456,12 +452,9 @@ async fn advertising_flood_does_not_redial_after_verified() {
         .count();
 
     assert_eq!(
-        connect_count_after,
-        connect_count_before,
+        connect_count_after, connect_count_before,
         "verified peer must not be redialled after {} floods; connect count grew from {} to {}",
-        20,
-        connect_count_before,
-        connect_count_after,
+        20, connect_count_before, connect_count_after,
     );
 }
 

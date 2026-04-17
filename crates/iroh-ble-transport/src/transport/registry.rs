@@ -4448,14 +4448,23 @@ mod tests {
             e.role = ConnectRole::Central;
             e.phase = PeerPhase::Connected {
                 since: std::time::Instant::now(),
-                channel: ChannelHandle { id: 1, path: ConnectPath::Gatt },
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
                 tx_gen: 1,
                 upgrading: true,
             };
         }
-        let actions = reg.handle(PeerCommand::L2capHandoverTimeout { device_id: dev.clone() });
+        let actions = reg.handle(PeerCommand::L2capHandoverTimeout {
+            device_id: dev.clone(),
+        });
 
-        assert!(actions.iter().any(|a| matches!(a, PeerAction::RevertToGattPipe { device_id } if device_id == &dev)));
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, PeerAction::RevertToGattPipe { device_id } if device_id == &dev)
+            )
+        );
         let e = &reg.peers[&dev];
         assert!(e.l2cap_upgrade_failed);
         match &e.phase {

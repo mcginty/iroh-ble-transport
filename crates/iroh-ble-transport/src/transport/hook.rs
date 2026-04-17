@@ -40,10 +40,7 @@ impl BleDedupHook {
 }
 
 impl EndpointHooks for BleDedupHook {
-    async fn after_handshake<'a>(
-        &'a self,
-        conn: &'a ConnectionInfo,
-    ) -> AfterHandshakeOutcome {
+    async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
         let _ = self.tx.send(conn.remote_id());
         AfterHandshakeOutcome::Accept
     }

@@ -2,8 +2,8 @@
 
 pub mod dedup;
 pub mod driver;
-pub mod hook;
 pub mod events;
+pub mod hook;
 pub mod interface;
 pub mod l2cap;
 pub mod mtu;
