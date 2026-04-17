@@ -267,7 +267,7 @@ impl BleTransport {
             }
         }
 
-        let registry = Registry::new(config.l2cap_policy);
+        let registry = Registry::new(config.l2cap_policy, local_id);
         let snap_for_actor = Arc::clone(&snapshots);
         let waker_for_actor = Arc::clone(&inbox_capacity_waker);
         tokio::spawn(async move {

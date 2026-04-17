@@ -32,19 +32,36 @@ pub struct Registry {
     /// Populated by VerifiedEndpoint; consulted by handle_advertised (Task 4)
     /// and the dedup pass (Task 7).
     verified_prefixes: HashMap<crate::transport::peer::KeyPrefix, iroh_base::EndpointId>,
+    #[allow(dead_code)]
+    my_endpoint: iroh_base::EndpointId,
+    my_prefix: crate::transport::peer::KeyPrefix,
 }
 
 impl Registry {
-    pub fn new(l2cap_policy: L2capPolicy) -> Self {
+    pub fn new(l2cap_policy: L2capPolicy, my_endpoint: iroh_base::EndpointId) -> Self {
+        let my_prefix = crate::transport::routing::prefix_from_endpoint(&my_endpoint);
         Self {
             peers: HashMap::new(),
             l2cap_policy,
             verified_prefixes: HashMap::new(),
+            my_endpoint,
+            my_prefix,
         }
     }
 
     pub fn new_for_test() -> Self {
-        Self::new(L2capPolicy::Disabled)
+        let ep = iroh_base::SecretKey::from_bytes(&[0u8; 32]).public();
+        Self::new(L2capPolicy::Disabled, ep)
+    }
+
+    pub fn new_for_test_with_policy(l2cap_policy: L2capPolicy) -> Self {
+        let ep = iroh_base::SecretKey::from_bytes(&[0u8; 32]).public();
+        Self::new(l2cap_policy, ep)
+    }
+
+    #[cfg(test)]
+    pub fn new_for_test_with_endpoint(endpoint: iroh_base::EndpointId) -> Self {
+        Self::new(L2capPolicy::Disabled, endpoint)
     }
 
     pub fn handle(&mut self, cmd: PeerCommand) -> Vec<PeerAction> {
@@ -160,6 +177,9 @@ impl Registry {
                 .unwrap_or(false)
                 && matches!(e.phase, PeerPhase::Connected { .. })
         });
+        let i_am_lower = self.my_prefix < prefix;
+        let already_verified_peer = self.verified_prefixes.contains_key(&prefix);
+        let should_defer = i_am_lower && !already_verified_peer;
 
         let entry = self
             .peers
@@ -179,6 +199,12 @@ impl Registry {
             PeerPhase::Unknown => {
                 if entry.pending_sends.is_empty() {
                     entry.phase = PeerPhase::Discovered { since: now };
+                } else if should_defer {
+                    entry.phase = PeerPhase::PendingDial {
+                        since: now,
+                        deadline: pending_dial_deadline(now, prefix),
+                        prefix,
+                    };
                 } else {
                     entry.phase = PeerPhase::Connecting {
                         attempt: 0,
@@ -192,15 +218,23 @@ impl Registry {
                 }
             }
             PeerPhase::Discovered { .. } if !entry.pending_sends.is_empty() => {
-                entry.phase = PeerPhase::Connecting {
-                    attempt: 0,
-                    started: now,
-                    path: crate::transport::peer::ConnectPath::Gatt,
-                };
-                actions.push(PeerAction::StartConnect {
-                    device_id: device_id.clone(),
-                    attempt: 0,
-                });
+                if should_defer {
+                    entry.phase = PeerPhase::PendingDial {
+                        since: now,
+                        deadline: pending_dial_deadline(now, prefix),
+                        prefix,
+                    };
+                } else {
+                    entry.phase = PeerPhase::Connecting {
+                        attempt: 0,
+                        started: now,
+                        path: crate::transport::peer::ConnectPath::Gatt,
+                    };
+                    actions.push(PeerAction::StartConnect {
+                        device_id: device_id.clone(),
+                        attempt: 0,
+                    });
+                }
             }
             PeerPhase::Reconnecting {
                 attempt, next_at, ..
@@ -1169,16 +1203,32 @@ impl Registry {
     }
 }
 
-impl Default for Registry {
-    fn default() -> Self {
-        Self::new(L2capPolicy::default())
-    }
-}
-
 /// Backoff computation used by the Reconnecting path. Exposed for tests.
 pub(crate) fn reconnect_backoff(attempt: u32) -> Duration {
     let base_ms = 500u64.saturating_mul(1u64 << attempt.min(6));
     Duration::from_millis(base_ms.min(30_000))
+}
+
+// Deterministic jitter keyed by peer prefix avoids adding a PRNG dep and
+// makes tests reproducible while still spreading dials across the window.
+fn pending_dial_deadline(
+    now: std::time::Instant,
+    prefix: crate::transport::peer::KeyPrefix,
+) -> std::time::Instant {
+    use crate::transport::dedup::{FAIRNESS_JITTER, FAIRNESS_WINDOW};
+
+    let jitter_span_ns = FAIRNESS_JITTER
+        .saturating_mul(2)
+        .as_nanos()
+        .try_into()
+        .unwrap_or(u64::MAX);
+    let seed: u64 = prefix
+        .iter()
+        .enumerate()
+        .map(|(i, b)| u64::from(*b) << ((i & 7) * 8))
+        .fold(0u64, u64::wrapping_add);
+    let jitter = std::time::Duration::from_nanos(seed % jitter_span_ns);
+    now + FAIRNESS_WINDOW.saturating_sub(FAIRNESS_JITTER) + jitter
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1699,7 +1749,7 @@ mod tests {
 
     #[test]
     fn adapter_on_with_l2cap_policy_also_restarts_listener() {
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let actions = reg.handle(PeerCommand::AdapterStateChanged { powered: true });
         assert!(
             actions
@@ -2717,7 +2767,7 @@ mod tests {
     fn connect_succeeded_prefer_l2cap_enters_handshaking_and_emits_open_l2cap() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
 
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2cap-1");
         reg.peers.insert(device_id.clone(), {
             let mut e = PeerEntry::new(device_id.clone());
@@ -2758,7 +2808,7 @@ mod tests {
     fn connect_succeeded_disabled_goes_straight_to_connected() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
 
-        let mut reg = Registry::new(L2capPolicy::Disabled);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
         let device_id = blew::DeviceId::from("dev-l2cap-2");
         reg.peers.insert(device_id.clone(), {
             let mut e = PeerEntry::new(device_id.clone());
@@ -2800,7 +2850,7 @@ mod tests {
     fn open_l2cap_succeeded_transitions_to_connected_l2cap() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
 
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2cap-3");
         reg.peers.insert(device_id.clone(), {
             let mut e = PeerEntry::new(device_id.clone());
@@ -2855,7 +2905,7 @@ mod tests {
     fn open_l2cap_failed_falls_back_to_gatt() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
 
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2cap-4");
         reg.peers.insert(device_id.clone(), {
             let mut e = PeerEntry::new(device_id.clone());
@@ -2911,7 +2961,7 @@ mod tests {
     fn tick_handshaking_l2cap_timeout_falls_back_to_gatt() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
 
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2cap-5");
         let old = std::time::Instant::now() - std::time::Duration::from_secs(5);
         reg.peers.insert(device_id.clone(), {
@@ -2964,7 +3014,7 @@ mod tests {
     fn tick_handshaking_no_l2cap_deadline_is_not_timed_out() {
         use crate::transport::peer::{ChannelHandle, ConnectPath};
 
-        let mut reg = Registry::new(L2capPolicy::Disabled);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
         let device_id = blew::DeviceId::from("dev-l2cap-6");
         let old = std::time::Instant::now() - std::time::Duration::from_secs(5);
         reg.peers.insert(device_id.clone(), {
@@ -2992,7 +3042,7 @@ mod tests {
     fn inbound_l2cap_channel_creates_peripheral_entry_with_l2cap_path() {
         use crate::transport::peer::{ConnectPath, ConnectRole};
 
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2cap-inbound");
         let (ch_a, _ch_b) = blew::L2capChannel::pair(8192);
         let actions = reg.handle(PeerCommand::InboundL2capChannel {
@@ -3097,7 +3147,7 @@ mod tests {
     fn inbound_l2cap_channel_dropped_when_gatt_pipe_exists() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, PendingSend, PipeHandles};
 
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2cap-dup");
 
         let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(4);
@@ -3148,7 +3198,7 @@ mod tests {
 
     #[test]
     fn connect_succeeded_with_l2cap_policy_moves_to_handshaking() {
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2-hs");
         reg.peers.insert(device_id.clone(), {
             let mut e = PeerEntry::new(device_id.clone());
@@ -3183,7 +3233,7 @@ mod tests {
 
     #[test]
     fn open_l2cap_succeeded_moves_handshaking_to_connected_l2cap() {
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2-ok");
         reg.peers.insert(device_id.clone(), {
             let mut e = PeerEntry::new(device_id.clone());
@@ -3219,7 +3269,7 @@ mod tests {
 
     #[test]
     fn open_l2cap_failed_falls_back_to_gatt_simple() {
-        let mut reg = Registry::new(L2capPolicy::PreferL2cap);
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2-fail");
         reg.peers.insert(device_id.clone(), {
             let mut e = PeerEntry::new(device_id.clone());
@@ -3710,5 +3760,117 @@ mod tests {
             reg.peers[&dev_id].phase,
             PeerPhase::Discovered { .. },
         ));
+    }
+
+    #[test]
+    fn lower_prefix_side_enters_pending_dial() {
+        use crate::transport::peer::{PeerPhase, PendingSend};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        // Seed [0xFF;32] yields a lower prefix than [0x01;32] for Ed25519.
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+        let peer_dev = DeviceId::from("peer-high");
+
+        reg.peers
+            .insert(peer_dev.clone(), PeerEntry::new(peer_dev.clone()));
+        reg.peers
+            .get_mut(&peer_dev)
+            .unwrap()
+            .pending_sends
+            .push_back(PendingSend {
+                tx_gen: 0,
+                datagram: bytes::Bytes::from_static(b"x"),
+                waker: noop_waker(),
+            });
+
+        let my_prefix = prefix_from_endpoint(&my_ep);
+        assert!(
+            my_prefix < peer_prefix,
+            "test setup invariant violated: my_prefix ({my_prefix:?}) \
+             must be < peer_prefix ({peer_prefix:?})",
+        );
+
+        let actions = reg.handle(PeerCommand::Advertised {
+            prefix: peer_prefix,
+            device: blew::BleDevice {
+                id: peer_dev.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartConnect { .. })),
+            "lower-prefix side must not dial immediately; got {actions:?}",
+        );
+        assert!(
+            matches!(reg.peers[&peer_dev].phase, PeerPhase::PendingDial { .. }),
+            "lower side must enter PendingDial; got {:?}",
+            reg.peers[&peer_dev].phase,
+        );
+    }
+
+    #[test]
+    fn higher_prefix_side_dials_immediately_on_pending_send() {
+        use crate::transport::peer::{PeerPhase, PendingSend};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        // Seed [0x01;32] yields a higher prefix than [0xFF;32] for Ed25519.
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+        let peer_dev = DeviceId::from("peer-low");
+
+        reg.peers
+            .insert(peer_dev.clone(), PeerEntry::new(peer_dev.clone()));
+        reg.peers
+            .get_mut(&peer_dev)
+            .unwrap()
+            .pending_sends
+            .push_back(PendingSend {
+                tx_gen: 0,
+                datagram: bytes::Bytes::from_static(b"x"),
+                waker: noop_waker(),
+            });
+
+        let my_prefix = prefix_from_endpoint(&my_ep);
+        assert!(
+            my_prefix > peer_prefix,
+            "test setup invariant violated: my_prefix ({my_prefix:?}) \
+             must be > peer_prefix ({peer_prefix:?})",
+        );
+
+        let actions = reg.handle(PeerCommand::Advertised {
+            prefix: peer_prefix,
+            device: blew::BleDevice {
+                id: peer_dev.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartConnect { .. })),
+            "higher-prefix side must dial immediately with a pending send; got {actions:?}",
+        );
+        assert!(
+            matches!(reg.peers[&peer_dev].phase, PeerPhase::Connecting { .. }),
+            "higher side must transition to Connecting; got {:?}",
+            reg.peers[&peer_dev].phase,
+        );
     }
 }

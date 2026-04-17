@@ -44,7 +44,7 @@ async fn advertised_then_send_triggers_connect_and_ack() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -140,7 +140,7 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -247,7 +247,7 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -316,7 +316,7 @@ async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::PreferL2cap);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -381,7 +381,7 @@ async fn version_mismatch_deads_peer_and_closes_channel() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -469,7 +469,7 @@ async fn version_match_lets_data_pipe_start() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -544,8 +544,8 @@ async fn full_round_trip_over_mock_gatt() {
         Arc::new(InMemoryPeerStore::new()),
     );
 
-    let central_reg = Registry::new(L2capPolicy::Disabled);
-    let peripheral_reg = Registry::new(L2capPolicy::Disabled);
+    let central_reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
+    let peripheral_reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let cs = central_snapshots.clone();
     let ps = peripheral_snapshots.clone();
     tokio::spawn(async move {
@@ -638,8 +638,8 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         Arc::new(InMemoryPeerStore::new()),
     );
 
-    let central_reg = Registry::new(L2capPolicy::Disabled);
-    let peripheral_reg = Registry::new(L2capPolicy::Disabled);
+    let central_reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
+    let peripheral_reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let cs = central_snapshots.clone();
     let ps = peripheral_snapshots.clone();
     tokio::spawn(async move {
@@ -788,7 +788,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -903,7 +903,7 @@ async fn connect_failure_retries_on_next_tick() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -1012,7 +1012,7 @@ async fn l2cap_prefer_succeeds_and_connects_via_l2cap() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::PreferL2cap);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))
@@ -1111,7 +1111,7 @@ async fn l2cap_prefer_fallback_to_gatt_on_failure() {
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::PreferL2cap);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
         reg.run(rx, driver, snap_for_actor, Arc::new(AtomicWaker::new()))

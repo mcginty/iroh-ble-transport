@@ -72,7 +72,7 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
         truncations,
         Arc::new(InMemoryPeerStore::new()),
     );
-    let registry = Registry::new(policy);
+    let registry = Registry::new_for_test_with_policy(policy);
     let snap = snapshots.clone();
     tokio::spawn(async move {
         registry
