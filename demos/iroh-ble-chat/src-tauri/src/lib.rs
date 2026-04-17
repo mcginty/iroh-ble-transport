@@ -1146,7 +1146,7 @@ pub fn run() {
             let env_filter =
                 tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new(
-                        "iroh_ble_transport=debug,iroh_gossip=info,iroh_ble_chat=debug,iroh_ble_chat_lib=debug,blew=info,warn",
+                        "iroh_ble_transport=trace,iroh_gossip=info,iroh_ble_chat=debug,iroh_ble_chat_lib=debug,blew=info,warn",
                     )
                 });
             let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
