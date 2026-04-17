@@ -86,7 +86,8 @@ impl PeerState {
             Some(BlePeerPhase::Handshaking) => "handshaking",
             Some(BlePeerPhase::Connecting) => "connecting",
             Some(BlePeerPhase::Reconnecting | BlePeerPhase::Restoring) => "reconnecting",
-            Some(BlePeerPhase::Discovered | BlePeerPhase::PendingDial | BlePeerPhase::Unknown) => {
+            Some(BlePeerPhase::PendingDial) => "pending_dial",
+            Some(BlePeerPhase::Discovered | BlePeerPhase::Unknown) => {
                 if matches!(self.gossip, Some(GossipStatus::InTopic)) {
                     "in_topic"
                 } else {
