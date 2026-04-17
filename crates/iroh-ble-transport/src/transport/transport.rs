@@ -277,9 +277,16 @@ impl BleTransport {
         let registry = Registry::new(config.l2cap_policy, local_id);
         let snap_for_actor = Arc::clone(&snapshots);
         let wakers_for_actor = Arc::clone(&inbox_capacity_wakers);
+        let routing_for_actor = Arc::clone(&routing);
         tokio::spawn(async move {
             registry
-                .run(inbox_rx, driver, snap_for_actor, wakers_for_actor)
+                .run(
+                    inbox_rx,
+                    driver,
+                    snap_for_actor,
+                    wakers_for_actor,
+                    routing_for_actor,
+                )
                 .await;
         });
 

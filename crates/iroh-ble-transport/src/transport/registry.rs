@@ -1411,6 +1411,7 @@ impl Registry {
         driver: Driver<I>,
         snapshots: Arc<ArcSwap<SnapshotMaps>>,
         inbox_capacity_wakers: Arc<parking_lot::Mutex<Vec<Waker>>>,
+        routing: Arc<crate::transport::routing::TransportRouting>,
     ) {
         while let Some(cmd) = rx.recv().await {
             // Wake BleSender::poll_send callers waiting on backpressure — we
@@ -1426,10 +1427,27 @@ impl Registry {
                 driver.execute(action).await;
             }
             self.publish_snapshot(&snapshots);
+            routing.publish_active_prefixes(self.active_prefix_bindings());
             if shutdown {
                 break;
             }
         }
+    }
+
+    /// Current set of prefix→DeviceId bindings for peers that hold a live
+    /// connection. Used by `run` to tell routing which prefixes must be
+    /// protected from scan-driven eviction.
+    fn active_prefix_bindings(&self) -> HashMap<crate::transport::peer::KeyPrefix, DeviceId> {
+        self.peers
+            .iter()
+            .filter_map(|(did, e)| {
+                if matches!(e.phase, PeerPhase::Connected { .. }) {
+                    e.prefix.map(|p| (p, did.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -2833,6 +2851,59 @@ mod tests {
             "peripheral entry must be stamped so dedup can collapse it"
         );
         assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
+    }
+
+    #[test]
+    fn active_prefix_bindings_include_only_connected_peers_with_prefix() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, KEY_PREFIX_LEN, PeerPhase};
+
+        let mut reg = Registry::new_for_test();
+        let now = std::time::Instant::now();
+
+        // Peer A: Connected with prefix → must appear.
+        let a_prefix: [u8; KEY_PREFIX_LEN] = [1u8; KEY_PREFIX_LEN];
+        let a_dev = DeviceId::from("A");
+        let mut a_entry = PeerEntry::new(a_dev.clone());
+        a_entry.prefix = Some(a_prefix);
+        a_entry.phase = PeerPhase::Connected {
+            since: now,
+            channel: ChannelHandle {
+                id: 1,
+                path: ConnectPath::Gatt,
+            },
+            tx_gen: 1,
+            upgrading: false,
+        };
+        reg.peers.insert(a_dev.clone(), a_entry);
+
+        // Peer B: Connecting (not yet Connected) → must NOT appear.
+        let b_dev = DeviceId::from("B");
+        let mut b_entry = PeerEntry::new(b_dev.clone());
+        b_entry.prefix = Some([2u8; KEY_PREFIX_LEN]);
+        b_entry.phase = PeerPhase::Connecting {
+            attempt: 0,
+            started: now,
+            path: ConnectPath::Gatt,
+        };
+        reg.peers.insert(b_dev, b_entry);
+
+        // Peer C: Connected but prefix=None (inbound-before-scan) → must NOT appear.
+        let c_dev = DeviceId::from("C");
+        let mut c_entry = PeerEntry::new(c_dev.clone());
+        c_entry.phase = PeerPhase::Connected {
+            since: now,
+            channel: ChannelHandle {
+                id: 2,
+                path: ConnectPath::Gatt,
+            },
+            tx_gen: 1,
+            upgrading: false,
+        };
+        reg.peers.insert(c_dev, c_entry);
+
+        let bindings = reg.active_prefix_bindings();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings.get(&a_prefix), Some(&a_dev));
     }
 
     #[tokio::test]

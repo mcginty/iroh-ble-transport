@@ -78,6 +78,15 @@ pub async fn run_central_events(
                             break;
                         }
                     }
+                    DiscoveryUpdate::ActivelyPinned => {
+                        tracing::trace!(
+                            device = %device.id,
+                            ?prefix,
+                            rssi,
+                            "ignoring scan: prefix is actively pinned to a different DeviceId"
+                        );
+                        continue;
+                    }
                 }
                 PeerCommand::Advertised {
                     prefix,
