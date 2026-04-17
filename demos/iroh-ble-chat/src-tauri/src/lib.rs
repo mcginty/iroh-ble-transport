@@ -9,7 +9,10 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_ble_transport::transport::BleTransport;
-use iroh_ble_transport::{BlePeerInfo, BlePeerPhase, Central, ConnectPath, Peripheral};
+use iroh_ble_transport::{
+    BleDedupHook, BlePeerInfo, BlePeerPhase, BleTransportConfig, Central, ConnectPath,
+    InMemoryPeerStore, L2capPolicy, Peripheral,
+};
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
 use n0_future::StreamExt;
@@ -184,11 +187,23 @@ async fn start_node(
         info!("BLE permissions granted");
     }
 
+    let (verified_tx, verified_rx) = tokio::sync::mpsc::unbounded_channel();
     let ble_transport: Arc<BleTransport> = {
         let central = Arc::new(Central::new().await.map_err(|e| e.to_string())?);
         let peripheral = Arc::new(Peripheral::new().await.map_err(|e| e.to_string())?);
         let local_id = st.secret_key.public();
-        let transport = BleTransport::new(local_id, central, peripheral).await.map_err(|e| {
+        let transport = BleTransport::with_config(
+            local_id,
+            central,
+            peripheral,
+            BleTransportConfig {
+                l2cap_policy: L2capPolicy::PreferL2cap,
+                store: Arc::new(InMemoryPeerStore::new()),
+                verified_rx: Some(verified_rx),
+            },
+        )
+        .await
+        .map_err(|e| {
             let msg = e.to_string();
             if msg.contains("adapter not found") || msg.contains("AdapterNotFound") {
                 "Bluetooth is not available on this device. A physical Bluetooth adapter is required — simulators and emulators are not supported.".to_string()
@@ -222,6 +237,7 @@ async fn start_node(
         .build();
 
     let ep = Endpoint::builder(presets::N0DisableRelay)
+        .hooks(BleDedupHook::new(verified_tx))
         .add_custom_transport(Arc::clone(&transport))
         .address_lookup(lookup)
         .transport_config(transport_cfg)
