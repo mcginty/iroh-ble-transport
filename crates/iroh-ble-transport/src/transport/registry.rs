@@ -136,8 +136,13 @@ impl Registry {
             PeerCommand::VerifiedEndpoint { endpoint_id } => {
                 self.handle_verified_endpoint(&mut actions, now, endpoint_id);
             }
-            PeerCommand::PeripheralClientSubscribed { .. }
-            | PeerCommand::L2capHandoverTimeout { .. } => {}
+            PeerCommand::PeripheralClientSubscribed {
+                client_id,
+                char_uuid,
+            } => {
+                self.handle_peripheral_client_subscribed(&mut actions, now, client_id, char_uuid);
+            }
+            PeerCommand::L2capHandoverTimeout { .. } => {}
         }
         actions
     }
@@ -206,6 +211,44 @@ impl Registry {
                 }
             }
         }
+    }
+
+    fn handle_peripheral_client_subscribed(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        client_id: DeviceId,
+        _char_uuid: uuid::Uuid,
+    ) {
+        let entry = self
+            .peers
+            .entry(client_id.clone())
+            .or_insert_with(|| PeerEntry::new(client_id.clone()));
+        // Idempotent across C2P/P2C: if we already materialized a
+        // Peripheral-role Connected entry on the first subscribe, the second
+        // characteristic's SubscriptionChanged must not restart the pipe.
+        if matches!(&entry.phase, PeerPhase::Connected { .. })
+            && entry.role == crate::transport::peer::ConnectRole::Peripheral
+        {
+            return;
+        }
+        entry.role = crate::transport::peer::ConnectRole::Peripheral;
+        entry.tx_gen = entry.tx_gen.saturating_add(1);
+        entry.phase = PeerPhase::Connected {
+            since: now,
+            channel: crate::transport::peer::ChannelHandle {
+                id: entry.tx_gen,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+            tx_gen: entry.tx_gen,
+            upgrading: false,
+        };
+        actions.push(PeerAction::StartDataPipe {
+            device_id: client_id,
+            role: crate::transport::peer::ConnectRole::Peripheral,
+            path: crate::transport::peer::ConnectPath::Gatt,
+            l2cap_channel: None,
+        });
     }
 
     fn handle_advertised(
@@ -2558,6 +2601,64 @@ mod tests {
             PeerAction::StartDataPipe { role: ConnectRole::Peripheral, device_id: d, .. }
                 if d == &device_id
         )));
+    }
+
+    #[test]
+    fn peripheral_client_subscribed_materializes_connected_peer() {
+        use crate::transport::peer::{ConnectPath, ConnectRole, PeerPhase};
+        use uuid::uuid;
+
+        let mut reg = Registry::new_for_test();
+        let client = DeviceId::from("inbound-client");
+        let actions = reg.handle(PeerCommand::PeripheralClientSubscribed {
+            client_id: client.clone(),
+            char_uuid: uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2"),
+        });
+        let entry = reg.peers.get(&client).expect("entry created");
+        assert_eq!(entry.role, ConnectRole::Peripheral);
+        assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::StartDataPipe {
+                    role: ConnectRole::Peripheral,
+                    path: ConnectPath::Gatt,
+                    ..
+                }
+            )),
+            "must emit StartDataPipe role=Peripheral path=Gatt; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn peripheral_client_subscribed_idempotent_for_second_char() {
+        use crate::transport::peer::PeerPhase;
+        use uuid::uuid;
+
+        let mut reg = Registry::new_for_test();
+        let client = DeviceId::from("inbound");
+        let _ = reg.handle(PeerCommand::PeripheralClientSubscribed {
+            client_id: client.clone(),
+            char_uuid: uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2"),
+        });
+        let tx_gen_after_first = match reg.peers[&client].phase {
+            PeerPhase::Connected { tx_gen, .. } => tx_gen,
+            _ => panic!(),
+        };
+        let actions = reg.handle(PeerCommand::PeripheralClientSubscribed {
+            client_id: client.clone(),
+            char_uuid: uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2"),
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartDataPipe { .. })),
+            "second subscribe on same client must not start another pipe"
+        );
+        match reg.peers[&client].phase {
+            PeerPhase::Connected { tx_gen, .. } => assert_eq!(tx_gen, tx_gen_after_first),
+            _ => panic!(),
+        }
     }
 
     #[tokio::test]
