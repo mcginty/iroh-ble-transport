@@ -37,9 +37,16 @@ impl<T> std::future::Future for AbortOnDrop<T> {
 use crate::transport::dedup::L2CAP_HANDOVER_TIMEOUT;
 use crate::transport::driver::IncomingPacket;
 use crate::transport::interface::BleInterface;
-use crate::transport::mtu::resolve_chunk_size;
+use crate::transport::mtu::{ATT_OVERHEAD, MIN_SANE_MTU, resolve_chunk_size};
 use crate::transport::peer::{ConnectPath, ConnectRole, PeerCommand, PendingSend};
 use crate::transport::reliable::ReliableChannel;
+
+/// Conservative initial chunk size for a freshly started GATT pipe, used
+/// while the async MTU resolver runs in parallel. Sized to the BLE-spec
+/// default ATT MTU floor (`MIN_SANE_MTU` = 24) minus ATT overhead so any
+/// fragments sent before the resolver lands are safe on any peer. The
+/// resolver calls `ReliableChannel::set_chunk_size` to bump this up.
+const INITIAL_CHUNK_SIZE: usize = (MIN_SANE_MTU as usize) - ATT_OVERHEAD;
 
 enum ActiveWorker {
     Gatt {
@@ -349,10 +356,24 @@ async fn run_gatt_pipe(
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
 ) {
-    let chunk_size = resolve_chunk_size(iface.as_ref(), &device_id).await;
+    // Start with a conservative chunk size so the select loop can begin
+    // processing inbound fragments immediately. Blocking on the MTU resolver
+    // here would starve inbound reassembly for up to `MTU_READY_DEADLINE`
+    // (≈3s) — enough to collide with an L2CAP accept landing mid-handshake.
     let (channel, mut datagram_rx) =
-        ReliableChannel::new(chunk_size, retransmit_counter, truncation_counter);
+        ReliableChannel::new(INITIAL_CHUNK_SIZE, retransmit_counter, truncation_counter);
     let channel = Arc::new(channel);
+
+    let resolver_handle = {
+        let channel = Arc::clone(&channel);
+        let iface = Arc::clone(&iface);
+        let device_id = device_id.clone();
+        tokio::spawn(async move {
+            let chunk_size = resolve_chunk_size(iface.as_ref(), &device_id).await;
+            channel.set_chunk_size(chunk_size);
+        })
+    };
+    let _resolver_guard = AbortOnDrop(resolver_handle);
 
     let send_loop_handle = {
         let channel = Arc::clone(&channel);
@@ -471,7 +492,31 @@ async fn run_l2cap_pipe(
             maybe_send = outbound_rx.recv() => {
                 match maybe_send {
                     Some(send) => {
-                        let _ = l2cap_tx.send(send.datagram.to_vec()).await;
+                        let datagram = send.datagram.to_vec();
+                        tracing::trace!(
+                            device = %device_id,
+                            tx_gen = send.tx_gen,
+                            len = datagram.len(),
+                            "l2cap pipe got outbound"
+                        );
+                        match l2cap_tx.send(datagram).await {
+                            Ok(()) => {
+                                tracing::trace!(
+                                    device = %device_id,
+                                    tx_gen = send.tx_gen,
+                                    "l2cap pipe forwarded outbound to send task"
+                                );
+                            }
+                            Err(_closed) => {
+                                tracing::warn!(
+                                    device = %device_id,
+                                    "l2cap pipe: send task channel closed; stopping"
+                                );
+                                send.waker.wake();
+                                io_died = true;
+                                break;
+                            }
+                        }
                         send.waker.wake();
                     }
                     None => break,

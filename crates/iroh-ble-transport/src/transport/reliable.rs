@@ -51,7 +51,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -197,7 +197,9 @@ pub struct ReliableChannel {
     state: Arc<Mutex<ChannelState>>,
     wake: Arc<Notify>,
     datagram_tx: mpsc::Sender<Vec<u8>>,
-    chunk_size: usize,
+    /// Mutable so the pipe can start with a conservative floor and be updated
+    /// once `resolve_chunk_size` lands — see `pipe::run_gatt_pipe`.
+    chunk_size: AtomicUsize,
     send_waker: Arc<atomic_waker::AtomicWaker>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
@@ -229,12 +231,21 @@ impl ReliableChannel {
             })),
             wake: Arc::new(Notify::new()),
             datagram_tx,
-            chunk_size,
+            chunk_size: AtomicUsize::new(chunk_size),
             send_waker: Arc::new(atomic_waker::AtomicWaker::new()),
             retransmit_counter,
             truncation_counter,
         };
         (ch, datagram_rx)
+    }
+
+    /// Update the outbound fragment chunk size. Affects future calls to
+    /// `fragment_into`; fragments already split into `frag_queue` or sitting
+    /// in `in_flight` keep their existing sizing so retransmits stay
+    /// consistent. Intended to be called once per channel lifetime when the
+    /// async MTU resolver lands a sane reading — see `pipe::run_gatt_pipe`.
+    pub fn set_chunk_size(&self, chunk_size: usize) {
+        self.chunk_size.store(chunk_size, Ordering::Relaxed);
     }
 
     /// Signal that the underlying link is gone — typically because blew has
@@ -618,7 +629,7 @@ impl ReliableChannel {
     }
 
     fn fragment_into(&self, state: &mut ChannelState, datagram: Vec<u8>) {
-        let max_payload = self.chunk_size - HEADER_SIZE - 1;
+        let max_payload = self.chunk_size.load(Ordering::Relaxed) - HEADER_SIZE - 1;
 
         if datagram.len() <= max_payload {
             state.frag_queue.push_back(FragmentEntry {

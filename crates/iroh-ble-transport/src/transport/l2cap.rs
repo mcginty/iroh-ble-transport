@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use super::IncomingPacket;
 use super::mtu::MAX_DATAGRAM_SIZE;
@@ -91,10 +91,12 @@ where
     let send_task = tokio::spawn(async move {
         let _guard = send_guard;
         while let Some(datagram) = outbound_rx.recv().await {
+            trace!(device = %dev, len = datagram.len(), "l2cap send task -> write_framed_datagram");
             if let Err(e) = write_framed_datagram(&mut writer, &datagram).await {
                 warn!(device = %dev, ?e, "l2cap send task exiting on error");
                 break;
             }
+            trace!(device = %dev, "l2cap send task wrote datagram");
         }
         debug!(device = %dev, "l2cap send task exiting");
     });
