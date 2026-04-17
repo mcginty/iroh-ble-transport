@@ -168,7 +168,13 @@ pub async fn run_peripheral_events(
                     subscribed,
                     "peripheral SubscriptionChanged"
                 );
-                continue;
+                if !subscribed {
+                    continue;
+                }
+                PeerCommand::PeripheralClientSubscribed {
+                    client_id,
+                    char_uuid,
+                }
             }
             PeripheralEvent::ReadRequest {
                 char_uuid,
