@@ -10,7 +10,7 @@ use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_ble_transport::transport::BleTransport;
 use iroh_ble_transport::{
-    BlePeerInfo, BlePeerPhase, Central, CentralConfig, ConnectPath, Peripheral,
+    BlePeerInfo, BlePeerPhase, Central, ConnectPath, Peripheral,
 };
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
@@ -186,13 +186,7 @@ async fn start_node(
     }
 
     let ble_transport: Arc<BleTransport> = {
-        let central = Arc::new(
-            Central::with_config(CentralConfig {
-                restore_identifier: Some("org.jakebot.iroh-ble-chat.central".into()),
-            })
-            .await
-            .map_err(|e| e.to_string())?,
-        );
+        let central = Arc::new(Central::new().await.map_err(|e| e.to_string())?);
         let peripheral = Arc::new(Peripheral::new().await.map_err(|e| e.to_string())?);
         let local_id = st.secret_key.public();
         let transport = BleTransport::new(local_id, central, peripheral).await.map_err(|e| {
@@ -1139,9 +1133,13 @@ pub fn run() {
                         "iroh_ble_transport=debug,iroh_gossip=info,iroh_ble_chat=debug,iroh_ble_chat_lib=debug,blew=info,warn",
                     )
                 });
+            let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+            #[cfg(target_os = "ios")]
+            let fmt_layer = fmt_layer.with_ansi(false);
+
             tracing_subscriber::registry()
                 .with(env_filter)
-                .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
+                .with(fmt_layer)
                 .with(debug_layer)
                 .init();
             Ok(())

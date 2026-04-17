@@ -60,8 +60,6 @@ targets:
           - _http._tcp
           - _https._tcp
         NSBluetoothAlwaysUsageDescription: "This app uses Bluetooth to discover and connect to nearby iroh peers."
-        UIBackgroundModes:
-          - bluetooth-central
         NSCameraUsageDescription: "This app uses the camera to scan QR code invitation links."
         NSPhotoLibraryUsageDescription: "This app accesses your photo library to share images in chat."
     entitlements:
