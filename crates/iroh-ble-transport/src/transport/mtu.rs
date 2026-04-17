@@ -62,7 +62,11 @@ pub async fn resolve_chunk_size(iface: &dyn BleInterface, device_id: &DeviceId) 
             break m;
         }
         if Instant::now() >= deadline {
-            tracing::warn!(
+            // Some backends (Linux blew stub, platforms where negotiation
+            // never completes) leave us at 23 forever. The fragment canary
+            // catches mis-sized fallbacks loudly, so this is an expected
+            // path rather than an operator-actionable warning.
+            tracing::info!(
                 device = %device_id,
                 last_seen = m,
                 "MTU never reached MIN_SANE_MTU, falling back"

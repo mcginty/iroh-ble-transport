@@ -459,7 +459,10 @@ impl BleInterface for BlewDriver {
             .await;
         match &result {
             Ok(()) => tracing::trace!(device = %device_id, len, "write_c2p ok"),
-            Err(e) => tracing::warn!(device = %device_id, len, err = %e, "write_c2p err"),
+            // Callers (ReliableChannel) handle the error — at this layer it
+            // is just "the radio refused a packet", not an operator-actionable
+            // warning.
+            Err(e) => tracing::debug!(device = %device_id, len, err = %e, "write_c2p err"),
         }
         result?;
         Ok(())
@@ -477,7 +480,7 @@ impl BleInterface for BlewDriver {
             .await;
         match &result {
             Ok(()) => tracing::trace!(device = %device_id, len, "notify_p2c ok"),
-            Err(e) => tracing::warn!(device = %device_id, len, err = %e, "notify_p2c err"),
+            Err(e) => tracing::debug!(device = %device_id, len, err = %e, "notify_p2c err"),
         }
         result?;
         Ok(())

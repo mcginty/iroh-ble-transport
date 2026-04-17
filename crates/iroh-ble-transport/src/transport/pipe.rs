@@ -324,7 +324,11 @@ fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout:
             }
             Err(_elapsed) => {
                 handle.abort();
-                tracing::warn!(
+                // The abort is the recovery path — we don't leak the worker
+                // and the new pipe is already serving traffic. Happens when
+                // the old GATT worker still has in-flight ACK-waits at swap
+                // time; not actionable, so debug rather than warn.
+                tracing::debug!(
                     device = %device_id,
                     "old pipe worker did not drain within handover timeout; aborted"
                 );
