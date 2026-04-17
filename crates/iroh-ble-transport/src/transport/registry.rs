@@ -146,13 +146,30 @@ impl Registry {
         now: std::time::Instant,
         endpoint_id: iroh_base::EndpointId,
     ) {
-        let _ = actions; // dedup pass + UpgradeToL2cap emission land in later tasks
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
         self.verified_prefixes.insert(prefix, endpoint_id);
         for entry in self.peers.values_mut() {
             if entry.prefix == Some(prefix) {
                 entry.verified_endpoint = Some(endpoint_id);
                 entry.verified_at = Some(now);
+            }
+        }
+        let to_cancel: Vec<DeviceId> = self
+            .peers
+            .iter()
+            .filter_map(|(did, e)| match &e.phase {
+                PeerPhase::PendingDial { prefix: p, .. } if *p == prefix => Some(did.clone()),
+                _ => None,
+            })
+            .collect();
+        for did in to_cancel {
+            if let Some(entry) = self.peers.get_mut(&did) {
+                let drain_acks = Self::drain_to_draining(
+                    entry,
+                    now,
+                    crate::transport::peer::DisconnectReason::DedupLoser,
+                );
+                actions.extend(drain_acks);
             }
         }
     }
@@ -719,6 +736,7 @@ impl Registry {
             StartConnect {
                 attempt: u32,
             },
+            PendingDialExpired,
             DrainingToDead,
             RestoringToDead,
             HandshakingL2capTimeout {
@@ -732,6 +750,9 @@ impl Registry {
                 PeerPhase::Reconnecting {
                     attempt, next_at, ..
                 } if *next_at <= tick_now => Some(TickAction::StartConnect { attempt: *attempt }),
+                PeerPhase::PendingDial { deadline, .. } if tick_now >= *deadline => {
+                    Some(TickAction::PendingDialExpired)
+                }
                 PeerPhase::Draining { since, .. }
                     if tick_now.saturating_duration_since(*since) > DRAINING_TIMEOUT =>
                 {
@@ -771,6 +792,17 @@ impl Registry {
                     actions.push(PeerAction::StartConnect {
                         device_id: device_id.clone(),
                         attempt,
+                    });
+                }
+                TickAction::PendingDialExpired => {
+                    entry.phase = PeerPhase::Connecting {
+                        attempt: 0,
+                        started: tick_now,
+                        path: crate::transport::peer::ConnectPath::Gatt,
+                    };
+                    actions.push(PeerAction::StartConnect {
+                        device_id: device_id.clone(),
+                        attempt: 0,
                     });
                 }
                 TickAction::DrainingToDead => {
@@ -3868,6 +3900,136 @@ mod tests {
             matches!(reg.peers[&peer_dev].phase, PeerPhase::Connecting { .. }),
             "higher side must transition to Connecting; got {:?}",
             reg.peers[&peer_dev].phase,
+        );
+    }
+
+    #[test]
+    fn pending_dial_expires_into_connecting_on_tick() {
+        use crate::transport::peer::{PeerPhase, PendingSend};
+        use crate::transport::routing::prefix_from_endpoint;
+        use std::time::Duration;
+
+        // [0xFF;32] yields a lower prefix than [0x01;32] for Ed25519 (same as
+        // lower_prefix_side_enters_pending_dial).
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+        let peer_dev = DeviceId::from("peer-high");
+
+        // Invariant guard: Ed25519 may flip ordering. Fix seeds if this fires.
+        let my_prefix = prefix_from_endpoint(&my_ep);
+        assert!(
+            my_prefix < peer_prefix,
+            "test invariant: my_prefix must be < peer_prefix",
+        );
+
+        reg.peers
+            .insert(peer_dev.clone(), PeerEntry::new(peer_dev.clone()));
+        reg.peers
+            .get_mut(&peer_dev)
+            .unwrap()
+            .pending_sends
+            .push_back(PendingSend {
+                tx_gen: 0,
+                datagram: bytes::Bytes::from_static(b"x"),
+                waker: noop_waker(),
+            });
+
+        let _ = reg.handle(PeerCommand::Advertised {
+            prefix: peer_prefix,
+            device: blew::BleDevice {
+                id: peer_dev.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+        let deadline = match reg.peers[&peer_dev].phase {
+            PeerPhase::PendingDial { deadline, .. } => deadline,
+            ref other => panic!("expected PendingDial, got {other:?}"),
+        };
+
+        let actions = reg.handle(PeerCommand::Tick(deadline + Duration::from_millis(10)));
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartConnect { .. })),
+            "deadline expiry must emit StartConnect; got {actions:?}",
+        );
+        assert!(
+            matches!(reg.peers[&peer_dev].phase, PeerPhase::Connecting { .. }),
+            "pending-dial must advance to Connecting; got {:?}",
+            reg.peers[&peer_dev].phase,
+        );
+    }
+
+    #[test]
+    fn pending_dial_cancelled_when_verified_endpoint_arrives_for_same_prefix() {
+        use crate::transport::peer::{DisconnectReason, PeerPhase, PendingSend};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        // [0xFF;32] yields a lower prefix than [0x01;32] for Ed25519.
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+        let pending_dev = DeviceId::from("pending-for-peer");
+
+        let my_prefix = prefix_from_endpoint(&my_ep);
+        assert!(my_prefix < peer_prefix, "test invariant: my < peer");
+
+        reg.peers
+            .insert(pending_dev.clone(), PeerEntry::new(pending_dev.clone()));
+        reg.peers
+            .get_mut(&pending_dev)
+            .unwrap()
+            .pending_sends
+            .push_back(PendingSend {
+                tx_gen: 0,
+                datagram: bytes::Bytes::from_static(b"x"),
+                waker: noop_waker(),
+            });
+        let _ = reg.handle(PeerCommand::Advertised {
+            prefix: peer_prefix,
+            device: blew::BleDevice {
+                id: pending_dev.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+        assert!(matches!(
+            reg.peers[&pending_dev].phase,
+            PeerPhase::PendingDial { .. },
+        ));
+
+        // A separate PeerEntry (e.g. peripheral-side of the same peer) will
+        // ultimately be the one that verified. Create it with the matching prefix
+        // so handle_verified_endpoint stamps it (and subsequently the PendingDial
+        // entry gets cancelled).
+        let periph_dev = DeviceId::from("periph-for-peer");
+        reg.peers
+            .insert(periph_dev.clone(), PeerEntry::new(periph_dev.clone()));
+        reg.peers.get_mut(&periph_dev).unwrap().prefix = Some(peer_prefix);
+
+        let _ = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_ep,
+        });
+
+        assert!(
+            matches!(
+                &reg.peers[&pending_dev].phase,
+                PeerPhase::Draining {
+                    reason: DisconnectReason::DedupLoser,
+                    ..
+                },
+            ),
+            "pending-dial entry must be drained as DedupLoser; got {:?}",
+            reg.peers[&pending_dev].phase,
         );
     }
 }
