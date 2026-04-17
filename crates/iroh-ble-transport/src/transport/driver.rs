@@ -105,50 +105,7 @@ impl<I: BleInterface> Driver<I> {
             }
 
             PeerAction::OpenL2cap { device_id } => {
-                let iface = Arc::clone(&self.iface);
-                let inbox = self.inbox.clone();
-                let dev_for_msg = device_id.clone();
-                tokio::spawn(async move {
-                    let result =
-                        tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
-                            let psm = match iface.read_psm(&device_id).await {
-                                Ok(Some(psm)) => psm,
-                                Ok(None) => return Err("no psm advertised".to_string()),
-                                Err(e) => return Err(format!("read_psm: {e}")),
-                            };
-                            iface
-                                .open_l2cap(&device_id, psm)
-                                .await
-                                .map_err(|e| format!("{e}"))
-                        })
-                        .await;
-                    match result {
-                        Ok(Ok(channel)) => {
-                            let _ = inbox
-                                .send(PeerCommand::OpenL2capSucceeded {
-                                    device_id: dev_for_msg,
-                                    channel,
-                                })
-                                .await;
-                        }
-                        Ok(Err(error)) => {
-                            let _ = inbox
-                                .send(PeerCommand::OpenL2capFailed {
-                                    device_id: dev_for_msg,
-                                    error,
-                                })
-                                .await;
-                        }
-                        Err(_elapsed) => {
-                            let _ = inbox
-                                .send(PeerCommand::OpenL2capFailed {
-                                    device_id: dev_for_msg,
-                                    error: "l2cap select timeout".into(),
-                                })
-                                .await;
-                        }
-                    }
-                });
+                self.spawn_l2cap_open(device_id);
             }
 
             PeerAction::CloseChannel { device_id, .. } => {
@@ -253,10 +210,57 @@ impl<I: BleInterface> Driver<I> {
                     tracing::debug!("inbox closed before DataPipeReady forwarded");
                 }
             }
-            PeerAction::UpgradeToL2cap { .. }
-            | PeerAction::SwapPipeToL2cap { .. }
-            | PeerAction::RevertToGattPipe { .. } => {}
+            PeerAction::UpgradeToL2cap { device_id } => {
+                self.spawn_l2cap_open(device_id);
+            }
+            PeerAction::SwapPipeToL2cap { .. } | PeerAction::RevertToGattPipe { .. } => {}
         }
+    }
+
+    fn spawn_l2cap_open(&self, device_id: blew::DeviceId) {
+        let iface = Arc::clone(&self.iface);
+        let inbox = self.inbox.clone();
+        let dev_for_msg = device_id.clone();
+        tokio::spawn(async move {
+            let result = tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
+                let psm = match iface.read_psm(&device_id).await {
+                    Ok(Some(psm)) => psm,
+                    Ok(None) => return Err("no psm advertised".to_string()),
+                    Err(e) => return Err(format!("read_psm: {e}")),
+                };
+                iface
+                    .open_l2cap(&device_id, psm)
+                    .await
+                    .map_err(|e| format!("{e}"))
+            })
+            .await;
+            match result {
+                Ok(Ok(channel)) => {
+                    let _ = inbox
+                        .send(PeerCommand::OpenL2capSucceeded {
+                            device_id: dev_for_msg,
+                            channel,
+                        })
+                        .await;
+                }
+                Ok(Err(error)) => {
+                    let _ = inbox
+                        .send(PeerCommand::OpenL2capFailed {
+                            device_id: dev_for_msg,
+                            error,
+                        })
+                        .await;
+                }
+                Err(_elapsed) => {
+                    let _ = inbox
+                        .send(PeerCommand::OpenL2capFailed {
+                            device_id: dev_for_msg,
+                            error: "l2cap select timeout".into(),
+                        })
+                        .await;
+                }
+            }
+        });
     }
 }
 
@@ -575,6 +579,44 @@ mod tests {
                 assert_eq!(device_id, blew::DeviceId::from("start-pipe-peri"));
             }
             other => panic!("expected DataPipeReady, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_to_l2cap_reads_psm_and_emits_open_l2cap_succeeded() {
+        let iface = Arc::new(MockBleInterface::new());
+        let device_id = blew::DeviceId::from("upgrade");
+        let psm = 0x0080u16;
+        iface.seed_psm(Some(psm));
+        let (chan, _other) = blew::L2capChannel::pair(1024);
+        iface.on_open_l2cap(device_id.clone(), psm, Ok(chan));
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+        );
+
+        driver
+            .execute(PeerAction::UpgradeToL2cap {
+                device_id: device_id.clone(),
+            })
+            .await;
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match cmd {
+            PeerCommand::OpenL2capSucceeded { device_id: got, .. } => {
+                assert_eq!(got, device_id);
+            }
+            other => panic!("expected OpenL2capSucceeded, got {other:?}"),
         }
     }
 
