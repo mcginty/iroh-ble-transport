@@ -233,7 +233,7 @@ impl Registry {
             return;
         }
         entry.role = crate::transport::peer::ConnectRole::Peripheral;
-        entry.tx_gen = entry.tx_gen.saturating_add(1);
+        entry.tx_gen += 1;
         entry.phase = PeerPhase::Connected {
             since: now,
             channel: crate::transport::peer::ChannelHandle {
@@ -2632,7 +2632,7 @@ mod tests {
 
     #[test]
     fn peripheral_client_subscribed_idempotent_for_second_char() {
-        use crate::transport::peer::PeerPhase;
+        use crate::transport::peer::{ConnectRole, PeerPhase};
         use uuid::uuid;
 
         let mut reg = Registry::new_for_test();
@@ -2659,6 +2659,7 @@ mod tests {
             PeerPhase::Connected { tx_gen, .. } => assert_eq!(tx_gen, tx_gen_after_first),
             _ => panic!(),
         }
+        assert_eq!(reg.peers[&client].role, ConnectRole::Peripheral);
     }
 
     #[tokio::test]
