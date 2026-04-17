@@ -275,9 +275,13 @@ pub enum PeerCommand {
     /// Emitted by run_peripheral_events when a remote central subscribes
     /// to C2P or P2C. Registry materializes a Connected{Gatt} PeerEntry
     /// with role=Peripheral so peripheral-side traffic is visible to dedup.
+    /// `prefix` is filled in when scan has already observed this DeviceId —
+    /// without it the inbound entry can't be collapsed with its outbound
+    /// sibling during the dedup pass, so the UI lists it separately.
     PeripheralClientSubscribed {
         client_id: DeviceId,
         char_uuid: uuid::Uuid,
+        prefix: Option<KeyPrefix>,
     },
     /// Emitted by the L2CAP pipe worker when its outbound write has been
     /// blocked on backpressure for longer than L2CAP_HANDOVER_TIMEOUT.
@@ -415,6 +419,7 @@ mod tests {
         let _cmd2 = PeerCommand::PeripheralClientSubscribed {
             client_id: DeviceId::from("x"),
             char_uuid: uuid::Uuid::nil(),
+            prefix: None,
         };
         let _cmd3 = PeerCommand::L2capHandoverTimeout {
             device_id: DeviceId::from("x"),

@@ -107,17 +107,22 @@ impl TransportRouting {
     /// if its advertising has been noted, otherwise fall back to a
     /// device-keyed token.
     pub fn mint_token_for_source(&self, device: &DeviceId) -> Token {
-        let prefix = {
-            let inner = self.inner.lock().expect("routing mutex poisoned");
-            inner
-                .discovered
-                .iter()
-                .find_map(|(p, d)| (d == device).then_some(*p))
-        };
-        match prefix {
+        match self.prefix_for_device(device) {
             Some(prefix) => self.mint_token_for_prefix(prefix),
             None => self.mint_token_for_device(device),
         }
+    }
+
+    /// Reverse-lookup the `KeyPrefix` that currently maps to `device`, if any.
+    /// Used by the peripheral event pump to stamp inbound peripheral-role
+    /// PeerEntries with the peer identity learned from scanning, so dedup can
+    /// collapse central+peripheral entries for the same peer.
+    pub fn prefix_for_device(&self, device: &DeviceId) -> Option<KeyPrefix> {
+        let inner = self.inner.lock().expect("routing mutex poisoned");
+        inner
+            .discovered
+            .iter()
+            .find_map(|(p, d)| (d == device).then_some(*p))
     }
 
     /// Resolve a token back to the `DeviceId` that should receive outbound
@@ -265,6 +270,22 @@ mod tests {
         let d = blew::DeviceId::from("unknown-mac");
         let t = r.mint_token_for_source(&d);
         assert_eq!(r.device_for_token(t).as_ref(), Some(&d));
+    }
+
+    #[test]
+    fn prefix_for_device_returns_none_when_undiscovered() {
+        let r = TransportRouting::new();
+        let d = blew::DeviceId::from("unseen");
+        assert!(r.prefix_for_device(&d).is_none());
+    }
+
+    #[test]
+    fn prefix_for_device_returns_prefix_after_discovery() {
+        let r = TransportRouting::new();
+        let p: KeyPrefix = [7u8; KEY_PREFIX_LEN];
+        let d = blew::DeviceId::from("seen");
+        r.note_discovery(p, d.clone());
+        assert_eq!(r.prefix_for_device(&d), Some(p));
     }
 
     #[test]

@@ -126,6 +126,7 @@ pub async fn run_central_events(
 /// `inbox` is closed.
 pub async fn run_peripheral_events(
     peripheral: Arc<Peripheral>,
+    routing: Arc<TransportRouting>,
     inbox: mpsc::Sender<PeerCommand>,
     psm: Option<u16>,
 ) {
@@ -171,9 +172,11 @@ pub async fn run_peripheral_events(
                 if !subscribed {
                     continue;
                 }
+                let prefix = routing.prefix_for_device(&client_id);
                 PeerCommand::PeripheralClientSubscribed {
                     client_id,
                     char_uuid,
+                    prefix,
                 }
             }
             PeripheralEvent::ReadRequest {

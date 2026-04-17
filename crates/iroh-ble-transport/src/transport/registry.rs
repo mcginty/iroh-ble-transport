@@ -148,8 +148,15 @@ impl Registry {
             PeerCommand::PeripheralClientSubscribed {
                 client_id,
                 char_uuid,
+                prefix,
             } => {
-                self.handle_peripheral_client_subscribed(&mut actions, now, client_id, char_uuid);
+                self.handle_peripheral_client_subscribed(
+                    &mut actions,
+                    now,
+                    client_id,
+                    char_uuid,
+                    prefix,
+                );
             }
             PeerCommand::L2capHandoverTimeout { device_id } => {
                 self.handle_l2cap_handover_timeout(&mut actions, device_id);
@@ -261,11 +268,22 @@ impl Registry {
         now: std::time::Instant,
         client_id: DeviceId,
         _char_uuid: uuid::Uuid,
+        prefix: Option<crate::transport::peer::KeyPrefix>,
     ) {
+        let verified = prefix.and_then(|p| self.verified_prefixes.get(&p).copied());
         let entry = self
             .peers
             .entry(client_id.clone())
             .or_insert_with(|| PeerEntry::new(client_id.clone()));
+        if let Some(p) = prefix {
+            entry.prefix = Some(p);
+        }
+        if let Some(eid) = verified
+            && entry.verified_endpoint.is_none()
+        {
+            entry.verified_endpoint = Some(eid);
+            entry.verified_at = Some(now);
+        }
         // Idempotent across C2P/P2C: if we already materialized a
         // Peripheral-role Connected entry on the first subscribe, the second
         // characteristic's SubscriptionChanged must not restart the pipe.
@@ -2729,6 +2747,7 @@ mod tests {
         let actions = reg.handle(PeerCommand::PeripheralClientSubscribed {
             client_id: client.clone(),
             char_uuid: uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2"),
+            prefix: None,
         });
         let entry = reg.peers.get(&client).expect("entry created");
         assert_eq!(entry.role, ConnectRole::Peripheral);
@@ -2756,6 +2775,7 @@ mod tests {
         let _ = reg.handle(PeerCommand::PeripheralClientSubscribed {
             client_id: client.clone(),
             char_uuid: uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2"),
+            prefix: None,
         });
         let tx_gen_after_first = match reg.peers[&client].phase {
             PeerPhase::Connected { tx_gen, .. } => tx_gen,
@@ -2764,6 +2784,7 @@ mod tests {
         let actions = reg.handle(PeerCommand::PeripheralClientSubscribed {
             client_id: client.clone(),
             char_uuid: uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2"),
+            prefix: None,
         });
         assert!(
             !actions
@@ -2776,6 +2797,42 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(reg.peers[&client].role, ConnectRole::Peripheral);
+    }
+
+    #[test]
+    fn peripheral_client_subscribed_with_known_prefix_is_eligible_for_dedup() {
+        use crate::transport::peer::{ConnectRole, KEY_PREFIX_LEN, PeerPhase};
+        use iroh_base::SecretKey;
+        use uuid::uuid;
+
+        let mut reg = Registry::new_for_test();
+        let peer_secret = SecretKey::from_bytes(&[9u8; 32]);
+        let peer_endpoint = peer_secret.public();
+        let prefix: [u8; KEY_PREFIX_LEN] = peer_endpoint.as_bytes()[..KEY_PREFIX_LEN]
+            .try_into()
+            .unwrap();
+
+        // Simulate having already verified the peer via a prior central-role handshake.
+        reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_endpoint,
+        });
+
+        let client = DeviceId::from("inbound-verified");
+        reg.handle(PeerCommand::PeripheralClientSubscribed {
+            client_id: client.clone(),
+            char_uuid: uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2"),
+            prefix: Some(prefix),
+        });
+
+        let entry = reg.peers.get(&client).expect("entry created");
+        assert_eq!(entry.role, ConnectRole::Peripheral);
+        assert_eq!(entry.prefix, Some(prefix));
+        assert_eq!(
+            entry.verified_endpoint,
+            Some(peer_endpoint),
+            "peripheral entry must be stamped so dedup can collapse it"
+        );
+        assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
     }
 
     #[tokio::test]
