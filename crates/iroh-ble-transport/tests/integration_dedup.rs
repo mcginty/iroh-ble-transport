@@ -17,7 +17,7 @@ use iroh_ble_transport::transport::{
     registry::{PhaseKind, Registry, SnapshotMaps},
     routing::prefix_from_endpoint,
     store::InMemoryPeerStore,
-    test_util::MockBleInterface,
+    test_util::{CallKind, MockBleInterface},
     transport::L2capPolicy,
 };
 use tokio::sync::mpsc;
@@ -315,6 +315,153 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
         b_peer.role,
         ConnectRole::Peripheral,
         "B (lower endpoint) keeps the Peripheral role after dedup"
+    );
+}
+
+// ─── Task 20 ─────────────────────────────────────────────────────────────────
+
+/// After a peer is verified (VerifiedEndpoint received), repeated
+/// advertisements from that peer must NOT trigger new StartConnect actions.
+/// The verified+live guard in handle_advertised short-circuits the dial path.
+#[tokio::test(flavor = "multi_thread")]
+async fn advertising_flood_does_not_redial_after_verified() {
+    let ep_a = endpoint_with_byte(0xFF);
+    let ep_b = endpoint_with_byte(0x01);
+
+    let dev_a = DeviceId::from("flood-a");
+    let dev_b = DeviceId::from("flood-b");
+
+    let (a_inbox_tx, a_inbox_rx) = mpsc::channel::<PeerCommand>(256);
+
+    let iface_a = Arc::new(MockBleInterface::new());
+    // Wire c2p write → b's inbox (we don't care about B's actual registry here;
+    // we only need the GATT fragment to flow so B's pipe comes up).
+    let (b_inbox_tx, _b_inbox_rx) = mpsc::channel::<PeerCommand>(256);
+    {
+        let inbox = b_inbox_tx.clone();
+        let from = dev_a.clone();
+        iface_a.set_on_c2p_write(Box::new(move |_target, bytes| {
+            let _ = inbox.try_send(PeerCommand::InboundGattFragment {
+                device_id: from.clone(),
+                source: iroh_ble_transport::transport::peer::FragmentSource::PeripheralReceivedC2p,
+                bytes,
+            });
+        }));
+    }
+
+    let a = spawn_node_with_endpoint(
+        dev_a.clone(),
+        a_inbox_tx.clone(),
+        a_inbox_rx,
+        Arc::clone(&iface_a),
+        L2capPolicy::Disabled,
+        ep_a,
+    );
+
+    // Use the endpoint-derived prefix so VerifiedEndpoint can match the entry.
+    let prefix_b = prefix_from_endpoint(&ep_b);
+
+    let (waker_tx, _) = mpsc::channel::<()>(1);
+    let waker = waker_from_channel(waker_tx);
+
+    // Establish connection: advertise B to A, then send a datagram to kick the dial.
+    a.inbox_tx
+        .send(PeerCommand::Advertised {
+            prefix: prefix_b,
+            device: ble_device(&dev_b),
+            rssi: None,
+        })
+        .await
+        .unwrap();
+    a.inbox_tx
+        .send(PeerCommand::SendDatagram {
+            device_id: dev_b.clone(),
+            tx_gen: 0,
+            datagram: Bytes::from_static(b"initial"),
+            waker,
+        })
+        .await
+        .unwrap();
+
+    // Wait for the initial Connect call.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if iface_a
+                .calls()
+                .iter()
+                .any(|c| matches!(c, CallKind::Connect(_)))
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A never issued a Connect call");
+
+    // Wait for Connected state.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = a.snapshots.load();
+            if snap
+                .peer_states
+                .get(&dev_b)
+                .map(|s| s.phase_kind == PhaseKind::Connected)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("A never reached Connected with B");
+
+    // Mark B's prefix as verified.
+    a.inbox_tx
+        .send(PeerCommand::VerifiedEndpoint {
+            endpoint_id: ep_b,
+        })
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Snapshot the Connect call count before the flood.
+    let connect_count_before = iface_a
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, CallKind::Connect(_)))
+        .count();
+
+    // Flood A with 20 more advertisements from B.
+    for _ in 0..20 {
+        a.inbox_tx
+            .send(PeerCommand::Advertised {
+                prefix: prefix_b,
+                device: ble_device(&dev_b),
+                rssi: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    // Let the registry process all messages.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let connect_count_after = iface_a
+        .calls()
+        .iter()
+        .filter(|c| matches!(c, CallKind::Connect(_)))
+        .count();
+
+    assert_eq!(
+        connect_count_after,
+        connect_count_before,
+        "verified peer must not be redialled after {} floods; connect count grew from {} to {}",
+        20,
+        connect_count_before,
+        connect_count_after,
     );
 }
 
