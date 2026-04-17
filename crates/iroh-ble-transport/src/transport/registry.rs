@@ -32,6 +32,7 @@ pub struct Registry {
     /// Populated by VerifiedEndpoint; consulted by handle_advertised (Task 4)
     /// and the dedup pass (Task 7).
     verified_prefixes: HashMap<crate::transport::peer::KeyPrefix, iroh_base::EndpointId>,
+    my_endpoint: iroh_base::EndpointId,
     my_prefix: crate::transport::peer::KeyPrefix,
 }
 
@@ -42,6 +43,7 @@ impl Registry {
             peers: HashMap::new(),
             l2cap_policy,
             verified_prefixes: HashMap::new(),
+            my_endpoint,
             my_prefix,
         }
     }
@@ -170,6 +172,38 @@ impl Registry {
                     crate::transport::peer::DisconnectReason::DedupLoser,
                 );
                 actions.extend(drain_acks);
+            }
+        }
+
+        let candidates: Vec<DeviceId> = self
+            .peers
+            .iter()
+            .filter(|(_, e)| {
+                e.prefix == Some(prefix) && matches!(e.phase, PeerPhase::Connected { .. })
+            })
+            .map(|(did, _)| did.clone())
+            .collect();
+        if candidates.len() >= 2 {
+            let my_endpoint = self.my_endpoint;
+            let winner = candidates
+                .iter()
+                .find(|did| {
+                    let role = self.peers[*did].role;
+                    crate::transport::dedup::should_win(role, &my_endpoint, &endpoint_id)
+                })
+                .cloned();
+            for did in candidates {
+                if Some(&did) == winner.as_ref() {
+                    continue;
+                }
+                if let Some(entry) = self.peers.get_mut(&did) {
+                    let drain_acks = Self::drain_to_draining(
+                        entry,
+                        now,
+                        crate::transport::peer::DisconnectReason::DedupLoser,
+                    );
+                    actions.extend(drain_acks);
+                }
             }
         }
     }
@@ -4030,6 +4064,127 @@ mod tests {
             ),
             "pending-dial entry must be drained as DedupLoser; got {:?}",
             reg.peers[&pending_dev].phase,
+        );
+    }
+
+    #[test]
+    fn dedup_drains_loser_keeping_winner_by_endpoint_tiebreaker() {
+        use crate::transport::peer::{
+            ChannelHandle, ConnectPath, ConnectRole, DisconnectReason, PeerPhase,
+        };
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x80u8; 32]).public();
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        assert!(
+            my_ep.as_bytes() > peer_ep.as_bytes(),
+            "test invariant: my_endpoint must be > peer_endpoint bytewise",
+        );
+
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+
+        let dev_c = DeviceId::from("central-side");
+        let dev_p = DeviceId::from("peripheral-side");
+        for (did, role) in [
+            (&dev_c, ConnectRole::Central),
+            (&dev_p, ConnectRole::Peripheral),
+        ] {
+            reg.peers.insert(did.clone(), PeerEntry::new(did.clone()));
+            let e = reg.peers.get_mut(did).unwrap();
+            e.prefix = Some(peer_prefix);
+            e.role = role;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let _ = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_ep,
+        });
+
+        assert!(
+            matches!(&reg.peers[&dev_c].phase, PeerPhase::Connected { .. }),
+            "HIGH side: central entry must survive; got {:?}",
+            reg.peers[&dev_c].phase,
+        );
+        assert!(
+            matches!(
+                &reg.peers[&dev_p].phase,
+                PeerPhase::Draining {
+                    reason: DisconnectReason::DedupLoser,
+                    ..
+                },
+            ),
+            "HIGH side: peripheral entry must drain as DedupLoser; got {:?}",
+            reg.peers[&dev_p].phase,
+        );
+    }
+
+    #[test]
+    fn dedup_lower_side_drains_own_central_keeps_peripheral() {
+        use crate::transport::peer::{
+            ChannelHandle, ConnectPath, ConnectRole, DisconnectReason, PeerPhase,
+        };
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0x80u8; 32]).public();
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        assert!(
+            my_ep.as_bytes() < peer_ep.as_bytes(),
+            "test invariant: my_endpoint must be < peer_endpoint bytewise",
+        );
+
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+        let dev_c = DeviceId::from("my-central");
+        let dev_p = DeviceId::from("my-peripheral");
+        for (did, role) in [
+            (&dev_c, ConnectRole::Central),
+            (&dev_p, ConnectRole::Peripheral),
+        ] {
+            reg.peers.insert(did.clone(), PeerEntry::new(did.clone()));
+            let e = reg.peers.get_mut(did).unwrap();
+            e.prefix = Some(peer_prefix);
+            e.role = role;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let _ = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_ep,
+        });
+
+        assert!(
+            matches!(&reg.peers[&dev_p].phase, PeerPhase::Connected { .. }),
+            "LOW side: peripheral entry must survive; got {:?}",
+            reg.peers[&dev_p].phase,
+        );
+        assert!(
+            matches!(
+                &reg.peers[&dev_c].phase,
+                PeerPhase::Draining {
+                    reason: DisconnectReason::DedupLoser,
+                    ..
+                },
+            ),
+            "LOW side: central entry must drain as DedupLoser; got {:?}",
+            reg.peers[&dev_c].phase,
         );
     }
 }
