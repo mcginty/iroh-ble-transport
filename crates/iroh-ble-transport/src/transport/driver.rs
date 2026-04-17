@@ -542,6 +542,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_data_pipe_spawns_pipe_and_emits_data_pipe_ready_peripheral() {
+        use crate::transport::peer::{ConnectPath, ConnectRole};
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+        );
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: blew::DeviceId::from("start-pipe-peri"),
+                role: ConnectRole::Peripheral,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match cmd {
+            PeerCommand::DataPipeReady { device_id, .. } => {
+                assert_eq!(device_id, blew::DeviceId::from("start-pipe-peri"));
+            }
+            other => panic!("expected DataPipeReady, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn start_connect_spawns_connect_and_forwards_success() {
         let iface = Arc::new(MockBleInterface::new());
         let (tx, mut rx) = mpsc::channel(16);
