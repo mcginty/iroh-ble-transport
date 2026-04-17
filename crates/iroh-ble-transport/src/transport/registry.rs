@@ -1085,6 +1085,18 @@ impl Registry {
                         channel: l2cap_chan,
                         swap_tx,
                     });
+                } else {
+                    // Pipe handles went away (e.g. DataPipeDown raced with the
+                    // upgrade). Drop the channel, clear upgrading, and mark the
+                    // upgrade failed so the stuck-in-upgrading trap is avoided.
+                    tracing::warn!(
+                        device = %device_id,
+                        "L2CAP upgrade succeeded but pipe handles absent; marking upgrade failed"
+                    );
+                    entry.l2cap_upgrade_failed = true;
+                    if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                        *upgrading = false;
+                    }
                 }
             }
             _ => {}
@@ -4305,6 +4317,52 @@ mod tests {
             "should NOT emit StartDataPipe for upgrade path; got {actions:?}"
         );
         let entry = reg.peer(&device_id).unwrap();
+        match &entry.phase {
+            PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
+            other => panic!("expected Connected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_l2cap_succeeded_without_pipe_handles_clears_upgrading_and_marks_failed() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
+
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-upgrade-ok-nopipe");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Central;
+            e.tx_gen = 2;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 2,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 2,
+                upgrading: true,
+            };
+            e.pipe = None;
+            e
+        });
+
+        let (l2cap_chan, _other) = blew::L2capChannel::pair(1024);
+        let actions = reg.handle(PeerCommand::OpenL2capSucceeded {
+            device_id: device_id.clone(),
+            channel: l2cap_chan,
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::SwapPipeToL2cap { .. })),
+            "should NOT emit SwapPipeToL2cap when pipe handles are absent; got {actions:?}"
+        );
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(
+            entry.l2cap_upgrade_failed,
+            "l2cap_upgrade_failed should be set so the peer is not stuck upgrading"
+        );
         match &entry.phase {
             PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
             other => panic!("expected Connected, got {other:?}"),
