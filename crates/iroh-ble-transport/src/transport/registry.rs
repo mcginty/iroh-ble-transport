@@ -28,6 +28,10 @@ pub(crate) const L2CAP_SELECT_TIMEOUT: std::time::Duration = std::time::Duration
 pub struct Registry {
     peers: HashMap<DeviceId, PeerEntry>,
     l2cap_policy: L2capPolicy,
+    /// Prefixes whose identity has been verified by iroh's QUIC handshake.
+    /// Populated by VerifiedEndpoint; consulted by handle_advertised (Task 4)
+    /// and the dedup pass (Task 7).
+    verified_prefixes: HashMap<crate::transport::peer::KeyPrefix, iroh_base::EndpointId>,
 }
 
 impl Registry {
@@ -35,6 +39,7 @@ impl Registry {
         Self {
             peers: HashMap::new(),
             l2cap_policy,
+            verified_prefixes: HashMap::new(),
         }
     }
 
@@ -112,11 +117,30 @@ impl Registry {
                 got,
                 want,
             } => self.handle_protocol_version_mismatch(&mut actions, now, device_id, got, want),
-            PeerCommand::VerifiedEndpoint { .. }
-            | PeerCommand::PeripheralClientSubscribed { .. }
+            PeerCommand::VerifiedEndpoint { endpoint_id } => {
+                self.handle_verified_endpoint(&mut actions, now, endpoint_id);
+            }
+            PeerCommand::PeripheralClientSubscribed { .. }
             | PeerCommand::L2capHandoverTimeout { .. } => {}
         }
         actions
+    }
+
+    fn handle_verified_endpoint(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        endpoint_id: iroh_base::EndpointId,
+    ) {
+        let _ = actions; // dedup pass + UpgradeToL2cap emission land in later tasks
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
+        self.verified_prefixes.insert(prefix, endpoint_id);
+        for entry in self.peers.values_mut() {
+            if entry.prefix == Some(prefix) {
+                entry.verified_endpoint = Some(endpoint_id);
+                entry.verified_at = Some(now);
+            }
+        }
     }
 
     fn handle_advertised(
@@ -3527,5 +3551,51 @@ mod tests {
             rssi: None,
         });
         assert_eq!(reg.peer(&device.id).unwrap().prefix, Some(prefix));
+    }
+
+    #[test]
+    fn verified_endpoint_stamps_all_matching_prefix_entries() {
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let mut reg = Registry::new_for_test();
+        let endpoint = iroh_base::SecretKey::from_bytes(&[7u8; 32]).public();
+        let prefix = prefix_from_endpoint(&endpoint);
+
+        // Two entries, same prefix (central view + peripheral view).
+        let dev_c = DeviceId::from("central-view");
+        let dev_p = DeviceId::from("peripheral-view");
+        for did in [&dev_c, &dev_p] {
+            reg.peers.insert(did.clone(), PeerEntry::new(did.clone()));
+            let e = reg.peers.get_mut(did).unwrap();
+            e.prefix = Some(prefix);
+        }
+
+        let _actions = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: endpoint,
+        });
+
+        assert_eq!(reg.verified_prefixes.get(&prefix), Some(&endpoint));
+        assert_eq!(reg.peers[&dev_c].verified_endpoint, Some(endpoint));
+        assert_eq!(reg.peers[&dev_p].verified_endpoint, Some(endpoint));
+    }
+
+    #[test]
+    fn verified_endpoint_ignores_entries_with_different_prefix() {
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let mut reg = Registry::new_for_test();
+        let ep_a = iroh_base::SecretKey::from_bytes(&[1u8; 32]).public();
+        let ep_b = iroh_base::SecretKey::from_bytes(&[2u8; 32]).public();
+
+        let dev = DeviceId::from("peer-b");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        reg.peers.get_mut(&dev).unwrap().prefix = Some(prefix_from_endpoint(&ep_b));
+
+        let _ = reg.handle(PeerCommand::VerifiedEndpoint { endpoint_id: ep_a });
+
+        assert!(
+            reg.peers[&dev].verified_endpoint.is_none(),
+            "entry for different prefix must not be stamped"
+        );
     }
 }
