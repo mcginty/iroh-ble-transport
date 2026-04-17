@@ -212,7 +212,56 @@ impl<I: BleInterface> Driver<I> {
             PeerAction::UpgradeToL2cap { device_id } => {
                 self.spawn_l2cap_open(device_id);
             }
-            PeerAction::SwapPipeToL2cap { .. } | PeerAction::RevertToGattPipe { .. } => {}
+            PeerAction::SwapPipeToL2cap {
+                device_id,
+                channel,
+                swap_tx,
+            } => {
+                tokio::spawn(async move {
+                    if swap_tx.send(channel).await.is_err() {
+                        tracing::warn!(device = %device_id, "swap_tx closed; pipe supervisor already gone");
+                    }
+                });
+            }
+            PeerAction::RevertToGattPipe { device_id } => {
+                tracing::debug!(device = %device_id, "RevertToGattPipe: spawning fresh GATT pipe");
+                let (outbound_tx, outbound_rx) =
+                    mpsc::channel::<crate::transport::peer::PendingSend>(32);
+                let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(64);
+                let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+                let iface: Arc<dyn BleInterface> = Arc::clone(&self.iface) as Arc<dyn BleInterface>;
+                let incoming_tx = self.incoming_tx.clone();
+                let inbox = self.inbox.clone();
+                let retransmit_counter = Arc::clone(&self.retransmit_counter);
+                let truncation_counter = Arc::clone(&self.truncation_counter);
+                let dev_for_ready = device_id.clone();
+                tokio::spawn(async move {
+                    run_data_pipe(
+                        iface,
+                        device_id,
+                        crate::transport::peer::ConnectRole::Central,
+                        crate::transport::peer::ConnectPath::Gatt,
+                        None,
+                        outbound_rx,
+                        inbound_rx,
+                        incoming_tx,
+                        inbox,
+                        swap_rx,
+                        retransmit_counter,
+                        truncation_counter,
+                    )
+                    .await;
+                });
+                let ready = PeerCommand::DataPipeReady {
+                    device_id: dev_for_ready,
+                    outbound_tx,
+                    inbound_tx,
+                    swap_tx,
+                };
+                if self.inbox.send(ready).await.is_err() {
+                    tracing::debug!("inbox closed before DataPipeReady (revert) forwarded");
+                }
+            }
         }
     }
 
@@ -616,6 +665,69 @@ mod tests {
                 assert_eq!(got, device_id);
             }
             other => panic!("expected OpenL2capSucceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn swap_pipe_to_l2cap_sends_channel_to_swap_tx() {
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, _rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+        );
+
+        let (swap_tx, mut swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+        let (chan, _other) = blew::L2capChannel::pair(1024);
+        driver
+            .execute(PeerAction::SwapPipeToL2cap {
+                device_id: blew::DeviceId::from("swap-dev"),
+                channel: chan,
+                swap_tx,
+            })
+            .await;
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), swap_rx.recv())
+            .await
+            .expect("timed out waiting for channel on swap_rx")
+            .expect("swap_rx closed unexpectedly");
+        drop(received);
+    }
+
+    #[tokio::test]
+    async fn revert_to_gatt_pipe_emits_data_pipe_ready() {
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+        );
+
+        driver
+            .execute(PeerAction::RevertToGattPipe {
+                device_id: blew::DeviceId::from("revert-dev"),
+            })
+            .await;
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match cmd {
+            PeerCommand::DataPipeReady { device_id, .. } => {
+                assert_eq!(device_id, blew::DeviceId::from("revert-dev"));
+            }
+            other => panic!("expected DataPipeReady after revert, got {other:?}"),
         }
     }
 

@@ -1045,36 +1045,50 @@ impl Registry {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
-        if !matches!(entry.phase, PeerPhase::Handshaking { .. }) {
-            return;
-        }
-        let gatt_channel = match &entry.phase {
-            PeerPhase::Handshaking { channel, .. } => channel.clone(),
-            _ => {
-                tracing::warn!(device = %device_id, "phase changed unexpectedly during L2CAP success");
-                return;
+        match &entry.phase {
+            PeerPhase::Handshaking { .. } => {
+                let gatt_channel = match &entry.phase {
+                    PeerPhase::Handshaking { channel, .. } => channel.clone(),
+                    _ => unreachable!(),
+                };
+                let l2cap_handle = crate::transport::peer::ChannelHandle {
+                    id: gatt_channel.id,
+                    path: crate::transport::peer::ConnectPath::L2cap,
+                };
+                entry.l2cap_channel = Some(l2cap_chan);
+                entry.tx_gen += 1;
+                let tx_gen = entry.tx_gen;
+                entry.phase = PeerPhase::Connected {
+                    since: now,
+                    channel: l2cap_handle,
+                    tx_gen,
+                    upgrading: false,
+                };
+                let role = entry.role;
+                actions.push(PeerAction::StartDataPipe {
+                    device_id: device_id.clone(),
+                    role,
+                    path: crate::transport::peer::ConnectPath::L2cap,
+                    l2cap_channel: entry.l2cap_channel.take(),
+                });
             }
-        };
-        let l2cap_handle = crate::transport::peer::ChannelHandle {
-            id: gatt_channel.id,
-            path: crate::transport::peer::ConnectPath::L2cap,
-        };
-        entry.l2cap_channel = Some(l2cap_chan);
-        entry.tx_gen += 1;
-        let tx_gen = entry.tx_gen;
-        entry.phase = PeerPhase::Connected {
-            since: now,
-            channel: l2cap_handle,
-            tx_gen,
-            upgrading: false,
-        };
-        let role = entry.role;
-        actions.push(PeerAction::StartDataPipe {
-            device_id: device_id.clone(),
-            role,
-            path: crate::transport::peer::ConnectPath::L2cap,
-            l2cap_channel: entry.l2cap_channel.take(),
-        });
+            PeerPhase::Connected {
+                upgrading: true, ..
+            } => {
+                if let Some(handles) = &entry.pipe {
+                    let swap_tx = handles.swap_tx.clone();
+                    if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                        *upgrading = false;
+                    }
+                    actions.push(PeerAction::SwapPipeToL2cap {
+                        device_id,
+                        channel: l2cap_chan,
+                        swap_tx,
+                    });
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_open_l2cap_failed(
@@ -1087,34 +1101,42 @@ impl Registry {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
-        if !matches!(entry.phase, PeerPhase::Handshaking { .. }) {
-            return;
-        }
-        let channel = match &entry.phase {
-            PeerPhase::Handshaking { channel, .. } => channel.clone(),
-            _ => {
-                tracing::warn!(device = %device_id, "phase changed unexpectedly during L2CAP failure");
-                return;
+        match &entry.phase {
+            PeerPhase::Handshaking { .. } => {
+                let channel = match &entry.phase {
+                    PeerPhase::Handshaking { channel, .. } => channel.clone(),
+                    _ => unreachable!(),
+                };
+                entry.tx_gen += 1;
+                let tx_gen = entry.tx_gen;
+                entry.phase = PeerPhase::Connected {
+                    since: now,
+                    channel,
+                    tx_gen,
+                    upgrading: false,
+                };
+                let role = entry.role;
+                actions.push(PeerAction::StartDataPipe {
+                    device_id: device_id.clone(),
+                    role,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                    l2cap_channel: None,
+                });
+                actions.push(PeerAction::EmitMetric(format!(
+                    "l2cap_fallback_to_gatt:{error}"
+                )));
             }
-        };
-        entry.tx_gen += 1;
-        let tx_gen = entry.tx_gen;
-        entry.phase = PeerPhase::Connected {
-            since: now,
-            channel,
-            tx_gen,
-            upgrading: false,
-        };
-        let role = entry.role;
-        actions.push(PeerAction::StartDataPipe {
-            device_id: device_id.clone(),
-            role,
-            path: crate::transport::peer::ConnectPath::Gatt,
-            l2cap_channel: None,
-        });
-        actions.push(PeerAction::EmitMetric(format!(
-            "l2cap_fallback_to_gatt:{error}"
-        )));
+            PeerPhase::Connected {
+                upgrading: true, ..
+            } => {
+                tracing::warn!(device = %device_id, %error, "L2CAP upgrade failed; staying GATT");
+                entry.l2cap_upgrade_failed = true;
+                if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                    *upgrading = false;
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_inbound_l2cap_channel(
@@ -4233,6 +4255,103 @@ mod tests {
         match &reg.peers[&dev].phase {
             PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
             other => panic!("expected Connected{{upgrading:false}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_l2cap_succeeded_while_upgrading_emits_swap_pipe() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PipeHandles};
+
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-upgrade-ok");
+        let (outbound_tx, _) = tokio::sync::mpsc::channel(1);
+        let (inbound_tx, _) = tokio::sync::mpsc::channel(1);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel(1);
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Central;
+            e.tx_gen = 2;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 2,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 2,
+                upgrading: true,
+            };
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+            });
+            e
+        });
+
+        let (l2cap_chan, _other) = blew::L2capChannel::pair(1024);
+        let actions = reg.handle(PeerCommand::OpenL2capSucceeded {
+            device_id: device_id.clone(),
+            channel: l2cap_chan,
+        });
+
+        assert!(
+            actions.iter().any(|a| matches!(a, PeerAction::SwapPipeToL2cap { device_id: did, .. } if *did == device_id)),
+            "expected SwapPipeToL2cap; got {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartDataPipe { .. })),
+            "should NOT emit StartDataPipe for upgrade path; got {actions:?}"
+        );
+        let entry = reg.peer(&device_id).unwrap();
+        match &entry.phase {
+            PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
+            other => panic!("expected Connected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_l2cap_failed_while_upgrading_marks_failed_and_clears_upgrading() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
+
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-upgrade-fail");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Central;
+            e.tx_gen = 2;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 2,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 2,
+                upgrading: true,
+            };
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::OpenL2capFailed {
+            device_id: device_id.clone(),
+            error: "upgrade timed out".into(),
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartDataPipe { .. })),
+            "should NOT emit StartDataPipe for upgrade-fail path; got {actions:?}"
+        );
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(
+            entry.l2cap_upgrade_failed,
+            "l2cap_upgrade_failed should be set"
+        );
+        match &entry.phase {
+            PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
+            other => panic!("expected Connected, got {other:?}"),
         }
     }
 }

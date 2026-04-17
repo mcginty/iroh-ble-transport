@@ -331,6 +331,7 @@ pub enum PeerAction {
     SwapPipeToL2cap {
         device_id: DeviceId,
         channel: L2capChannel,
+        swap_tx: tokio::sync::mpsc::Sender<L2capChannel>,
     },
     /// L2CAP handover stalled; kill the L2CAP worker, respawn a GATT
     /// worker, and stay Connected{Gatt} for the rest of this session.
