@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use atomic_waker::AtomicWaker;
 use blew::DeviceId;
+use std::task::Waker;
 use tokio::sync::mpsc;
 
 use crate::transport::driver::Driver;
@@ -314,20 +314,24 @@ impl Registry {
         let already_verified_peer = self.verified_prefixes.contains_key(&prefix);
         let should_defer = i_am_lower && !already_verified_peer;
 
-        let entry = self
-            .peers
-            .entry(device_id.clone())
-            .or_insert_with(|| PeerEntry::new(device_id.clone()));
-        entry.last_adv = Some(now);
-        entry.prefix = Some(prefix);
-
         if has_verified_live {
+            if let Some(entry) = self.peers.get_mut(&device_id) {
+                entry.last_adv = Some(now);
+                entry.prefix = Some(prefix);
+            }
             tracing::trace!(
                 device = %device_id,
                 "suppressing dial: verified live peer already exists for this prefix",
             );
             return;
         }
+
+        let entry = self
+            .peers
+            .entry(device_id.clone())
+            .or_insert_with(|| PeerEntry::new(device_id.clone()));
+        entry.last_adv = Some(now);
+        entry.prefix = Some(prefix);
         match &entry.phase {
             PeerPhase::Unknown => {
                 if entry.pending_sends.is_empty() {
@@ -621,6 +625,7 @@ impl Registry {
             if let Some(prefix) = entry.prefix {
                 actions.push(PeerAction::ForgetPeerStore { prefix });
             }
+            self.prune_verified_prefixes();
         } else {
             entry.phase = PeerPhase::Reconnecting {
                 attempt: next_attempt,
@@ -926,6 +931,15 @@ impl Registry {
                 PeerPhase::Dead { at, .. } if tick_now.saturating_duration_since(*at) > DEAD_GC_TTL
             )
         });
+        self.prune_verified_prefixes();
+    }
+
+    fn prune_verified_prefixes(&mut self) {
+        self.verified_prefixes.retain(|_, endpoint| {
+            self.peers.values().any(|e| {
+                e.verified_endpoint == Some(*endpoint) && !matches!(e.phase, PeerPhase::Dead { .. })
+            })
+        });
     }
 
     fn handle_forget(
@@ -964,6 +978,7 @@ impl Registry {
                 reason,
             });
         }
+        self.prune_verified_prefixes();
     }
 
     fn handle_stalled(
@@ -1162,9 +1177,9 @@ impl Registry {
             entry.l2cap_upgrade_failed = true;
             if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
                 *upgrading = false;
+                actions.push(PeerAction::RevertToGattPipe { device_id });
             }
         }
-        actions.push(PeerAction::RevertToGattPipe { device_id });
     }
 
     fn handle_inbound_l2cap_channel(
@@ -1309,6 +1324,7 @@ impl Registry {
                 reason: crate::transport::peer::DisconnectReason::ProtocolMismatch,
             });
         }
+        self.prune_verified_prefixes();
     }
 
     #[cfg(test)]
@@ -1376,12 +1392,16 @@ impl Registry {
         mut rx: mpsc::Receiver<PeerCommand>,
         driver: Driver<I>,
         snapshots: Arc<ArcSwap<SnapshotMaps>>,
-        inbox_capacity_waker: Arc<AtomicWaker>,
+        inbox_capacity_wakers: Arc<parking_lot::Mutex<Vec<Waker>>>,
     ) {
         while let Some(cmd) = rx.recv().await {
             // Wake BleSender::poll_send callers waiting on backpressure — we
-            // just freed a slot in the inbox.
-            inbox_capacity_waker.wake();
+            // just freed a slot in the inbox. Drain the whole list so every
+            // parked sender gets a fair shot at the freed permit.
+            let to_wake: Vec<Waker> = std::mem::take(&mut *inbox_capacity_wakers.lock());
+            for w in to_wake {
+                w.wake();
+            }
             let shutdown = matches!(cmd, PeerCommand::Shutdown);
             let actions = self.handle(cmd);
             for action in actions {
@@ -3843,7 +3863,7 @@ mod tests {
 
     #[test]
     fn advertised_suppressed_when_verified_peer_already_connected() {
-        use crate::transport::peer::{ChannelHandle, ConnectPath, PeerPhase, PendingSend};
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PeerPhase};
         use crate::transport::routing::prefix_from_endpoint;
 
         let mut reg = Registry::new_for_test();
@@ -3867,21 +3887,9 @@ mod tests {
             upgrading: false,
         };
 
-        // Seed a *different* BleDevice.id for the same peer with a pending send
-        // so handle_advertised would normally transition Unknown → Connecting and
-        // emit StartConnect. The guard must suppress that.
+        // Advertisement arrives for a *different* DeviceId (e.g. MAC rotation).
+        // No PeerEntry should be minted — the verified-live peer covers it.
         let new_dev = DeviceId::from("new-mac");
-        reg.peers
-            .insert(new_dev.clone(), PeerEntry::new(new_dev.clone()));
-        reg.peers
-            .get_mut(&new_dev)
-            .unwrap()
-            .pending_sends
-            .push_back(PendingSend {
-                tx_gen: 0,
-                datagram: bytes::Bytes::from_static(b"x"),
-                waker: noop_waker(),
-            });
 
         let actions = reg.handle(PeerCommand::Advertised {
             prefix,
@@ -3901,13 +3909,56 @@ mod tests {
             "must not emit StartConnect when a verified live peer already exists; got {actions:?}",
         );
         assert!(
-            matches!(
-                reg.peers[&new_dev].phase,
-                PeerPhase::Discovered { .. } | PeerPhase::Unknown,
-            ),
-            "duplicate entry should stay pre-Connecting; got {:?}",
-            reg.peers[&new_dev].phase,
+            !reg.peers.contains_key(&new_dev),
+            "must not mint a PeerEntry stub for a suppressed advert; got {:?}",
+            reg.peers.get(&new_dev).map(|e| &e.phase),
         );
+    }
+
+    #[test]
+    fn advertised_suppressed_still_updates_existing_entry() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PeerPhase};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let mut reg = Registry::new_for_test();
+        let endpoint = iroh_base::SecretKey::from_bytes(&[7u8; 32]).public();
+        let prefix = prefix_from_endpoint(&endpoint);
+
+        // Existing verified-and-Connected entry for this prefix.
+        let alive_dev = DeviceId::from("alive-central-2");
+        reg.peers
+            .insert(alive_dev.clone(), PeerEntry::new(alive_dev.clone()));
+        let alive = reg.peers.get_mut(&alive_dev).unwrap();
+        alive.prefix = Some(prefix);
+        alive.verified_endpoint = Some(endpoint);
+        alive.phase = PeerPhase::Connected {
+            since: std::time::Instant::now(),
+            channel: ChannelHandle {
+                id: 1,
+                path: ConnectPath::Gatt,
+            },
+            tx_gen: 1,
+            upgrading: false,
+        };
+
+        // Suppressed advert for the *same* DeviceId should refresh last_adv / prefix
+        // on the existing entry without changing its phase.
+        let before_phase_disc = matches!(alive.phase, PeerPhase::Connected { .. });
+        assert!(before_phase_disc);
+        let _ = reg.handle(PeerCommand::Advertised {
+            prefix,
+            device: blew::BleDevice {
+                id: alive_dev.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+        let after = &reg.peers[&alive_dev];
+        assert!(after.last_adv.is_some(), "last_adv must be stamped");
+        assert_eq!(after.prefix, Some(prefix));
+        assert!(matches!(after.phase, PeerPhase::Connected { .. }));
     }
 
     #[test]

@@ -5,10 +5,9 @@ use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
 use arc_swap::ArcSwap;
-use atomic_waker::AtomicWaker;
 use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
 use blew::gatt::service::{GattCharacteristic, GattService};
 use blew::peripheral::AdvertisingConfig;
@@ -18,6 +17,7 @@ use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item
 use iroh::endpoint::transports::{Addr, CustomEndpoint, CustomSender, CustomTransport, Transmit};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_watcher::Watchable;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 use uuid::{Uuid, uuid};
@@ -171,10 +171,11 @@ pub struct BleTransport {
     rx_bytes: Arc<AtomicU64>,
     retransmits: Arc<AtomicU64>,
     truncations: Arc<AtomicU64>,
-    /// Woken by the registry actor whenever it pops a command off the inbox,
-    /// letting `BleSender::poll_send` wait for capacity without a busy spin
-    /// when `try_send` sees `Full`.
-    inbox_capacity_waker: Arc<AtomicWaker>,
+    /// Wakers parked by `BleSender::poll_send` when `try_send` sees `Full`.
+    /// The registry actor drains and wakes the whole list each time it pops
+    /// a command — fair across N concurrent senders, unlike a single-slot
+    /// `AtomicWaker` (which would clobber prior registrations and leak wakeups).
+    inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>>,
     store: Arc<dyn PeerStore>,
 }
 
@@ -242,7 +243,7 @@ impl BleTransport {
         let rx_bytes = Arc::new(AtomicU64::new(0));
         let retransmits = Arc::new(AtomicU64::new(0));
         let truncations = Arc::new(AtomicU64::new(0));
-        let inbox_capacity_waker = Arc::new(AtomicWaker::new());
+        let inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(Vec::new()));
 
         let iface = Arc::new(BlewDriver::new(
             Arc::clone(&central),
@@ -275,10 +276,10 @@ impl BleTransport {
 
         let registry = Registry::new(config.l2cap_policy, local_id);
         let snap_for_actor = Arc::clone(&snapshots);
-        let waker_for_actor = Arc::clone(&inbox_capacity_waker);
+        let wakers_for_actor = Arc::clone(&inbox_capacity_wakers);
         tokio::spawn(async move {
             registry
-                .run(inbox_rx, driver, snap_for_actor, waker_for_actor)
+                .run(inbox_rx, driver, snap_for_actor, wakers_for_actor)
                 .await;
         });
 
@@ -320,7 +321,7 @@ impl BleTransport {
             rx_bytes,
             retransmits,
             truncations,
-            inbox_capacity_waker,
+            inbox_capacity_wakers,
             store: config.store,
         })
     }
@@ -435,7 +436,7 @@ impl CustomTransport for BleTransport {
             snapshots: Arc::clone(&self.handle.snapshots),
             routing: Arc::clone(&self.routing),
             tx_bytes: Arc::clone(&self.tx_bytes),
-            inbox_capacity_waker: Arc::clone(&self.inbox_capacity_waker),
+            inbox_capacity_wakers: Arc::clone(&self.inbox_capacity_wakers),
         });
         Ok(Box::new(BleEndpoint {
             receiver: incoming_rx,
@@ -536,7 +537,7 @@ pub struct BleSender {
     snapshots: Arc<ArcSwap<SnapshotMaps>>,
     routing: Arc<TransportRouting>,
     tx_bytes: Arc<AtomicU64>,
-    inbox_capacity_waker: Arc<AtomicWaker>,
+    inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>>,
 }
 
 impl std::fmt::Debug for BleSender {
@@ -606,10 +607,10 @@ impl CustomSender for BleSender {
                 Poll::Ready(Ok(()))
             }
             Err(mpsc::error::TrySendError::Full(cmd)) => {
-                // Register for a wake-up when the actor pops a command, then
-                // re-try to close the race where the actor drained between the
-                // first try_send and the register.
-                self.inbox_capacity_waker.register(cx.waker());
+                // Park our waker before re-checking try_send, so the actor's
+                // post-pop drain wakes us if it raced our first try_send.
+                // Each concurrent sender gets its own slot — no clobbering.
+                self.inbox_capacity_wakers.lock().push(cx.waker().clone());
                 match self.inbox.try_send(cmd) {
                     Ok(()) => {
                         self.tx_bytes.fetch_add(len as u64, Ordering::Relaxed);
@@ -733,7 +734,7 @@ mod tests {
             snapshots,
             routing,
             tx_bytes,
-            inbox_capacity_waker: Arc::new(AtomicWaker::new()),
+            inbox_capacity_wakers: Arc::new(Mutex::new(Vec::new())),
         };
         (sender, inbox_rx)
     }
@@ -955,5 +956,35 @@ mod tests {
         // same stable token — iroh's address cache stays valid.
         let t3 = extract_token(lookup.resolve(endpoint_id));
         assert_eq!(t1, t3);
+    }
+
+    // ---------- Test #4: inbox-capacity wakers — every parked sender wakes ----------
+
+    #[test]
+    fn inbox_capacity_drain_wakes_every_parked_sender() {
+        // Models the bug_015 contract: when the registry actor pops from a
+        // full inbox, every sender parked on backpressure must be woken — not
+        // just the most-recently-registered one. The previous AtomicWaker
+        // stranded earlier registrants.
+        let wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let (c1, w1) = counting_waker();
+        let (c2, w2) = counting_waker();
+        let (c3, w3) = counting_waker();
+        wakers.lock().push(w1);
+        wakers.lock().push(w2);
+        wakers.lock().push(w3);
+
+        // Drain mirrors the registry actor's per-pop wake step.
+        let to_wake: Vec<Waker> = std::mem::take(&mut *wakers.lock());
+        assert_eq!(to_wake.len(), 3);
+        for w in to_wake {
+            w.wake();
+        }
+
+        assert_eq!(c1.0.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(c2.0.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(c3.0.load(AtomicOrdering::SeqCst), 1);
+        assert!(wakers.lock().is_empty(), "drain must clear the list");
     }
 }
