@@ -63,6 +63,14 @@ impl Registry {
         Self::new(L2capPolicy::Disabled, endpoint)
     }
 
+    #[cfg(test)]
+    pub fn new_for_test_with_policy_and_endpoint(
+        l2cap_policy: L2capPolicy,
+        endpoint: iroh_base::EndpointId,
+    ) -> Self {
+        Self::new(l2cap_policy, endpoint)
+    }
+
     pub fn handle(&mut self, cmd: PeerCommand) -> Vec<PeerAction> {
         let now = std::time::Instant::now();
         let mut actions = Vec::new();
@@ -208,6 +216,37 @@ impl Registry {
                         crate::transport::peer::DisconnectReason::DedupLoser,
                     );
                     actions.extend(drain_acks);
+                }
+            }
+        }
+
+        if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
+            let to_upgrade: Vec<DeviceId> = self
+                .peers
+                .iter()
+                .filter(|(_, e)| {
+                    e.prefix == Some(prefix)
+                        && !e.l2cap_upgrade_failed
+                        && matches!(
+                            e.phase,
+                            PeerPhase::Connected {
+                                upgrading: false,
+                                channel: crate::transport::peer::ChannelHandle {
+                                    path: crate::transport::peer::ConnectPath::Gatt,
+                                    ..
+                                },
+                                ..
+                            }
+                        )
+                })
+                .map(|(did, _)| did.clone())
+                .collect();
+            for did in to_upgrade {
+                if let Some(entry) = self.peers.get_mut(&did) {
+                    if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                        *upgrading = true;
+                    }
+                    actions.push(PeerAction::UpgradeToL2cap { device_id: did });
                 }
             }
         }
@@ -4288,5 +4327,98 @@ mod tests {
             "LOW side: central entry must drain as DedupLoser; got {:?}",
             reg.peers[&dev_c].phase,
         );
+    }
+
+    #[test]
+    fn upgrade_to_l2cap_emitted_on_winner_after_verified() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x80u8; 32]).public();
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        // Invariant guard: Ed25519 pubkey byte ordering isn't guaranteed to
+        // follow seed byte ordering; make the test fail loud if key derivation
+        // changes.
+        assert!(
+            my_ep.as_bytes() > peer_ep.as_bytes(),
+            "test presumes HIGH>LOW on derived pubkeys"
+        );
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        let mut reg =
+            Registry::new_for_test_with_policy_and_endpoint(L2capPolicy::PreferL2cap, my_ep);
+        let dev = DeviceId::from("peer");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        {
+            let e = reg.peers.get_mut(&dev).unwrap();
+            e.prefix = Some(peer_prefix);
+            e.role = ConnectRole::Central;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let actions = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_ep,
+        });
+
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, PeerAction::UpgradeToL2cap { device_id } if device_id == &dev)
+            ),
+            "winner must get UpgradeToL2cap; got {actions:?}"
+        );
+        match &reg.peers[&dev].phase {
+            PeerPhase::Connected { upgrading, .. } => assert!(*upgrading),
+            other => panic!("expected Connected{{upgrading:true}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgrade_to_l2cap_not_emitted_when_policy_disabled() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x80u8; 32]).public();
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        assert!(my_ep.as_bytes() > peer_ep.as_bytes());
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        let mut reg = Registry::new_for_test_with_policy_and_endpoint(L2capPolicy::Disabled, my_ep);
+        let dev = DeviceId::from("peer");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        {
+            let e = reg.peers.get_mut(&dev).unwrap();
+            e.prefix = Some(peer_prefix);
+            e.role = ConnectRole::Central;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let actions = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_ep,
+        });
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::UpgradeToL2cap { .. }))
+        );
+        match &reg.peers[&dev].phase {
+            PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
+            other => panic!("expected Connected{{upgrading:false}}, got {other:?}"),
+        }
     }
 }
