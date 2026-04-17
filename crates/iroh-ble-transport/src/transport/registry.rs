@@ -112,6 +112,9 @@ impl Registry {
                 got,
                 want,
             } => self.handle_protocol_version_mismatch(&mut actions, now, device_id, got, want),
+            PeerCommand::VerifiedEndpoint { .. }
+            | PeerCommand::PeripheralClientSubscribed { .. }
+            | PeerCommand::L2capHandoverTimeout { .. } => {}
         }
         actions
     }
@@ -211,6 +214,7 @@ impl Registry {
             }
             PeerPhase::Discovered { .. } => SendDecision::StartAndEnqueue,
             PeerPhase::Unknown
+            | PeerPhase::PendingDial { .. }
             | PeerPhase::Connecting { .. }
             | PeerPhase::Handshaking { .. }
             | PeerPhase::Reconnecting { .. }
@@ -383,6 +387,7 @@ impl Registry {
                     since: now,
                     channel,
                     tx_gen,
+                    upgrading: false,
                 };
                 let role = entry.role;
                 actions.push(PeerAction::StartDataPipe {
@@ -451,6 +456,7 @@ impl Registry {
                         path: crate::transport::peer::ConnectPath::Gatt,
                     },
                     tx_gen: 1,
+                    upgrading: false,
                 };
                 e.tx_gen = 1;
                 (v.insert(e), true)
@@ -484,6 +490,7 @@ impl Registry {
                 since: now,
                 channel,
                 tx_gen,
+                upgrading: false,
             };
             entry.rx_backlog.push_back(bytes);
             let role = entry.role;
@@ -534,6 +541,7 @@ impl Registry {
                 path: crate::transport::peer::ConnectPath::Gatt,
             },
             tx_gen: entry.tx_gen,
+            upgrading: false,
         };
         entry.rx_backlog.push_back(bytes);
         actions.push(PeerAction::StartDataPipe {
@@ -719,6 +727,7 @@ impl Registry {
                         since: tick_now,
                         channel,
                         tx_gen,
+                        upgrading: false,
                     };
                     let role = entry.role;
                     actions.push(PeerAction::StartDataPipe {
@@ -879,6 +888,7 @@ impl Registry {
             since: now,
             channel: l2cap_handle,
             tx_gen,
+            upgrading: false,
         };
         let role = entry.role;
         actions.push(PeerAction::StartDataPipe {
@@ -915,6 +925,7 @@ impl Registry {
             since: now,
             channel,
             tx_gen,
+            upgrading: false,
         };
         let role = entry.role;
         actions.push(PeerAction::StartDataPipe {
@@ -949,6 +960,7 @@ impl Registry {
                         path: crate::transport::peer::ConnectPath::L2cap,
                     },
                     tx_gen: 1,
+                    upgrading: false,
                 };
                 let inserted = v.insert(e);
                 actions.push(PeerAction::StartDataPipe {
@@ -986,6 +998,7 @@ impl Registry {
                             path: crate::transport::peer::ConnectPath::L2cap,
                         },
                         tx_gen,
+                        upgrading: false,
                     };
                     let role = entry.role;
                     actions.push(PeerAction::StartDataPipe {
@@ -1145,6 +1158,7 @@ pub struct PeerStateSummary {
 pub enum PhaseKind {
     Unknown,
     Discovered,
+    PendingDial,
     Connecting,
     Handshaking,
     Connected,
@@ -1159,6 +1173,7 @@ impl From<&PeerPhase> for PhaseKind {
         match p {
             PeerPhase::Unknown => Self::Unknown,
             PeerPhase::Discovered { .. } => Self::Discovered,
+            PeerPhase::PendingDial { .. } => Self::PendingDial,
             PeerPhase::Connecting { .. } => Self::Connecting,
             PeerPhase::Handshaking { .. } => Self::Handshaking,
             PeerPhase::Connected { .. } => Self::Connected,
@@ -1395,6 +1410,7 @@ mod tests {
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
                 tx_gen: 3,
+                upgrading: false,
             };
             e
         });
@@ -1422,6 +1438,7 @@ mod tests {
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
                 tx_gen: 5,
+                upgrading: false,
             };
             e
         });
@@ -1455,6 +1472,7 @@ mod tests {
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e
         });
@@ -1489,6 +1507,7 @@ mod tests {
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e
         });
@@ -1521,6 +1540,7 @@ mod tests {
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e
         });
@@ -1551,6 +1571,7 @@ mod tests {
                         path: crate::transport::peer::ConnectPath::Gatt,
                     },
                     tx_gen: 1,
+                    upgrading: false,
                 };
                 e
             });
@@ -1823,6 +1844,7 @@ mod tests {
                 since: std::time::Instant::now(),
                 channel: channel.clone(),
                 tx_gen: 7,
+                upgrading: false,
             };
             e
         });
@@ -1927,6 +1949,7 @@ mod tests {
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e
         });
@@ -2056,6 +2079,7 @@ mod tests {
                 path: ConnectPath::Gatt,
             },
             tx_gen: 7,
+            upgrading: false,
         };
         entry.tx_gen = 7;
         reg.peers.insert(device_id.clone(), entry);
@@ -2144,6 +2168,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 7,
+                upgrading: false,
             };
             e.tx_gen = 7;
             for i in 0..3u64 {
@@ -2190,6 +2215,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e.rx_backlog.push_back(bytes::Bytes::from_static(b"A"));
             e.rx_backlog.push_back(bytes::Bytes::from_static(b"B"));
@@ -2230,6 +2256,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 9,
+                upgrading: false,
             };
             e.pipe = Some(PipeHandles {
                 outbound_tx,
@@ -2274,6 +2301,7 @@ mod tests {
                         path: ConnectPath::Gatt,
                     },
                     tx_gen: 8,
+                    upgrading: false,
                 };
                 e.pipe = Some(PipeHandles {
                     outbound_tx,
@@ -2322,6 +2350,7 @@ mod tests {
                         path: ConnectPath::Gatt,
                     },
                     tx_gen: 7,
+                    upgrading: false,
                 };
                 e.pipe = Some(PipeHandles {
                     outbound_tx,
@@ -2399,6 +2428,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e.pipe = Some(PipeHandles {
                 outbound_tx,
@@ -2433,6 +2463,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e
         });
@@ -2498,6 +2529,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 4,
+                upgrading: false,
             };
             e.pipe = Some(PipeHandles {
                 outbound_tx,
@@ -2603,6 +2635,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e.pipe = Some(PipeHandles {
                 outbound_tx,
@@ -2977,6 +3010,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 5,
+                upgrading: false,
             };
             e.pipe = Some(PipeHandles {
                 outbound_tx,
@@ -3039,6 +3073,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 3,
+                upgrading: false,
             };
             e.pipe = Some(PipeHandles {
                 outbound_tx,
@@ -3224,6 +3259,7 @@ mod tests {
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             for i in 0..3u64 {
                 e.pending_sends
@@ -3303,6 +3339,7 @@ mod tests {
                 since: std::time::Instant::now(),
                 channel: channel.clone(),
                 tx_gen: 1,
+                upgrading: false,
             };
             e
         });
@@ -3352,6 +3389,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e
         });
@@ -3419,6 +3457,7 @@ mod tests {
                     path: ConnectPath::Gatt,
                 },
                 tx_gen: 1,
+                upgrading: false,
             };
             e
         });

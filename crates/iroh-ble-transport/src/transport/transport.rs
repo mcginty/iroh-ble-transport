@@ -371,6 +371,7 @@ pub struct BlePeerInfo {
 pub enum BlePeerPhase {
     Unknown,
     Discovered,
+    PendingDial,
     Connecting,
     Handshaking,
     Connected,
@@ -385,6 +386,7 @@ impl From<PhaseKind> for BlePeerPhase {
         match p {
             PhaseKind::Unknown => Self::Unknown,
             PhaseKind::Discovered => Self::Discovered,
+            PhaseKind::PendingDial => Self::PendingDial,
             PhaseKind::Connecting => Self::Connecting,
             PhaseKind::Handshaking => Self::Handshaking,
             PhaseKind::Connected => Self::Connected,

@@ -253,6 +253,9 @@ impl<I: BleInterface> Driver<I> {
                     tracing::debug!("inbox closed before DataPipeReady forwarded");
                 }
             }
+            PeerAction::UpgradeToL2cap { .. }
+            | PeerAction::SwapPipeToL2cap { .. }
+            | PeerAction::RevertToGattPipe { .. } => {}
         }
     }
 }

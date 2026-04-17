@@ -9,9 +9,7 @@ use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_ble_transport::transport::BleTransport;
-use iroh_ble_transport::{
-    BlePeerInfo, BlePeerPhase, Central, ConnectPath, Peripheral,
-};
+use iroh_ble_transport::{BlePeerInfo, BlePeerPhase, Central, ConnectPath, Peripheral};
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
 use n0_future::StreamExt;
@@ -64,6 +62,7 @@ fn ble_phase_str(phase: BlePeerPhase) -> &'static str {
     match phase {
         BlePeerPhase::Unknown => "unknown",
         BlePeerPhase::Discovered => "discovered",
+        BlePeerPhase::PendingDial => "pending_dial",
         BlePeerPhase::Connecting => "connecting",
         BlePeerPhase::Handshaking => "handshaking",
         BlePeerPhase::Connected => "connected",
@@ -84,7 +83,7 @@ impl PeerState {
             Some(BlePeerPhase::Handshaking) => "handshaking",
             Some(BlePeerPhase::Connecting) => "connecting",
             Some(BlePeerPhase::Reconnecting | BlePeerPhase::Restoring) => "reconnecting",
-            Some(BlePeerPhase::Discovered | BlePeerPhase::Unknown) => {
+            Some(BlePeerPhase::Discovered | BlePeerPhase::PendingDial | BlePeerPhase::Unknown) => {
                 if matches!(self.gossip, Some(GossipStatus::InTopic)) {
                     "in_topic"
                 } else {

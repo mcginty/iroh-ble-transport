@@ -61,6 +61,9 @@ pub struct PeerEntry {
     /// before scan ever saw the advertisement — those peers don't get
     /// persisted to the `PeerStore` because we have no stable key for them.
     pub prefix: Option<KeyPrefix>,
+    pub verified_endpoint: Option<iroh_base::EndpointId>,
+    pub verified_at: Option<Instant>,
+    pub l2cap_upgrade_failed: bool,
 }
 
 impl PeerEntry {
@@ -79,6 +82,9 @@ impl PeerEntry {
             rx_backlog: VecDeque::new(),
             l2cap_channel: None,
             prefix: None,
+            verified_endpoint: None,
+            verified_at: None,
+            l2cap_upgrade_failed: false,
         }
     }
 }
@@ -106,6 +112,7 @@ pub enum DisconnectReason {
     Timeout,
     LinkDead,
     ProtocolMismatch,
+    DedupLoser,
     Unknown(i32),
 }
 
@@ -136,6 +143,11 @@ pub enum PeerPhase {
     Discovered {
         since: Instant,
     },
+    PendingDial {
+        since: Instant,
+        deadline: Instant,
+        prefix: KeyPrefix,
+    },
     Connecting {
         attempt: u32,
         started: Instant,
@@ -150,6 +162,7 @@ pub enum PeerPhase {
         since: Instant,
         channel: ChannelHandle,
         tx_gen: u64,
+        upgrading: bool,
     },
     Draining {
         since: Instant,
@@ -253,6 +266,23 @@ pub enum PeerCommand {
         outbound_tx: tokio::sync::mpsc::Sender<PendingSend>,
         inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     },
+    /// Emitted when `EndpointHooks::after_handshake` fires. The registry
+    /// stamps all PeerEntries whose prefix matches and runs the dedup pass.
+    VerifiedEndpoint {
+        endpoint_id: iroh_base::EndpointId,
+    },
+    /// Emitted by run_peripheral_events when a remote central subscribes
+    /// to C2P or P2C. Registry materializes a Connected{Gatt} PeerEntry
+    /// with role=Peripheral so peripheral-side traffic is visible to dedup.
+    PeripheralClientSubscribed {
+        client_id: DeviceId,
+        char_uuid: uuid::Uuid,
+    },
+    /// Emitted by the L2CAP pipe worker when its outbound write has been
+    /// blocked on backpressure for longer than L2CAP_HANDOVER_TIMEOUT.
+    L2capHandoverTimeout {
+        device_id: DeviceId,
+    },
     Shutdown,
 }
 
@@ -292,6 +322,22 @@ pub enum PeerAction {
         role: ConnectRole,
         path: ConnectPath,
         l2cap_channel: Option<L2capChannel>,
+    },
+    /// Winner of a dedup pass asks the driver to attempt an L2CAP open
+    /// for this already-connected GATT peer.
+    UpgradeToL2cap {
+        device_id: DeviceId,
+    },
+    /// L2CAP open succeeded; swap the pipe worker from GATT to L2CAP on
+    /// this peer. The existing GATT worker enters drain-only mode.
+    SwapPipeToL2cap {
+        device_id: DeviceId,
+        channel: L2capChannel,
+    },
+    /// L2CAP handover stalled; kill the L2CAP worker, respawn a GATT
+    /// worker, and stay Connected{Gatt} for the rest of this session.
+    RevertToGattPipe {
+        device_id: DeviceId,
     },
     /// Persist a snapshot of this peer to the configured `PeerStore`. Emitted
     /// when a peer leaves `Connected` for `Draining`: we've seen enough of
@@ -358,5 +404,34 @@ mod tests {
             path: ConnectPath::Gatt,
             l2cap_channel: None,
         };
+    }
+
+    #[test]
+    fn new_variants_are_constructible() {
+        let _cmd1 = PeerCommand::VerifiedEndpoint {
+            endpoint_id: iroh_base::SecretKey::from_bytes(&[0u8; 32]).public(),
+        };
+        let _cmd2 = PeerCommand::PeripheralClientSubscribed {
+            client_id: DeviceId::from("x"),
+            char_uuid: uuid::Uuid::nil(),
+        };
+        let _cmd3 = PeerCommand::L2capHandoverTimeout {
+            device_id: DeviceId::from("x"),
+        };
+        let _act1 = PeerAction::UpgradeToL2cap {
+            device_id: DeviceId::from("x"),
+        };
+        let _act2 = PeerAction::RevertToGattPipe {
+            device_id: DeviceId::from("x"),
+        };
+        assert_eq!(DisconnectReason::DedupLoser, DisconnectReason::DedupLoser);
+    }
+
+    #[test]
+    fn peer_entry_initializes_dedup_fields_empty() {
+        let e = PeerEntry::new(DeviceId::from("x"));
+        assert!(e.verified_endpoint.is_none());
+        assert!(e.verified_at.is_none());
+        assert!(!e.l2cap_upgrade_failed);
     }
 }
