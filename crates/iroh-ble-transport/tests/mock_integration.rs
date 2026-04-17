@@ -942,10 +942,10 @@ async fn connect_failure_retries_on_next_tick() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let maps = snapshots.load();
-            if let Some(state) = maps.peer_states.get(&device_id) {
-                if state.phase_kind == PhaseKind::Reconnecting {
-                    return;
-                }
+            if let Some(state) = maps.peer_states.get(&device_id)
+                && state.phase_kind == PhaseKind::Reconnecting
+            {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -964,13 +964,13 @@ async fn connect_failure_retries_on_next_tick() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let maps = snapshots.load();
-            if let Some(state) = maps.peer_states.get(&device_id) {
-                if matches!(
+            if let Some(state) = maps.peer_states.get(&device_id)
+                && matches!(
                     state.phase_kind,
                     PhaseKind::Connected | PhaseKind::Handshaking
-                ) {
-                    return;
-                }
+                )
+            {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
