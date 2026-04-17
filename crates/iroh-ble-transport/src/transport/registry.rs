@@ -58,12 +58,12 @@ impl Registry {
         Self::new(l2cap_policy, ep)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new_for_test_with_endpoint(endpoint: iroh_base::EndpointId) -> Self {
         Self::new(L2capPolicy::Disabled, endpoint)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new_for_test_with_policy_and_endpoint(
         l2cap_policy: L2capPolicy,
         endpoint: iroh_base::EndpointId,
@@ -1327,6 +1327,9 @@ impl Registry {
                     tx_gen: entry.tx_gen,
                     consecutive_failures: entry.consecutive_failures,
                     connect_path,
+                    role: entry.role,
+                    l2cap_upgrade_failed: entry.l2cap_upgrade_failed,
+                    verified_endpoint: entry.verified_endpoint,
                 },
             );
         }
@@ -1396,6 +1399,9 @@ pub struct PeerStateSummary {
     pub tx_gen: u64,
     pub consecutive_failures: u32,
     pub connect_path: Option<crate::transport::peer::ConnectPath>,
+    pub role: crate::transport::peer::ConnectRole,
+    pub l2cap_upgrade_failed: bool,
+    pub verified_endpoint: Option<iroh_base::EndpointId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
