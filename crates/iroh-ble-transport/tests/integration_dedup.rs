@@ -465,3 +465,186 @@ async fn advertising_flood_does_not_redial_after_verified() {
     );
 }
 
+// ─── Task 21 ─────────────────────────────────────────────────────────────────
+
+/// With L2capPolicy::PreferL2cap, a VerifiedEndpoint triggers UpgradeToL2cap.
+/// When the L2CAP channel is accepted but the peer never reads (buffer fills),
+/// the pipe supervisor fires L2capHandoverTimeout → registry sets
+/// l2cap_upgrade_failed=true and emits RevertToGattPipe.
+#[tokio::test(flavor = "multi_thread")]
+async fn l2cap_handover_timeout_reverts_to_gatt() {
+    use iroh_ble_transport::transport::peer::ChannelHandle;
+    use iroh_ble_transport::transport::peer::ConnectPath;
+
+    let ep_self = endpoint_with_byte(0xFF);
+    let ep_peer = endpoint_with_byte(0x01);
+
+    let dev_self = DeviceId::from("l2cap-self");
+    let dev_peer = DeviceId::from("l2cap-peer");
+
+    let (self_inbox_tx, self_inbox_rx) = mpsc::channel::<PeerCommand>(256);
+
+    let iface = Arc::new(MockBleInterface::new());
+
+    // Pre-seed a successful connect response for the initial GATT dial.
+    iface.on_connect(
+        dev_peer.clone(),
+        Ok(ChannelHandle {
+            id: 1,
+            path: ConnectPath::Gatt,
+        }),
+    );
+
+    // Seed the PSM read that UpgradeToL2cap will trigger.
+    let psm: u16 = 0x0080;
+    iface.seed_psm(Some(psm));
+
+    // Create an L2CAP channel pair. The peripheral side is held alive but
+    // never read from — this fills the underlying duplex buffer and causes
+    // any central-side write to block, triggering the handover timeout.
+    // The buffer is intentionally tiny (64 bytes) so it fills quickly.
+    let (central_chan, _peripheral_chan_never_read) = blew::L2capChannel::pair(64);
+    iface.on_open_l2cap(dev_peer.clone(), psm, Ok(central_chan));
+
+    let node = spawn_node_with_endpoint(
+        dev_self.clone(),
+        self_inbox_tx.clone(),
+        self_inbox_rx,
+        Arc::clone(&iface),
+        L2capPolicy::PreferL2cap,
+        ep_self,
+    );
+
+    // Use the endpoint-derived prefix so VerifiedEndpoint can match the entry.
+    let prefix_peer = prefix_from_endpoint(&ep_peer);
+
+    let (waker_tx, _) = mpsc::channel::<()>(1);
+    let waker = waker_from_channel(waker_tx);
+
+    // Advertise peer + send to trigger the dial.
+    node.inbox_tx
+        .send(PeerCommand::Advertised {
+            prefix: prefix_peer,
+            device: ble_device(&dev_peer),
+            rssi: None,
+        })
+        .await
+        .unwrap();
+    node.inbox_tx
+        .send(PeerCommand::SendDatagram {
+            device_id: dev_peer.clone(),
+            tx_gen: 0,
+            datagram: Bytes::from_static(b"initial"),
+            waker,
+        })
+        .await
+        .unwrap();
+
+    // Wait for Connected{Gatt} state.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = node.snapshots.load();
+            if snap
+                .peer_states
+                .get(&dev_peer)
+                .map(|s| {
+                    s.phase_kind == PhaseKind::Connected
+                        && s.connect_path == Some(ConnectPath::Gatt)
+                })
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("node never reached Connected{Gatt}");
+
+    // VerifiedEndpoint triggers UpgradeToL2cap (L2capPolicy::PreferL2cap).
+    // self's endpoint (0xFF) > peer's endpoint (0x01) → self keeps Central →
+    // should_win(Central, ep_self, ep_peer) = true → upgrade is triggered.
+    //
+    // Read the current tx_gen before sending VerifiedEndpoint; all subsequent
+    // sends must carry this value so the registry forwards them to the pipe.
+    let live_tx_gen = node
+        .snapshots
+        .load()
+        .peer_states
+        .get(&dev_peer)
+        .expect("peer entry must exist after Connected")
+        .tx_gen;
+
+    node.inbox_tx
+        .send(PeerCommand::VerifiedEndpoint {
+            endpoint_id: ep_peer,
+        })
+        .await
+        .unwrap();
+
+    // Wait a moment for the upgrade path to complete (read_psm + open_l2cap +
+    // SwapPipeToL2cap) before flooding with sends. The mock returns immediately,
+    // so 100 ms is ample.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Fill the L2CAP pipe chain with sends using the correct tx_gen.
+    // The duplex buffer (64 B) fills after the first framed write (2-byte len +
+    // 64-byte payload = 66 B). The L2CAP IO task's outbound channel (cap 64)
+    // and the pipe supervisor's outbound_fwd channel (cap 32) also need to fill
+    // so that `forward_outbound`'s `outbound_fwd_tx.send()` actually blocks.
+    // 64 + 32 + 1 = 97 sends is sufficient; send 150 for margin.
+    let sender = node.inbox_tx.clone();
+    let dev_peer_clone = dev_peer.clone();
+    tokio::spawn(async move {
+        for _ in 0..150u64 {
+            let (waker_tx, _) = mpsc::channel::<()>(1);
+            let waker = waker_from_channel(waker_tx);
+            let _ = sender
+                .send(PeerCommand::SendDatagram {
+                    device_id: dev_peer_clone.clone(),
+                    tx_gen: live_tx_gen,
+                    datagram: Bytes::from(vec![0xAB; 64]),
+                    waker,
+                })
+                .await;
+            // Yield between sends so the registry actor can drain the inbox.
+            tokio::task::yield_now().await;
+        }
+    });
+
+    // Wait for l2cap_upgrade_failed to become true in the snapshot.
+    // Give it generous headroom above L2CAP_HANDOVER_TIMEOUT (1s).
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = node.snapshots.load();
+            if snap
+                .peer_states
+                .get(&dev_peer)
+                .map(|s| s.l2cap_upgrade_failed)
+                .unwrap_or(false)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("l2cap_upgrade_failed never set after handover timeout");
+
+    // Assert post-revert state: still Connected, l2cap_upgrade_failed=true.
+    let snap = node.snapshots.load();
+    let peer_state = snap
+        .peer_states
+        .get(&dev_peer)
+        .expect("node has no entry for peer after revert");
+
+    assert_eq!(
+        peer_state.phase_kind,
+        PhaseKind::Connected,
+        "peer should still be Connected after GATT revert"
+    );
+    assert!(
+        peer_state.l2cap_upgrade_failed,
+        "l2cap_upgrade_failed must be true after handover timeout"
+    );
+}
