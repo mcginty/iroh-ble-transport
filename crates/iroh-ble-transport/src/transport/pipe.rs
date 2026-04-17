@@ -5,13 +5,34 @@
 //! schedules a delayed abort after `L2CAP_HANDOVER_TIMEOUT` to bound the
 //! drain tail.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Duration;
+
+/// Wraps a `JoinHandle` so the inner task is aborted (not just detached) when
+/// the wrapper is dropped — including when the owning task is cancelled mid
+/// `select!`. Used to keep child tasks like the GATT send loop from outliving
+/// their parent worker after a supervisor swap aborts the worker.
+struct AbortOnDrop<T>(JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, JoinError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut self.0).poll(cx)
+    }
+}
 
 use crate::transport::dedup::L2CAP_HANDOVER_TIMEOUT;
 use crate::transport::driver::IncomingPacket;
@@ -356,6 +377,12 @@ async fn run_gatt_pipe(
         ))
     };
 
+    // If the supervisor aborts us mid-swap, the send loop is a separately
+    // spawned task — dropping its JoinHandle would only detach it, leaving an
+    // orphan that keeps retransmitting ghost fragments over the now-handed-off
+    // channel for `LINK_DEAD_DEADLINE` (≈6 s). Guard it so cancellation here
+    // also tears down the send loop.
+    let send_loop_handle = AbortOnDrop(send_loop_handle);
     tokio::pin!(send_loop_handle);
     let mut link_dead = false;
     let mut send_loop_done = false;

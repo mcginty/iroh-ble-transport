@@ -322,7 +322,7 @@ impl Registry {
         entry.prefix = Some(prefix);
 
         if has_verified_live {
-            tracing::debug!(
+            tracing::trace!(
                 device = %device_id,
                 "suppressing dial: verified live peer already exists for this prefix",
             );
@@ -1208,6 +1208,41 @@ impl Registry {
                     match existing_path {
                         Some(crate::transport::peer::ConnectPath::L2cap) => {
                             actions.push(PeerAction::EmitMetric("l2cap_duplicate_accept".into()));
+                        }
+                        Some(crate::transport::peer::ConnectPath::Gatt) => {
+                            // Peripheral-side mirror of the central's
+                            // OpenL2capSucceeded → SwapPipeToL2cap path. The
+                            // central swaps unilaterally; if we keep our GATT
+                            // pipe, the central's L2CAP writes black-hole
+                            // here and our GATT notifications black-hole at
+                            // the central's post-swap inbound. Both sides
+                            // must move to L2CAP together.
+                            if let Some(handles) = &entry.pipe {
+                                let swap_tx = handles.swap_tx.clone();
+                                entry.tx_gen += 1;
+                                let tx_gen = entry.tx_gen;
+                                entry.phase = PeerPhase::Connected {
+                                    since: now,
+                                    channel: crate::transport::peer::ChannelHandle {
+                                        id: 0,
+                                        path: crate::transport::peer::ConnectPath::L2cap,
+                                    },
+                                    tx_gen,
+                                    upgrading: false,
+                                };
+                                actions.push(PeerAction::EmitMetric(
+                                    "l2cap_late_accept_swapped".into(),
+                                ));
+                                actions.push(PeerAction::SwapPipeToL2cap {
+                                    device_id,
+                                    channel,
+                                    swap_tx,
+                                });
+                            } else {
+                                actions.push(PeerAction::EmitMetric(
+                                    "l2cap_late_accept_after_gatt".into(),
+                                ));
+                            }
                         }
                         _ => {
                             actions.push(PeerAction::EmitMetric(
@@ -3254,11 +3289,11 @@ mod tests {
     }
 
     #[test]
-    fn inbound_l2cap_channel_dropped_when_gatt_pipe_exists() {
+    fn inbound_l2cap_channel_swaps_gatt_pipe_to_l2cap() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, PendingSend, PipeHandles};
 
         let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
-        let device_id = blew::DeviceId::from("dev-l2cap-dup");
+        let device_id = blew::DeviceId::from("dev-l2cap-late-accept");
 
         let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(4);
         let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
@@ -3293,18 +3328,85 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                PeerAction::EmitMetric(s) if s == "l2cap_late_accept_after_gatt"
+                PeerAction::EmitMetric(s) if s == "l2cap_late_accept_swapped"
             )),
-            "expected l2cap_late_accept_after_gatt metric; got {actions:?}"
+            "expected l2cap_late_accept_swapped metric; got {actions:?}"
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::SwapPipeToL2cap { device_id: did, .. } if *did == device_id)),
+            "expected SwapPipeToL2cap; got {actions:?}"
         );
         match &reg.peer(&device_id).unwrap().phase {
             PeerPhase::Connected {
                 channel, tx_gen, ..
             } => {
-                assert_eq!(channel.path, ConnectPath::Gatt, "path unchanged");
+                assert_eq!(channel.path, ConnectPath::L2cap, "path swapped to L2cap");
+                assert_eq!(*tx_gen, 4, "tx_gen incremented across the swap");
+            }
+            other => panic!("expected Connected(L2cap), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn inbound_l2cap_channel_duplicate_when_already_l2cap() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PendingSend, PipeHandles};
+
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-l2cap-dup");
+
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(4);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.tx_gen = 3;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::L2cap,
+                },
+                tx_gen: 3,
+                upgrading: false,
+            };
+            let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+            });
+            e
+        });
+
+        let (ch, _other) = blew::L2capChannel::pair(8192);
+        let actions = reg.handle(PeerCommand::InboundL2capChannel {
+            device_id: device_id.clone(),
+            channel: ch,
+        });
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::EmitMetric(s) if s == "l2cap_duplicate_accept"
+            )),
+            "expected l2cap_duplicate_accept metric; got {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::SwapPipeToL2cap { .. })),
+            "should NOT emit SwapPipeToL2cap when already on L2cap; got {actions:?}"
+        );
+        match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Connected {
+                channel, tx_gen, ..
+            } => {
+                assert_eq!(channel.path, ConnectPath::L2cap, "path unchanged");
                 assert_eq!(*tx_gen, 3, "tx_gen unchanged");
             }
-            other => panic!("expected Connected(Gatt) unchanged, got {other:?}"),
+            other => panic!("expected Connected(L2cap) unchanged, got {other:?}"),
         }
     }
 
