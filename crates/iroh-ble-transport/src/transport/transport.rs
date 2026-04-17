@@ -55,7 +55,6 @@ pub enum L2capPolicy {
     PreferL2cap,
 }
 
-#[derive(Clone)]
 pub struct BleTransportConfig {
     pub l2cap_policy: L2capPolicy,
     /// Persistent peer cache. Defaults to an in-memory store; applications
@@ -64,6 +63,11 @@ pub struct BleTransportConfig {
     /// whenever a peer leaves `Connected`, and forgets a peer when it
     /// transitions to `Dead { MaxRetries }`.
     pub store: Arc<dyn PeerStore>,
+    /// Receiver for verified [`EndpointId`] events emitted by a
+    /// [`crate::BleDedupHook`] installed on the iroh `Endpoint`. When `None`,
+    /// handshake-time dedup is effectively disabled — useful for tests that
+    /// don't run a real iroh `Endpoint`.
+    pub verified_rx: Option<tokio::sync::mpsc::UnboundedReceiver<iroh_base::EndpointId>>,
 }
 
 impl Default for BleTransportConfig {
@@ -71,6 +75,7 @@ impl Default for BleTransportConfig {
         Self {
             l2cap_policy: L2capPolicy::default(),
             store: Arc::new(InMemoryPeerStore::new()),
+            verified_rx: None,
         }
     }
 }
@@ -80,6 +85,7 @@ impl std::fmt::Debug for BleTransportConfig {
         f.debug_struct("BleTransportConfig")
             .field("l2cap_policy", &self.l2cap_policy)
             .field("store", &"<PeerStore>")
+            .field("verified_rx", &self.verified_rx.is_some())
             .finish()
     }
 }
@@ -275,6 +281,21 @@ impl BleTransport {
                 .run(inbox_rx, driver, snap_for_actor, waker_for_actor)
                 .await;
         });
+
+        if let Some(mut verified_rx) = config.verified_rx {
+            let inbox = inbox_tx.clone();
+            tokio::spawn(async move {
+                while let Some(endpoint_id) = verified_rx.recv().await {
+                    if inbox
+                        .send(PeerCommand::VerifiedEndpoint { endpoint_id })
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
 
         tokio::spawn(run_central_events(
             Arc::clone(&central),
