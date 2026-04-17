@@ -153,12 +153,28 @@ impl Registry {
     ) {
         let _ = rssi;
         let device_id = device.id.clone();
+
+        let has_verified_live = self.peers.values().any(|e| {
+            e.verified_endpoint
+                .map(|eid| crate::transport::routing::prefix_from_endpoint(&eid) == prefix)
+                .unwrap_or(false)
+                && matches!(e.phase, PeerPhase::Connected { .. })
+        });
+
         let entry = self
             .peers
             .entry(device_id.clone())
             .or_insert_with(|| PeerEntry::new(device_id.clone()));
         entry.last_adv = Some(now);
         entry.prefix = Some(prefix);
+
+        if has_verified_live {
+            tracing::debug!(
+                device = %device_id,
+                "suppressing dial: verified live peer already exists for this prefix",
+            );
+            return;
+        }
         match &entry.phase {
             PeerPhase::Unknown => {
                 if entry.pending_sends.is_empty() {
@@ -3597,5 +3613,102 @@ mod tests {
             reg.peers[&dev].verified_endpoint.is_none(),
             "entry for different prefix must not be stamped"
         );
+    }
+
+    #[test]
+    fn advertised_suppressed_when_verified_peer_already_connected() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PeerPhase, PendingSend};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let mut reg = Registry::new_for_test();
+        let endpoint = iroh_base::SecretKey::from_bytes(&[9u8; 32]).public();
+        let prefix = prefix_from_endpoint(&endpoint);
+
+        // Existing verified-and-Connected entry for this prefix.
+        let alive_dev = DeviceId::from("alive-central");
+        reg.peers
+            .insert(alive_dev.clone(), PeerEntry::new(alive_dev.clone()));
+        let alive = reg.peers.get_mut(&alive_dev).unwrap();
+        alive.prefix = Some(prefix);
+        alive.verified_endpoint = Some(endpoint);
+        alive.phase = PeerPhase::Connected {
+            since: std::time::Instant::now(),
+            channel: ChannelHandle {
+                id: 1,
+                path: ConnectPath::Gatt,
+            },
+            tx_gen: 1,
+            upgrading: false,
+        };
+
+        // Seed a *different* BleDevice.id for the same peer with a pending send
+        // so handle_advertised would normally transition Unknown → Connecting and
+        // emit StartConnect. The guard must suppress that.
+        let new_dev = DeviceId::from("new-mac");
+        reg.peers
+            .insert(new_dev.clone(), PeerEntry::new(new_dev.clone()));
+        reg.peers
+            .get_mut(&new_dev)
+            .unwrap()
+            .pending_sends
+            .push_back(PendingSend {
+                tx_gen: 0,
+                datagram: bytes::Bytes::from_static(b"x"),
+                waker: noop_waker(),
+            });
+
+        let actions = reg.handle(PeerCommand::Advertised {
+            prefix,
+            device: blew::BleDevice {
+                id: new_dev.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartConnect { .. })),
+            "must not emit StartConnect when a verified live peer already exists; got {actions:?}",
+        );
+        assert!(
+            matches!(
+                reg.peers[&new_dev].phase,
+                PeerPhase::Discovered { .. } | PeerPhase::Unknown,
+            ),
+            "duplicate entry should stay pre-Connecting; got {:?}",
+            reg.peers[&new_dev].phase,
+        );
+    }
+
+    #[test]
+    fn advertised_still_dials_unverified_peer() {
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let mut reg = Registry::new_for_test();
+        let endpoint = iroh_base::SecretKey::from_bytes(&[8u8; 32]).public();
+        let prefix = prefix_from_endpoint(&endpoint);
+        let dev_id = DeviceId::from("fresh");
+
+        let _ = reg.handle(PeerCommand::Advertised {
+            prefix,
+            device: blew::BleDevice {
+                id: dev_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        // Pre-existing behaviour: a fresh advertisement with no pending_sends
+        // transitions Unknown → Discovered. Dedup guard must not interfere.
+        assert!(matches!(
+            reg.peers[&dev_id].phase,
+            PeerPhase::Discovered { .. },
+        ));
     }
 }
