@@ -130,8 +130,11 @@ async fn run_pipe_supervisor(
                             break;
                         }
                     }
-                    // L2CAP reads from the channel directly; inbound GATT
-                    // fragments post-swap are no longer meaningful.
+                    // Post-swap: L2CAP reads from its channel directly, and the
+                    // old GATT worker's inbound_fwd_tx was dropped with the old
+                    // ActiveWorker. Late GATT fragments are unrecoverable and
+                    // the drain tail can only flush already-queued outbound
+                    // ACKs, not new inbound work.
                     ActiveWorker::L2cap { .. } => {}
                 }
             }
@@ -162,16 +165,18 @@ async fn run_pipe_supervisor(
     // observes outbound/inbound EOF and tears itself down, then wait briefly
     // for it to exit (so its send sub-tasks and any outstanding ACK flushes
     // are joined) before returning. The join is bounded so a wedged worker
-    // cannot hold the caller hostage.
-    let handle = match active {
+    // cannot hold the caller hostage — on timeout we abort the task rather
+    // than letting the JoinHandle drop (which would only detach it).
+    let mut handle = match active {
         ActiveWorker::Gatt { handle, .. } => handle,
         ActiveWorker::L2cap { handle, .. } => handle,
     };
-    if tokio::time::timeout(L2CAP_HANDOVER_TIMEOUT, handle)
+    if tokio::time::timeout(L2CAP_HANDOVER_TIMEOUT, &mut handle)
         .await
         .is_err()
     {
-        tracing::debug!(device = %device_id, "pipe supervisor: worker did not exit within handover timeout");
+        handle.abort();
+        tracing::debug!(device = %device_id, "pipe supervisor: worker did not exit within handover timeout; aborted");
     }
 }
 
@@ -282,12 +287,14 @@ fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout:
     tokio::spawn(async move {
         // Dropping the forwarding senders closes the worker's input channels;
         // the GATT worker's select loop then breaks, marks the ReliableChannel
-        // dead, and joins its send sub-task before returning.
-        let handle = match old {
+        // dead, and joins its send sub-task before returning. On timeout we
+        // abort the task — dropping the JoinHandle alone would only detach it,
+        // letting a wedged worker leak.
+        let mut handle = match old {
             ActiveWorker::Gatt { handle, .. } => handle,
             ActiveWorker::L2cap { handle, .. } => handle,
         };
-        match tokio::time::timeout(timeout, handle).await {
+        match tokio::time::timeout(timeout, &mut handle).await {
             Ok(Ok(())) => {
                 tracing::debug!(device = %device_id, "old pipe worker drained cleanly");
             }
@@ -295,9 +302,10 @@ fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout:
                 tracing::debug!(device = %device_id, ?join_err, "old pipe worker join error");
             }
             Err(_elapsed) => {
+                handle.abort();
                 tracing::warn!(
                     device = %device_id,
-                    "old pipe worker did not drain within handover timeout"
+                    "old pipe worker did not drain within handover timeout; aborted"
                 );
             }
         }
