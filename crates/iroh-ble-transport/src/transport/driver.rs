@@ -104,10 +104,6 @@ impl<I: BleInterface> Driver<I> {
                 });
             }
 
-            PeerAction::OpenL2cap { device_id } => {
-                self.spawn_l2cap_open(device_id);
-            }
-
             PeerAction::CloseChannel { device_id, .. } => {
                 let iface = Arc::clone(&self.iface);
                 tokio::spawn(async move {

@@ -573,35 +573,21 @@ impl Registry {
         actions.push(PeerAction::ReadVersion {
             device_id: device_id.clone(),
         });
-        match self.l2cap_policy {
-            L2capPolicy::PreferL2cap => {
-                entry.phase = PeerPhase::Handshaking {
-                    since: now,
-                    channel,
-                    l2cap_deadline: Some(now + L2CAP_SELECT_TIMEOUT),
-                };
-                actions.push(PeerAction::OpenL2cap {
-                    device_id: device_id.clone(),
-                });
-            }
-            L2capPolicy::Disabled => {
-                entry.tx_gen += 1;
-                let tx_gen = entry.tx_gen;
-                entry.phase = PeerPhase::Connected {
-                    since: now,
-                    channel,
-                    tx_gen,
-                    upgrading: false,
-                };
-                let role = entry.role;
-                actions.push(PeerAction::StartDataPipe {
-                    device_id: device_id.clone(),
-                    role,
-                    path: crate::transport::peer::ConnectPath::Gatt,
-                    l2cap_channel: None,
-                });
-            }
-        }
+        entry.tx_gen += 1;
+        let tx_gen = entry.tx_gen;
+        entry.phase = PeerPhase::Connected {
+            since: now,
+            channel,
+            tx_gen,
+            upgrading: false,
+        };
+        let role = entry.role;
+        actions.push(PeerAction::StartDataPipe {
+            device_id: device_id.clone(),
+            role,
+            path: crate::transport::peer::ConnectPath::Gatt,
+            l2cap_channel: None,
+        });
     }
 
     fn handle_connect_failed(
@@ -849,15 +835,10 @@ impl Registry {
 
     fn handle_tick(&mut self, actions: &mut Vec<PeerAction>, tick_now: std::time::Instant) {
         enum TickAction {
-            StartConnect {
-                attempt: u32,
-            },
+            StartConnect { attempt: u32 },
             PendingDialExpired,
             DrainingToDead,
             RestoringToDead,
-            HandshakingL2capTimeout {
-                channel: crate::transport::peer::ChannelHandle,
-            },
         }
 
         let mut decisions: Vec<(DeviceId, TickAction)> = Vec::new();
@@ -879,13 +860,6 @@ impl Registry {
                 {
                     Some(TickAction::RestoringToDead)
                 }
-                PeerPhase::Handshaking {
-                    l2cap_deadline: Some(deadline),
-                    channel,
-                    ..
-                } if tick_now >= *deadline => Some(TickAction::HandshakingL2capTimeout {
-                    channel: channel.clone(),
-                }),
                 _ => None,
             };
             if let Some(a) = decision {
@@ -938,24 +912,6 @@ impl Registry {
                         reason: crate::transport::peer::DeadReason::Forgotten,
                         at: tick_now,
                     };
-                }
-                TickAction::HandshakingL2capTimeout { channel } => {
-                    entry.tx_gen += 1;
-                    let tx_gen = entry.tx_gen;
-                    entry.phase = PeerPhase::Connected {
-                        since: tick_now,
-                        channel,
-                        tx_gen,
-                        upgrading: false,
-                    };
-                    let role = entry.role;
-                    actions.push(PeerAction::StartDataPipe {
-                        device_id: device_id.clone(),
-                        role,
-                        path: crate::transport::peer::ConnectPath::Gatt,
-                        l2cap_channel: None,
-                    });
-                    actions.push(PeerAction::EmitMetric("l2cap_handshaking_timeout".into()));
                 }
             }
         }
@@ -1610,7 +1566,6 @@ mod tests {
                     id: 1,
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
-                l2cap_deadline: None,
             };
             e
         });
@@ -2111,7 +2066,6 @@ mod tests {
                     id: 99,
                     path: crate::transport::peer::ConnectPath::L2cap,
                 },
-                l2cap_deadline: None,
             };
             e
         });
@@ -2365,7 +2319,6 @@ mod tests {
                     id: 1,
                     path: ConnectPath::Gatt,
                 },
-                l2cap_deadline: None,
             };
             e
         });
@@ -2968,47 +2921,6 @@ mod tests {
     }
 
     #[test]
-    fn connect_succeeded_prefer_l2cap_enters_handshaking_and_emits_open_l2cap() {
-        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
-
-        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
-        let device_id = blew::DeviceId::from("dev-l2cap-1");
-        reg.peers.insert(device_id.clone(), {
-            let mut e = PeerEntry::new(device_id.clone());
-            e.role = ConnectRole::Central;
-            e.phase = PeerPhase::Connecting {
-                attempt: 0,
-                started: std::time::Instant::now(),
-                path: ConnectPath::Gatt,
-            };
-            e
-        });
-        let ch = ChannelHandle {
-            id: 42,
-            path: ConnectPath::Gatt,
-        };
-        let actions = reg.handle(PeerCommand::ConnectSucceeded {
-            device_id: device_id.clone(),
-            channel: ch,
-        });
-
-        match &reg.peer(&device_id).unwrap().phase {
-            PeerPhase::Handshaking {
-                l2cap_deadline: Some(_),
-                ..
-            } => {}
-            other => panic!("expected Handshaking with l2cap_deadline, got {other:?}"),
-        }
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PeerAction::OpenL2cap { .. })),
-            "expected OpenL2cap action; got {actions:?}"
-        );
-        assert_eq!(reg.peer(&device_id).unwrap().consecutive_failures, 0);
-    }
-
-    #[test]
     fn connect_succeeded_disabled_goes_straight_to_connected() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
 
@@ -3066,7 +2978,6 @@ mod tests {
                     id: 42,
                     path: ConnectPath::Gatt,
                 },
-                l2cap_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
             };
             e
         });
@@ -3121,7 +3032,6 @@ mod tests {
                     id: 42,
                     path: ConnectPath::Gatt,
                 },
-                l2cap_deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
             };
             e
         });
@@ -3159,87 +3069,6 @@ mod tests {
             )),
             "expected l2cap_fallback_to_gatt metric; got {actions:?}"
         );
-    }
-
-    #[test]
-    fn tick_handshaking_l2cap_timeout_falls_back_to_gatt() {
-        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
-
-        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
-        let device_id = blew::DeviceId::from("dev-l2cap-5");
-        let old = std::time::Instant::now() - std::time::Duration::from_secs(5);
-        reg.peers.insert(device_id.clone(), {
-            let mut e = PeerEntry::new(device_id.clone());
-            e.role = ConnectRole::Central;
-            e.tx_gen = 1;
-            e.phase = PeerPhase::Handshaking {
-                since: old,
-                channel: ChannelHandle {
-                    id: 42,
-                    path: ConnectPath::Gatt,
-                },
-                l2cap_deadline: Some(old + L2CAP_SELECT_TIMEOUT),
-            };
-            e
-        });
-
-        let actions = reg.handle(PeerCommand::Tick(std::time::Instant::now()));
-
-        let entry = reg.peer(&device_id).unwrap();
-        match &entry.phase {
-            PeerPhase::Connected {
-                channel, tx_gen, ..
-            } => {
-                assert_eq!(channel.path, ConnectPath::Gatt);
-                assert_eq!(*tx_gen, 2);
-            }
-            other => panic!("expected Connected(Gatt), got {other:?}"),
-        }
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                PeerAction::StartDataPipe {
-                    path: ConnectPath::Gatt,
-                    ..
-                }
-            )),
-            "expected StartDataPipe(Gatt); got {actions:?}"
-        );
-        assert!(
-            actions.iter().any(|a| matches!(
-                a,
-                PeerAction::EmitMetric(s) if s.contains("l2cap_handshaking_timeout")
-            )),
-            "expected l2cap_handshaking_timeout metric; got {actions:?}"
-        );
-    }
-
-    #[test]
-    fn tick_handshaking_no_l2cap_deadline_is_not_timed_out() {
-        use crate::transport::peer::{ChannelHandle, ConnectPath};
-
-        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
-        let device_id = blew::DeviceId::from("dev-l2cap-6");
-        let old = std::time::Instant::now() - std::time::Duration::from_secs(5);
-        reg.peers.insert(device_id.clone(), {
-            let mut e = PeerEntry::new(device_id.clone());
-            e.phase = PeerPhase::Handshaking {
-                since: old,
-                channel: ChannelHandle {
-                    id: 1,
-                    path: ConnectPath::Gatt,
-                },
-                l2cap_deadline: None,
-            };
-            e
-        });
-
-        let actions = reg.handle(PeerCommand::Tick(std::time::Instant::now()));
-        assert!(actions.is_empty());
-        assert!(matches!(
-            reg.peer(&device_id).unwrap().phase,
-            PeerPhase::Handshaking { .. }
-        ));
     }
 
     #[test]
@@ -3401,41 +3230,6 @@ mod tests {
     }
 
     #[test]
-    fn connect_succeeded_with_l2cap_policy_moves_to_handshaking() {
-        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
-        let device_id = blew::DeviceId::from("dev-l2-hs");
-        reg.peers.insert(device_id.clone(), {
-            let mut e = PeerEntry::new(device_id.clone());
-            e.phase = PeerPhase::Connecting {
-                attempt: 0,
-                started: std::time::Instant::now(),
-                path: crate::transport::peer::ConnectPath::Gatt,
-            };
-            e
-        });
-        let ch = crate::transport::peer::ChannelHandle {
-            id: 42,
-            path: crate::transport::peer::ConnectPath::Gatt,
-        };
-        let actions = reg.handle(PeerCommand::ConnectSucceeded {
-            device_id: device_id.clone(),
-            channel: ch,
-        });
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PeerAction::OpenL2cap { .. }))
-        );
-        assert!(matches!(
-            reg.peer(&device_id).unwrap().phase,
-            PeerPhase::Handshaking {
-                l2cap_deadline: Some(_),
-                ..
-            }
-        ));
-    }
-
-    #[test]
     fn open_l2cap_succeeded_moves_handshaking_to_connected_l2cap() {
         let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let device_id = blew::DeviceId::from("dev-l2-ok");
@@ -3447,7 +3241,6 @@ mod tests {
                     id: 1,
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
-                l2cap_deadline: Some(std::time::Instant::now() + Duration::from_secs(2)),
             };
             e
         });
@@ -3483,7 +3276,6 @@ mod tests {
                     id: 1,
                     path: crate::transport::peer::ConnectPath::Gatt,
                 },
-                l2cap_deadline: Some(std::time::Instant::now() + Duration::from_secs(2)),
             };
             e
         });
@@ -3719,7 +3511,6 @@ mod tests {
                     id: 1,
                     path: ConnectPath::Gatt,
                 },
-                l2cap_deadline: None,
             };
             e
         });

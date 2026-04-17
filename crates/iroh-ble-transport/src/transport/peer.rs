@@ -156,7 +156,6 @@ pub enum PeerPhase {
     Handshaking {
         since: Instant,
         channel: ChannelHandle,
-        l2cap_deadline: Option<Instant>,
     },
     Connected {
         since: Instant,
@@ -291,9 +290,6 @@ pub enum PeerAction {
     StartConnect {
         device_id: DeviceId,
         attempt: u32,
-    },
-    OpenL2cap {
-        device_id: DeviceId,
     },
     /// Read the peer's VERSION characteristic and, on mismatch, emit
     /// [`PeerCommand::ProtocolVersionMismatch`] so the registry can Dead
