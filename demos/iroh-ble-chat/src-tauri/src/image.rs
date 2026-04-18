@@ -55,7 +55,7 @@ pub fn encode_image_from_bytes(data: &[u8]) -> Result<Vec<u8>, String> {
 
     let encode_ms = encode_start.elapsed().as_millis();
     let total_ms = total_start.elapsed().as_millis();
-    tracing::info!(
+    tracing::debug!(
         input_bytes = data.len(),
         orig = %format!("{orig_w}x{orig_h}"),
         final_size = %format!("{final_w}x{final_h}"),
@@ -94,14 +94,14 @@ pub struct ImageReceiver {
 
 impl ProtocolHandler for ImageReceiver {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        tracing::info!(
+        tracing::debug!(
             remote = %connection.remote_id().fmt_short(),
             "IMAGE_ALPN connection accepted"
         );
         loop {
             let mut recv = match connection.accept_uni().await {
                 Ok(r) => {
-                    tracing::info!(
+                    tracing::debug!(
                         remote = %connection.remote_id().fmt_short(),
                         "accepted uni stream for image"
                     );
@@ -135,11 +135,11 @@ async fn handle_image_stream(
     app: &AppHandle,
     pending: &PendingImages,
 ) -> Result<(), String> {
-    tracing::info!("image stream: reading header");
+    tracing::debug!("image stream: reading header");
     let mut id_buf = [0u8; 8];
     read_exact_uni(recv, &mut id_buf).await?;
     let image_id = u64::from_le_bytes(id_buf);
-    tracing::info!(image_id, "image stream: got header");
+    tracing::debug!(image_id, "image stream: got header");
 
     let info = wait_for_pending(pending, image_id).await;
 
@@ -177,7 +177,7 @@ async fn handle_image_stream(
     } else {
         0
     };
-    tracing::info!(
+    tracing::debug!(
         image_id,
         bytes = avif_data.len(),
         recv_ms,

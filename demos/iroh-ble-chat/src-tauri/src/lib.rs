@@ -464,7 +464,7 @@ async fn gossip_event_pump(
                                 peer.to_ui(),
                             )
                         };
-                        info!(
+                        tracing::debug!(
                             peer = %from.fmt_short(),
                             nickname = %nickname,
                             gossip = gossip_status,
@@ -528,7 +528,7 @@ async fn gossip_event_pump(
                                 peer.to_ui(),
                             )
                         };
-                        info!(
+                        tracing::debug!(
                             peer = %from.fmt_short(),
                             nickname = %nickname,
                             text_len = text.len(),
@@ -599,7 +599,7 @@ async fn gossip_event_pump(
                                 peer.to_ui(),
                             )
                         };
-                        info!(
+                        tracing::debug!(
                             peer = %from.fmt_short(),
                             new_nickname = %new_nickname,
                             gossip = gossip_status,
@@ -684,7 +684,7 @@ async fn gossip_event_pump(
                                 ble_failures,
                             )
                         };
-                        info!(
+                        tracing::debug!(
                             peer = %from.fmt_short(),
                             nickname = %nickname,
                             image_id = *image_id,
@@ -1333,7 +1333,7 @@ async fn send_message(
     let total_peers = st.peers.len();
     drop(st);
 
-    info!(
+    tracing::debug!(
         text_len = text.len(),
         total_peers,
         known_peers = known_peers.len(),
@@ -1372,7 +1372,7 @@ async fn send_message(
         .broadcast(Bytes::from(payload))
         .await
         .map_err(|e| format!("broadcast: {e}"))?;
-    info!(text_len = text.len(), "send_message broadcast ok");
+    tracing::debug!(text_len = text.len(), "send_message broadcast ok");
 
     // Gossip doesn't deliver our own broadcasts back to us.
     let _ = app.emit(
@@ -1464,7 +1464,7 @@ async fn send_image(app: AppHandle, state: State<'_, Arc<Mutex<AppState>>>) -> R
     });
     let _ = sender.broadcast(Bytes::from(payload)).await;
 
-    info!(
+    tracing::debug!(
         peers = peer_ids.len(),
         image_id, avif_size, "sending image to peers"
     );
@@ -1499,7 +1499,7 @@ async fn stream_image_to_peer(
     match ep.remote_info(peer_id).await {
         Some(info) => {
             let addr_count = info.addrs().count();
-            info!(
+            tracing::debug!(
                 peer = %peer_id.fmt_short(),
                 addr_count,
                 "image stream: peer known to iroh"
@@ -1513,7 +1513,7 @@ async fn stream_image_to_peer(
         }
     }
 
-    info!(
+    tracing::debug!(
         peer = %peer_id.fmt_short(),
         image_id,
         size = avif_bytes.len(),
@@ -1530,14 +1530,20 @@ async fn stream_image_to_peer(
     .map_err(|_| "connect timed out after 60s".to_string())?
     .map_err(|e| format!("connect: {e}"))?;
 
-    info!(peer = %peer_id.fmt_short(), "image stream: connected, opening uni stream");
+    tracing::debug!(
+        peer = %peer_id.fmt_short(),
+        "image stream: connected, opening uni stream"
+    );
 
     let mut send = conn
         .open_uni()
         .await
         .map_err(|e| format!("open_uni: {e}"))?;
 
-    info!(peer = %peer_id.fmt_short(), "image stream: writing header + data");
+    tracing::debug!(
+        peer = %peer_id.fmt_short(),
+        "image stream: writing header + data"
+    );
 
     send.write_all(&image_id.to_le_bytes())
         .await
@@ -1558,7 +1564,7 @@ async fn stream_image_to_peer(
     // CONNECTION_CLOSE races with STREAM frames over slow BLE links.
     match tokio::time::timeout(std::time::Duration::from_secs(60), send.stopped()).await {
         Ok(stop_reason) => {
-            info!(
+            tracing::debug!(
                 peer = %peer_id.fmt_short(),
                 image_id,
                 written,
