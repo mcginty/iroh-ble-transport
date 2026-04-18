@@ -1629,7 +1629,7 @@ async fn set_debug(enabled: bool, state: State<'_, Arc<Mutex<AppState>>>) -> Res
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let debug_enabled = Arc::new(AtomicBool::new(true));
+    let debug_enabled = Arc::new(AtomicBool::new(false));
     let debug_enabled2 = debug_enabled.clone();
 
     #[allow(unused_mut)]
