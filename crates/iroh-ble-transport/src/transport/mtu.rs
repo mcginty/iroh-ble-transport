@@ -44,6 +44,12 @@ pub const MTU_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// ATT PDU overhead on every write/notify (1-byte opcode + 2-byte handle).
 pub const ATT_OVERHEAD: usize = 3;
 
+/// Max reassembled QUIC datagram size in bytes. Applied uniformly to the
+/// GATT (reliable) and L2CAP paths so both surface the same datagram-size
+/// ceiling to iroh. 1472 matches iroh's `initial_mtu(1200)` with headroom
+/// for QUIC overhead — see `docs/superpowers/specs/` for the rationale.
+pub const MAX_DATAGRAM_SIZE: usize = 1472;
+
 /// Resolve a chunk size for `device_id` by polling `iface.mtu()` until it
 /// crosses `MIN_SANE_MTU` or `MTU_READY_DEADLINE` elapses. The returned
 /// value is clamped to `MAX_CHUNK_SIZE` and is the over-the-wire fragment
@@ -56,7 +62,11 @@ pub async fn resolve_chunk_size(iface: &dyn BleInterface, device_id: &DeviceId) 
             break m;
         }
         if Instant::now() >= deadline {
-            tracing::warn!(
+            // Some backends (Linux blew stub, platforms where negotiation
+            // never completes) leave us at 23 forever. The fragment canary
+            // catches mis-sized fallbacks loudly, so this is an expected
+            // path rather than an operator-actionable warning.
+            tracing::info!(
                 device = %device_id,
                 last_seen = m,
                 "MTU never reached MIN_SANE_MTU, falling back"

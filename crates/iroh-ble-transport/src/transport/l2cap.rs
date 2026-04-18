@@ -9,21 +9,16 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 use super::IncomingPacket;
-
-/// Maximum datagram payload that can be sent on an L2CAP stream, in bytes.
-///
-/// Matches [`super::reliable::MAX_DATAGRAM_SIZE`] so the two transport paths
-/// expose the same datagram size ceiling to iroh.
-pub(super) const MAX_DATAGRAM_SIZE: usize = 1472;
+use super::mtu::MAX_DATAGRAM_SIZE;
 
 pub(super) async fn write_framed_datagram<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
@@ -77,8 +72,8 @@ pub(super) fn spawn_l2cap_io_tasks<R, W>(
     writer: W,
     device_id: blew::DeviceId,
     incoming_tx: mpsc::Sender<IncomingPacket>,
-    bytes_tx: Arc<AtomicU64>,
-    bytes_rx: Arc<AtomicU64>,
+    last_rx_at: crate::transport::peer::LivenessClock,
+    tearing_down: Arc<AtomicBool>,
 ) -> (
     mpsc::Sender<Vec<u8>>,
     JoinHandle<()>,
@@ -96,28 +91,33 @@ where
     let dev = device_id.clone();
     let send_guard = NotifyOnDrop(Arc::clone(&done));
     let mut writer = writer;
+    let send_teardown = Arc::clone(&tearing_down);
     let send_task = tokio::spawn(async move {
         let _guard = send_guard;
         while let Some(datagram) = outbound_rx.recv().await {
-            let len = datagram.len() as u64 + 2;
+            trace!(device = %dev, len = datagram.len(), "l2cap send task -> write_framed_datagram");
             if let Err(e) = write_framed_datagram(&mut writer, &datagram).await {
-                warn!(device = %dev, ?e, "l2cap send task exiting on error");
+                if send_teardown.load(Ordering::Relaxed) {
+                    debug!(device = %dev, ?e, "l2cap send task exiting during teardown");
+                } else {
+                    warn!(device = %dev, ?e, "l2cap send task exiting on writer error");
+                }
                 break;
             }
-            bytes_tx.fetch_add(len, Ordering::Relaxed);
+            trace!(device = %dev, "l2cap send task wrote datagram");
         }
         debug!(device = %dev, "l2cap send task exiting");
     });
 
     let recv_guard = NotifyOnDrop(Arc::clone(&done));
     let mut reader = reader;
+    let recv_teardown = Arc::clone(&tearing_down);
     let recv_task = tokio::spawn(async move {
         let _guard = recv_guard;
         loop {
             match read_framed_datagram(&mut reader).await {
                 Ok(Some(data)) => {
-                    let len = data.len() as u64 + 2;
-                    bytes_rx.fetch_add(len, Ordering::Relaxed);
+                    last_rx_at.bump();
                     if incoming_tx
                         .send(IncomingPacket {
                             device_id: device_id.clone(),
@@ -135,7 +135,11 @@ where
                     break;
                 }
                 Err(e) => {
-                    warn!(device = %device_id, ?e, "l2cap recv task exiting on error");
+                    if recv_teardown.load(Ordering::Relaxed) {
+                        debug!(device = %device_id, ?e, "l2cap recv task exiting during teardown");
+                    } else {
+                        warn!(device = %device_id, ?e, "l2cap recv task exiting on reader error");
+                    }
                     break;
                 }
             }
@@ -240,8 +244,8 @@ mod tests {
             a_wr,
             device_id.clone(),
             incoming_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         let (mut b_rd, mut b_wr) = split(peripheral_side);
@@ -277,8 +281,8 @@ mod tests {
             a_wr,
             device_id.clone(),
             incoming_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         let (_b_rd, mut b_wr) = split(peripheral_side);
@@ -309,8 +313,8 @@ mod tests {
             a_wr,
             blew::DeviceId::from("exit-test"),
             incoming_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         drop(b);
@@ -330,8 +334,8 @@ mod tests {
             a_wr,
             blew::DeviceId::from("abort-test"),
             incoming_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
+            crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         send_task.abort();

@@ -15,6 +15,10 @@ pub trait BleInterface: Send + Sync + 'static {
     async fn write_c2p(&self, device_id: &DeviceId, bytes: Bytes) -> BleResult<()>;
     async fn notify_p2c(&self, device_id: &DeviceId, bytes: Bytes) -> BleResult<()>;
     async fn read_psm(&self, device_id: &DeviceId) -> BleResult<Option<u16>>;
+    /// Read the peer's one-byte VERSION characteristic. Returns `Ok(None)`
+    /// if the peer does not publish VERSION (older build or characteristic
+    /// absent); callers treat that as "skip the check".
+    async fn read_version(&self, device_id: &DeviceId) -> BleResult<Option<u8>>;
     async fn open_l2cap(&self, device_id: &DeviceId, psm: u16) -> BleResult<L2capChannel>;
     async fn start_scan(&self) -> BleResult<()>;
     async fn stop_scan(&self) -> BleResult<()>;
@@ -55,6 +59,9 @@ mod tests {
             Ok(())
         }
         async fn read_psm(&self, _: &DeviceId) -> BleResult<Option<u16>> {
+            Ok(None)
+        }
+        async fn read_version(&self, _: &DeviceId) -> BleResult<Option<u8>> {
             Ok(None)
         }
         async fn open_l2cap(&self, _: &DeviceId, _: u16) -> BleResult<L2capChannel> {

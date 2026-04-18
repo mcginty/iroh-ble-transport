@@ -19,6 +19,7 @@ pub enum CallKind {
     WriteC2p { device_id: DeviceId, bytes: Bytes },
     NotifyP2c { device_id: DeviceId, bytes: Bytes },
     ReadPsm(DeviceId),
+    ReadVersion(DeviceId),
     OpenL2cap(DeviceId, u16),
     StartScan,
     StopScan,
@@ -41,9 +42,10 @@ struct Inner {
     is_powered: bool,
     connect_delay: Option<Duration>,
     next_channel_id: u64,
-    on_c2p_write: Option<Box<dyn Fn(Bytes) + Send + Sync>>,
-    on_p2c_notify: Option<Box<dyn Fn(Bytes) + Send + Sync>>,
+    on_c2p_write: Option<Box<dyn Fn(DeviceId, Bytes) + Send + Sync>>,
+    on_p2c_notify: Option<Box<dyn Fn(DeviceId, Bytes) + Send + Sync>>,
     psm_responses: VecDeque<Option<u16>>,
+    version_responses: VecDeque<Option<u8>>,
     mtu_responses: VecDeque<u16>,
     mtu_default: u16,
 }
@@ -81,6 +83,7 @@ impl MockBleInterface {
                 on_c2p_write: None,
                 on_p2c_notify: None,
                 psm_responses: VecDeque::new(),
+                version_responses: VecDeque::new(),
                 mtu_responses: VecDeque::new(),
                 mtu_default: 512,
             })),
@@ -139,11 +142,11 @@ impl MockBleInterface {
         self.inner.lock().unwrap().connect_delay = Some(delay);
     }
 
-    pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(Bytes) + Send + Sync>) {
+    pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
         self.inner.lock().unwrap().on_c2p_write = Some(hook);
     }
 
-    pub fn set_on_p2c_notify(&self, hook: Box<dyn Fn(Bytes) + Send + Sync>) {
+    pub fn set_on_p2c_notify(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
         self.inner.lock().unwrap().on_p2c_notify = Some(hook);
     }
 
@@ -160,6 +163,17 @@ impl MockBleInterface {
 
     pub fn seed_psm(&self, psm: Option<u16>) {
         self.inner.lock().unwrap().psm_responses.push_back(psm);
+    }
+
+    /// Queue one response for the next `read_version()` call. `None` means
+    /// "peer does not publish VERSION"; `Some(v)` is the byte the central
+    /// will observe.
+    pub fn seed_version(&self, version: Option<u8>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .version_responses
+            .push_back(version);
     }
 
     pub fn assert_called(&self, kind: &CallKind) {
@@ -228,7 +242,7 @@ impl BleInterface for MockBleInterface {
         }
         let hook = self.inner.lock().unwrap().on_c2p_write.take();
         if let Some(h) = hook.as_ref() {
-            h(bytes);
+            h(device_id.clone(), bytes);
         }
         if let Some(h) = hook {
             self.inner.lock().unwrap().on_c2p_write = Some(h);
@@ -254,12 +268,18 @@ impl BleInterface for MockBleInterface {
         }
         let hook = self.inner.lock().unwrap().on_p2c_notify.take();
         if let Some(h) = hook.as_ref() {
-            h(bytes);
+            h(device_id.clone(), bytes);
         }
         if let Some(h) = hook {
             self.inner.lock().unwrap().on_p2c_notify = Some(h);
         }
         Ok(())
+    }
+
+    async fn read_version(&self, device_id: &DeviceId) -> BleResult<Option<u8>> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(CallKind::ReadVersion(device_id.clone()));
+        Ok(inner.version_responses.pop_front().flatten())
     }
 
     async fn read_psm(&self, device_id: &DeviceId) -> BleResult<Option<u16>> {
@@ -340,15 +360,17 @@ impl BleInterface for MockBleInterface {
 }
 
 /// Pairs two `MockBleInterface` instances so that writes on one side appear
-/// as inbound fragments on the other side's registry inbox.
-pub struct MockFabric {
+/// as inbound fragments on the other side's registry inbox. The N=2 special
+/// case of the more general `MockFabric`; preserved so the existing suite
+/// of pairwise integration tests doesn't churn.
+pub struct MockFabricPair {
     pub central: Arc<MockBleInterface>,
     pub peripheral: Arc<MockBleInterface>,
     pub central_as_device: DeviceId,
     pub peripheral_as_device: DeviceId,
 }
 
-impl MockFabric {
+impl MockFabricPair {
     pub fn new(
         central_inbox: tokio::sync::mpsc::Sender<crate::transport::peer::PeerCommand>,
         peripheral_inbox: tokio::sync::mpsc::Sender<crate::transport::peer::PeerCommand>,
@@ -361,7 +383,7 @@ impl MockFabric {
         {
             let inbox = peripheral_inbox.clone();
             let from = central_as_device.clone();
-            central.set_on_c2p_write(Box::new(move |bytes| {
+            central.set_on_c2p_write(Box::new(move |_target, bytes| {
                 let cmd = crate::transport::peer::PeerCommand::InboundGattFragment {
                     device_id: from.clone(),
                     source: crate::transport::peer::FragmentSource::PeripheralReceivedC2p,
@@ -373,7 +395,7 @@ impl MockFabric {
         {
             let inbox = central_inbox.clone();
             let from = peripheral_as_device.clone();
-            peripheral.set_on_p2c_notify(Box::new(move |bytes| {
+            peripheral.set_on_p2c_notify(Box::new(move |_target, bytes| {
                 let cmd = crate::transport::peer::PeerCommand::InboundGattFragment {
                     device_id: from.clone(),
                     source: crate::transport::peer::FragmentSource::CentralReceivedP2c,
@@ -389,6 +411,72 @@ impl MockFabric {
             central_as_device,
             peripheral_as_device,
         }
+    }
+}
+
+/// N-node fabric that routes by destination `DeviceId`. Each `add_node` call
+/// returns a fresh `MockBleInterface` whose `on_c2p_write` and `on_p2c_notify`
+/// hooks are pre-wired to look the target up in the shared routing table and
+/// dispatch `PeerCommand::InboundGattFragment` into that node's inbox.
+///
+/// Unknown targets fail silently — models "wrote to a peer we used to know
+/// but which has since been removed."
+#[derive(Clone, Default)]
+pub struct MockFabric {
+    routes: Arc<
+        Mutex<
+            std::collections::HashMap<
+                DeviceId,
+                tokio::sync::mpsc::Sender<crate::transport::peer::PeerCommand>,
+            >,
+        >,
+    >,
+}
+
+impl MockFabric {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a node and returns its `MockBleInterface`. The interface's
+    /// c2p/p2c hooks are pre-installed to route by destination through the
+    /// shared routing table.
+    pub fn add_node(
+        &self,
+        device_id: DeviceId,
+        inbox: tokio::sync::mpsc::Sender<crate::transport::peer::PeerCommand>,
+    ) -> Arc<MockBleInterface> {
+        self.routes.lock().unwrap().insert(device_id.clone(), inbox);
+
+        let iface = Arc::new(MockBleInterface::new());
+
+        let routes_c2p = Arc::clone(&self.routes);
+        let from_c2p = device_id.clone();
+        iface.set_on_c2p_write(Box::new(move |target, bytes| {
+            let inbox = routes_c2p.lock().unwrap().get(&target).cloned();
+            if let Some(inbox) = inbox {
+                let _ = inbox.try_send(crate::transport::peer::PeerCommand::InboundGattFragment {
+                    device_id: from_c2p.clone(),
+                    source: crate::transport::peer::FragmentSource::PeripheralReceivedC2p,
+                    bytes,
+                });
+            }
+        }));
+
+        let routes_p2c = Arc::clone(&self.routes);
+        let from_p2c = device_id.clone();
+        iface.set_on_p2c_notify(Box::new(move |target, bytes| {
+            let inbox = routes_p2c.lock().unwrap().get(&target).cloned();
+            if let Some(inbox) = inbox {
+                let _ = inbox.try_send(crate::transport::peer::PeerCommand::InboundGattFragment {
+                    device_id: from_p2c.clone(),
+                    source: crate::transport::peer::FragmentSource::CentralReceivedP2c,
+                    bytes,
+                });
+            }
+        }));
+
+        iface
     }
 }
 
@@ -453,7 +541,7 @@ mod tests {
         let mock = MockBleInterface::new();
         let captured = Arc::new(Mutex::new(Vec::<Bytes>::new()));
         let sink = Arc::clone(&captured);
-        mock.set_on_c2p_write(Box::new(move |b| {
+        mock.set_on_c2p_write(Box::new(move |_target, b| {
             sink.lock().unwrap().push(b);
         }));
         mock.write_c2p(&DeviceId::from("peer-x"), Bytes::from_static(b"payload"))
@@ -469,7 +557,7 @@ mod tests {
         let mock = MockBleInterface::new();
         let captured = Arc::new(Mutex::new(Vec::<Bytes>::new()));
         let sink = Arc::clone(&captured);
-        mock.set_on_p2c_notify(Box::new(move |b| {
+        mock.set_on_p2c_notify(Box::new(move |_target, b| {
             sink.lock().unwrap().push(b);
         }));
         mock.notify_p2c(&DeviceId::from("peer-y"), Bytes::from_static(b"notify"))
@@ -487,7 +575,7 @@ mod tests {
         let (central_inbox, _central_rx) = tokio::sync::mpsc::channel::<PeerCommand>(16);
         let (peripheral_inbox, mut peripheral_rx) = tokio::sync::mpsc::channel::<PeerCommand>(16);
 
-        let fabric = MockFabric::new(central_inbox, peripheral_inbox);
+        let fabric = MockFabricPair::new(central_inbox, peripheral_inbox);
         fabric
             .central
             .write_c2p(&fabric.peripheral_as_device, Bytes::from_static(b"hello"))
@@ -536,5 +624,83 @@ mod tests {
         mock.on_disconnect(device.clone(), Err(crate::error::BleError::NotConnected));
         let result = rt.block_on(mock.disconnect(&device));
         assert!(matches!(result, Err(crate::error::BleError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn mock_fabric_routes_c2p_write_to_target_node_inbox() {
+        use crate::transport::peer::{FragmentSource, PeerCommand};
+
+        let (a_inbox_tx, _a_inbox_rx) = tokio::sync::mpsc::channel::<PeerCommand>(16);
+        let (b_inbox_tx, mut b_inbox_rx) = tokio::sync::mpsc::channel::<PeerCommand>(16);
+        let fabric = MockFabric::new();
+        let iface_a = fabric.add_node(DeviceId::from("a"), a_inbox_tx);
+        let _iface_b = fabric.add_node(DeviceId::from("b"), b_inbox_tx);
+
+        iface_a
+            .write_c2p(&DeviceId::from("b"), Bytes::from_static(b"hello-b"))
+            .await
+            .unwrap();
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), b_inbox_rx.recv())
+            .await
+            .expect("timeout waiting for routed fragment")
+            .expect("inbox closed");
+        match cmd {
+            PeerCommand::InboundGattFragment {
+                device_id,
+                source,
+                bytes,
+            } => {
+                assert_eq!(device_id, DeviceId::from("a"));
+                assert_eq!(source, FragmentSource::PeripheralReceivedC2p);
+                assert_eq!(&bytes[..], b"hello-b");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_fabric_routes_p2c_notify_to_target_node_inbox() {
+        use crate::transport::peer::{FragmentSource, PeerCommand};
+
+        let (a_inbox_tx, mut a_inbox_rx) = tokio::sync::mpsc::channel::<PeerCommand>(16);
+        let (b_inbox_tx, _b_inbox_rx) = tokio::sync::mpsc::channel::<PeerCommand>(16);
+        let fabric = MockFabric::new();
+        let _iface_a = fabric.add_node(DeviceId::from("a"), a_inbox_tx);
+        let iface_b = fabric.add_node(DeviceId::from("b"), b_inbox_tx);
+
+        iface_b
+            .notify_p2c(&DeviceId::from("a"), Bytes::from_static(b"hello-a"))
+            .await
+            .unwrap();
+
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), a_inbox_rx.recv())
+            .await
+            .expect("timeout waiting for routed fragment")
+            .expect("inbox closed");
+        match cmd {
+            PeerCommand::InboundGattFragment {
+                device_id,
+                source,
+                bytes,
+            } => {
+                assert_eq!(device_id, DeviceId::from("b"));
+                assert_eq!(source, FragmentSource::CentralReceivedP2c);
+                assert_eq!(&bytes[..], b"hello-a");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_fabric_drops_writes_to_unknown_target() {
+        let (a_inbox_tx, _a_inbox_rx) = tokio::sync::mpsc::channel(16);
+        let fabric = MockFabric::new();
+        let iface_a = fabric.add_node(DeviceId::from("a"), a_inbox_tx);
+        // No node with DeviceId "ghost" registered — write must not panic.
+        iface_a
+            .write_c2p(&DeviceId::from("ghost"), Bytes::from_static(b"nope"))
+            .await
+            .unwrap();
     }
 }

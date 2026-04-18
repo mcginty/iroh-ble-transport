@@ -1,7 +1,9 @@
 //! Transport layer module tree. `BleTransport` itself lives in `transport.rs`.
 
+pub mod dedup;
 pub mod driver;
 pub mod events;
+pub mod hook;
 pub mod interface;
 pub mod l2cap;
 pub mod mtu;

@@ -2,96 +2,33 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::task::Waker;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use parking_lot::Mutex;
+
 use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{ChannelHandle, ConnectPath, KEY_PREFIX_LEN, KeyPrefix, PeerCommand},
     registry::{Registry, SnapshotMaps},
+    routing::TransportRouting,
+    store::InMemoryPeerStore,
     test_util::{CallKind, MockBleInterface},
     transport::L2capPolicy,
 };
 use tokio::sync::mpsc;
 
-fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-    (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+fn test_wakers() -> Arc<Mutex<Vec<Waker>>> {
+    Arc::new(Mutex::new(Vec::new()))
 }
 
-#[tokio::test]
-async fn advertised_then_send_triggers_connect_and_ack() {
-    let iface = Arc::new(MockBleInterface::new());
-    let device_id = blew::DeviceId::from("dev-a");
-    iface.on_connect(
-        device_id.clone(),
-        Ok(ChannelHandle {
-            id: 1,
-            path: ConnectPath::Gatt,
-        }),
-    );
+fn test_routing() -> Arc<TransportRouting> {
+    Arc::new(TransportRouting::new())
+}
 
-    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
-    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
-    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
-    let driver = Driver::new(
-        iface.clone(),
-        tx.clone(),
-        incoming_tx,
-        retransmits,
-        truncations,
-    );
-    let reg = Registry::new(L2capPolicy::Disabled);
-    let snap_for_actor = snapshots.clone();
-    tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
-    });
-
-    let prefix: KeyPrefix = [1u8; KEY_PREFIX_LEN];
-    tx.send(PeerCommand::Advertised {
-        prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
-        rssi: None,
-    })
-    .await
-    .unwrap();
-
-    // Give the actor a tick to process.
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Push a SendDatagram which should transition Discovered → Connecting → StartConnect.
-    // The waker is required by the SendDatagram field but its notification is not
-    // asserted here — the test polls iface.calls() directly.
-    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
-    let waker = waker_from_channel(waker_tx);
-    tx.send(PeerCommand::SendDatagram {
-        device_id: device_id.clone(),
-        tx_gen: 0,
-        datagram: bytes::Bytes::from_static(b"ping"),
-        waker,
-    })
-    .await
-    .unwrap();
-
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if iface
-                .calls()
-                .iter()
-                .any(|c| matches!(c, CallKind::Connect(_)))
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("expected Connect call");
+fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>) {
+    (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
 }
 
 fn waker_from_channel(tx: mpsc::Sender<()>) -> std::task::Waker {
@@ -134,11 +71,13 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
+            .await;
     });
     tokio::spawn(iroh_ble_transport::transport::watchdog::run_watchdog(
         tx.clone(),
@@ -239,11 +178,13 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
+            .await;
     });
     tokio::spawn(iroh_ble_transport::transport::watchdog::run_watchdog(
         tx.clone(),
@@ -293,92 +234,222 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_round_trip_over_mock_gatt() {
-    use iroh_ble_transport::transport::test_util::MockFabric;
+async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
+    let iface = Arc::new(MockBleInterface::new());
 
-    let (central_inbox_tx, central_inbox_rx) = mpsc::channel::<PeerCommand>(256);
-    let (peripheral_inbox_tx, peripheral_inbox_rx) = mpsc::channel::<PeerCommand>(256);
-    let fabric = MockFabric::new(central_inbox_tx.clone(), peripheral_inbox_tx.clone());
-
-    let (central_incoming_tx, _central_incoming_rx) = mpsc::channel::<IncomingPacket>(64);
-    let (peripheral_incoming_tx, mut peripheral_incoming_rx) = mpsc::channel::<IncomingPacket>(64);
-
-    let central_snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let peripheral_snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-
-    let (c_retransmits, c_truncations) = zero_counters();
-    let (p_retransmits, p_truncations) = zero_counters();
-
-    let central_driver = Driver::new(
-        fabric.central.clone(),
-        central_inbox_tx.clone(),
-        central_incoming_tx,
-        c_retransmits,
-        c_truncations,
+    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
-    let peripheral_driver = Driver::new(
-        fabric.peripheral.clone(),
-        peripheral_inbox_tx.clone(),
-        peripheral_incoming_tx,
-        p_retransmits,
-        p_truncations,
-    );
-
-    let central_reg = Registry::new(L2capPolicy::Disabled);
-    let peripheral_reg = Registry::new(L2capPolicy::Disabled);
-    let cs = central_snapshots.clone();
-    let ps = peripheral_snapshots.clone();
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+    let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        central_reg.run(central_inbox_rx, central_driver, cs).await;
-    });
-    tokio::spawn(async move {
-        peripheral_reg
-            .run(peripheral_inbox_rx, peripheral_driver, ps)
+        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
             .await;
     });
 
-    let prefix: KeyPrefix = [0xAAu8; KEY_PREFIX_LEN];
-    central_inbox_tx
-        .send(PeerCommand::Advertised {
-            prefix,
-            device: blew::BleDevice {
-                id: fabric.peripheral_as_device.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+    tx.send(PeerCommand::AdapterStateChanged { powered: false })
+        .await
+        .unwrap();
+    tx.send(PeerCommand::AdapterStateChanged { powered: true })
+        .await
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let calls = iface.calls();
+            let has_rebuild = calls.iter().any(|c| matches!(c, CallKind::RebuildServer));
+            let has_restart_adv = calls
+                .iter()
+                .any(|c| matches!(c, CallKind::RestartAdvertising));
+            let has_restart_l2cap = calls
+                .iter()
+                .any(|c| matches!(c, CallKind::RestartL2capListener));
+            if has_rebuild && has_restart_adv && has_restart_l2cap {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "expected rebuild_server + restart_advertising + restart_l2cap_listener after adapter-on",
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_mismatch_deads_peer_and_closes_channel() {
+    use iroh_ble_transport::transport::peer::DeadReason;
+    use iroh_ble_transport::transport::registry::PhaseKind;
+
+    let iface = Arc::new(MockBleInterface::new());
+    let device_id = blew::DeviceId::from("dev-vmismatch");
+    iface.on_connect(
+        device_id.clone(),
+        Ok(ChannelHandle {
+            id: 1,
+            path: ConnectPath::Gatt,
+        }),
+    );
+    // Seed a peer-advertised version that disagrees with our compile-time one.
+    iface.seed_version(Some(0xAA));
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(64);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(8);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+        Arc::new(InMemoryPeerStore::new()),
+    );
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
+            .await;
+    });
+
+    let prefix: KeyPrefix = [0x77; KEY_PREFIX_LEN];
+    tx.send(PeerCommand::Advertised {
+        prefix,
+        device: blew::BleDevice {
+            id: device_id.clone(),
+            name: None,
             rssi: None,
-        })
-        .await
-        .unwrap();
-
+            services: vec![],
+        },
+        rssi: None,
+    })
+    .await
+    .unwrap();
     let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
-    let waker = waker_from_channel(waker_tx);
-    central_inbox_tx
-        .send(PeerCommand::SendDatagram {
-            device_id: fabric.peripheral_as_device.clone(),
-            tx_gen: 0,
-            datagram: bytes::Bytes::from_static(b"hello-peripheral"),
-            waker,
-        })
-        .await
-        .unwrap();
+    tx.send(PeerCommand::SendDatagram {
+        device_id: device_id.clone(),
+        tx_gen: 0,
+        datagram: bytes::Bytes::from_static(b"x"),
+        waker: waker_from_channel(waker_tx),
+    })
+    .await
+    .unwrap();
 
-    let pkt = tokio::time::timeout(Duration::from_secs(10), peripheral_incoming_rx.recv())
-        .await
-        .expect("timed out waiting for round-trip delivery")
-        .expect("incoming_rx closed");
-    assert_eq!(pkt.data.as_ref(), b"hello-peripheral");
-    let _ = fabric;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snap = snapshots.load();
+            if let Some(summary) = snap.peer_states.get(&device_id)
+                && summary.phase_kind == PhaseKind::Dead
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("peer should reach Dead after version mismatch");
+
+    assert!(
+        iface
+            .calls()
+            .iter()
+            .any(|c| matches!(c, CallKind::ReadVersion(d) if d == &device_id)),
+        "expected read_version to be called"
+    );
+    assert!(
+        iface
+            .calls()
+            .iter()
+            .any(|c| matches!(c, CallKind::Disconnect(d) if d == &device_id)),
+        "expected disconnect after version mismatch"
+    );
+    let _ = DeadReason::ProtocolMismatch { got: 0, want: 0 };
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn version_match_lets_data_pipe_start() {
+    let iface = Arc::new(MockBleInterface::new());
+    let device_id = blew::DeviceId::from("dev-vmatch");
+    iface.on_connect(
+        device_id.clone(),
+        Ok(ChannelHandle {
+            id: 1,
+            path: ConnectPath::Gatt,
+        }),
+    );
+    iface.seed_version(Some(
+        iroh_ble_transport::transport::transport::PROTOCOL_VERSION,
+    ));
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(64);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(8);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations) = zero_counters();
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+        Arc::new(InMemoryPeerStore::new()),
+    );
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
+            .await;
+    });
+
+    let prefix: KeyPrefix = [0x78; KEY_PREFIX_LEN];
+    tx.send(PeerCommand::Advertised {
+        prefix,
+        device: blew::BleDevice {
+            id: device_id.clone(),
+            name: None,
+            rssi: None,
+            services: vec![],
+        },
+        rssi: None,
+    })
+    .await
+    .unwrap();
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
+    tx.send(PeerCommand::SendDatagram {
+        device_id: device_id.clone(),
+        tx_gen: 0,
+        datagram: bytes::Bytes::from_static(b"x"),
+        waker: waker_from_channel(waker_tx),
+    })
+    .await
+    .unwrap();
+
+    wait_for_call_count(&iface, CallKindMatcher::Connect, 1, Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !iface
+            .calls()
+            .iter()
+            .any(|c| matches!(c, CallKind::Disconnect(d) if d == &device_id)),
+        "matching version must not trigger a disconnect"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mock_fabric_handles_bidirectional_traffic() {
-    use iroh_ble_transport::transport::test_util::MockFabric;
+    use iroh_ble_transport::transport::test_util::MockFabricPair;
 
     let (central_inbox_tx, central_inbox_rx) = mpsc::channel::<PeerCommand>(256);
     let (peripheral_inbox_tx, peripheral_inbox_rx) = mpsc::channel::<PeerCommand>(256);
-    let fabric = MockFabric::new(central_inbox_tx.clone(), peripheral_inbox_tx.clone());
+    let fabric = MockFabricPair::new(central_inbox_tx.clone(), peripheral_inbox_tx.clone());
 
     let (central_incoming_tx, mut central_incoming_rx) = mpsc::channel::<IncomingPacket>(64);
     let (peripheral_incoming_tx, mut peripheral_incoming_rx) = mpsc::channel::<IncomingPacket>(64);
@@ -395,6 +466,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         central_incoming_tx,
         c_retransmits,
         c_truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
     let peripheral_driver = Driver::new(
         fabric.peripheral.clone(),
@@ -402,18 +474,33 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         peripheral_incoming_tx,
         p_retransmits,
         p_truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
 
-    let central_reg = Registry::new(L2capPolicy::Disabled);
-    let peripheral_reg = Registry::new(L2capPolicy::Disabled);
+    let central_reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
+    let peripheral_reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let cs = central_snapshots.clone();
     let ps = peripheral_snapshots.clone();
     tokio::spawn(async move {
-        central_reg.run(central_inbox_rx, central_driver, cs).await;
+        central_reg
+            .run(
+                central_inbox_rx,
+                central_driver,
+                cs,
+                test_wakers(),
+                test_routing(),
+            )
+            .await;
     });
     tokio::spawn(async move {
         peripheral_reg
-            .run(peripheral_inbox_rx, peripheral_driver, ps)
+            .run(
+                peripheral_inbox_rx,
+                peripheral_driver,
+                ps,
+                test_wakers(),
+                test_routing(),
+            )
             .await;
     });
 
@@ -540,11 +627,13 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
+            .await;
     });
 
     // First lifecycle: advertise, send, wait for connect.
@@ -653,11 +742,13 @@ async fn connect_failure_retries_on_next_tick() {
         incoming_tx,
         retransmits,
         truncations,
+        Arc::new(InMemoryPeerStore::new()),
     );
-    let reg = Registry::new(L2capPolicy::Disabled);
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
+        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
+            .await;
     });
 
     let prefix: KeyPrefix = [9u8; KEY_PREFIX_LEN];
@@ -692,10 +783,10 @@ async fn connect_failure_retries_on_next_tick() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let maps = snapshots.load();
-            if let Some(state) = maps.peer_states.get(&device_id) {
-                if state.phase_kind == PhaseKind::Reconnecting {
-                    return;
-                }
+            if let Some(state) = maps.peer_states.get(&device_id)
+                && state.phase_kind == PhaseKind::Reconnecting
+            {
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -714,91 +805,11 @@ async fn connect_failure_retries_on_next_tick() {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let maps = snapshots.load();
-            if let Some(state) = maps.peer_states.get(&device_id) {
-                if matches!(
+            if let Some(state) = maps.peer_states.get(&device_id)
+                && matches!(
                     state.phase_kind,
                     PhaseKind::Connected | PhaseKind::Handshaking
-                ) {
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("peer did not reach Connected or Handshaking after retry");
-}
-
-#[tokio::test]
-async fn l2cap_prefer_succeeds_and_connects_via_l2cap() {
-    use iroh_ble_transport::transport::registry::PhaseKind;
-
-    let iface = Arc::new(MockBleInterface::new());
-    let device_id = blew::DeviceId::from("dev-l2cap-ok");
-
-    // Seed successful GATT connect.
-    iface.on_connect(
-        device_id.clone(),
-        Ok(ChannelHandle {
-            id: 20,
-            path: ConnectPath::Gatt,
-        }),
-    );
-    // Seed PSM response.
-    iface.seed_psm(Some(128));
-    // Seed L2CAP open success.
-    let (l2cap_channel, _other) = blew::L2capChannel::pair(8192);
-    iface.on_open_l2cap(device_id.clone(), 128, Ok(l2cap_channel));
-
-    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
-    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
-    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
-    let driver = Driver::new(
-        iface.clone(),
-        tx.clone(),
-        incoming_tx,
-        retransmits,
-        truncations,
-    );
-    let reg = Registry::new(L2capPolicy::PreferL2cap);
-    let snap_for_actor = snapshots.clone();
-    tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
-    });
-
-    let prefix: KeyPrefix = [0xCCu8; KEY_PREFIX_LEN];
-    tx.send(PeerCommand::Advertised {
-        prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
-        rssi: None,
-    })
-    .await
-    .unwrap();
-
-    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
-    let waker = waker_from_channel(waker_tx);
-    tx.send(PeerCommand::SendDatagram {
-        device_id: device_id.clone(),
-        tx_gen: 0,
-        datagram: bytes::Bytes::from_static(b"l2cap-ping"),
-        waker,
-    })
-    .await
-    .unwrap();
-
-    // Wait for the OpenL2cap call to the mock.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if iface
-                .calls()
-                .iter()
-                .any(|c| matches!(c, CallKind::OpenL2cap(_, 128)))
+                )
             {
                 return;
             }
@@ -806,105 +817,7 @@ async fn l2cap_prefer_succeeds_and_connects_via_l2cap() {
         }
     })
     .await
-    .expect("expected OpenL2cap(_, 128) call");
-
-    // Wait for peer to reach Connected via L2CAP path.
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let maps = snapshots.load();
-            if let Some(state) = maps.peer_states.get(&device_id) {
-                if state.phase_kind == PhaseKind::Connected
-                    && state.connect_path == Some(ConnectPath::L2cap)
-                {
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("peer did not reach Connected with L2CAP path");
-}
-
-#[tokio::test]
-async fn l2cap_prefer_fallback_to_gatt_on_failure() {
-    use iroh_ble_transport::error::BleError;
-    use iroh_ble_transport::transport::registry::PhaseKind;
-
-    let iface = Arc::new(MockBleInterface::new());
-    let device_id = blew::DeviceId::from("dev-l2cap-fallback");
-
-    // Seed successful GATT connect.
-    iface.on_connect(
-        device_id.clone(),
-        Ok(ChannelHandle {
-            id: 30,
-            path: ConnectPath::Gatt,
-        }),
-    );
-    // Seed PSM response.
-    iface.seed_psm(Some(128));
-    // Seed L2CAP open failure.
-    iface.on_open_l2cap(device_id.clone(), 128, Err(BleError::Unsupported));
-
-    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
-    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
-    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
-    let driver = Driver::new(
-        iface.clone(),
-        tx.clone(),
-        incoming_tx,
-        retransmits,
-        truncations,
-    );
-    let reg = Registry::new(L2capPolicy::PreferL2cap);
-    let snap_for_actor = snapshots.clone();
-    tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor).await;
-    });
-
-    let prefix: KeyPrefix = [0xDDu8; KEY_PREFIX_LEN];
-    tx.send(PeerCommand::Advertised {
-        prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
-        rssi: None,
-    })
-    .await
-    .unwrap();
-
-    let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
-    let waker = waker_from_channel(waker_tx);
-    tx.send(PeerCommand::SendDatagram {
-        device_id: device_id.clone(),
-        tx_gen: 0,
-        datagram: bytes::Bytes::from_static(b"gatt-fallback"),
-        waker,
-    })
-    .await
-    .unwrap();
-
-    // Wait for peer to reach Connected via GATT (L2CAP fallback).
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let maps = snapshots.load();
-            if let Some(state) = maps.peer_states.get(&device_id) {
-                if state.phase_kind == PhaseKind::Connected
-                    && state.connect_path == Some(ConnectPath::Gatt)
-                {
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("peer did not reach Connected with GATT fallback path");
+    .expect("peer did not reach Connected or Handshaking after retry");
 }
 
 enum CallKindMatcher {

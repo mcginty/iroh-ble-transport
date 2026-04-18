@@ -51,11 +51,14 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{debug, trace, warn};
+
+use super::mtu::MAX_DATAGRAM_SIZE;
+
 const HEADER_SIZE: usize = 2;
 
 /// Trailer byte appended to every outbound fragment so the receiver can
@@ -87,7 +90,6 @@ fn set_ack(header: &mut [u8], ack_seq: u8) {
 fn seq_dist(a: u8, b: u8) -> u8 {
     b.wrapping_sub(a) % SEQ_MODULUS
 }
-pub const MAX_DATAGRAM_SIZE: usize = 1472;
 
 /// Must be < SEQ_MODULUS / 2 for correct modular window arithmetic.
 const WINDOW_SIZE: u8 = 6;
@@ -195,7 +197,9 @@ pub struct ReliableChannel {
     state: Arc<Mutex<ChannelState>>,
     wake: Arc<Notify>,
     datagram_tx: mpsc::Sender<Vec<u8>>,
-    chunk_size: usize,
+    /// Mutable so the pipe can start with a conservative floor and be updated
+    /// once `resolve_chunk_size` lands — see `pipe::run_gatt_pipe`.
+    chunk_size: AtomicUsize,
     send_waker: Arc<atomic_waker::AtomicWaker>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
@@ -227,12 +231,21 @@ impl ReliableChannel {
             })),
             wake: Arc::new(Notify::new()),
             datagram_tx,
-            chunk_size,
+            chunk_size: AtomicUsize::new(chunk_size),
             send_waker: Arc::new(atomic_waker::AtomicWaker::new()),
             retransmit_counter,
             truncation_counter,
         };
         (ch, datagram_rx)
+    }
+
+    /// Update the outbound fragment chunk size. Affects future calls to
+    /// `fragment_into`; fragments already split into `frag_queue` or sitting
+    /// in `in_flight` keep their existing sizing so retransmits stay
+    /// consistent. Intended to be called once per channel lifetime when the
+    /// async MTU resolver lands a sane reading — see `pipe::run_gatt_pipe`.
+    pub fn set_chunk_size(&self, chunk_size: usize) {
+        self.chunk_size.store(chunk_size, Ordering::Relaxed);
     }
 
     /// Signal that the underlying link is gone — typically because blew has
@@ -440,10 +453,15 @@ impl ReliableChannel {
     /// dispatching a fresh fragment — Selective Repeat keeps the window moving
     /// while the head is stalled, so "we sent something new" implies nothing
     /// about the dead peer.
-    pub async fn run_send_loop<F, Fut>(&self, mut send_fn: F) -> Result<(), LinkDead>
+    pub async fn run_send_loop<F, Fut, S>(
+        &self,
+        mut send_fn: F,
+        is_tearing_down: S,
+    ) -> Result<(), LinkDead>
     where
         F: FnMut(Vec<u8>) -> Fut,
         Fut: std::future::Future<Output = Result<(), String>>,
+        S: Fn() -> bool,
     {
         let mut timeout = ACK_TIMEOUT;
         let mut tracked_progress_at: Option<tokio::time::Instant> = None;
@@ -517,7 +535,14 @@ impl ReliableChannel {
                                         "ACK timeout, retransmitting oldest fragment"
                                     );
                                     if let Err(e) = send_fn(msg).await {
-                                        warn!(err = %e, "BLE retransmit failed");
+                                        if is_tearing_down() {
+                                            debug!(
+                                                err = %e,
+                                                "BLE retransmit failed during teardown"
+                                            );
+                                        } else {
+                                            warn!(err = %e, "BLE retransmit failed");
+                                        }
                                     }
                                 }
 
@@ -540,7 +565,11 @@ impl ReliableChannel {
                 }
                 SendAction::Send(msg) => {
                     if let Err(e) = send_fn(msg).await {
-                        warn!(err = %e, "BLE send failed");
+                        if is_tearing_down() {
+                            debug!(err = %e, "BLE send failed during teardown");
+                        } else {
+                            warn!(err = %e, "BLE send failed");
+                        }
                     }
 
                     tokio::time::sleep(INTER_FRAME_GAP).await;
@@ -616,7 +645,7 @@ impl ReliableChannel {
     }
 
     fn fragment_into(&self, state: &mut ChannelState, datagram: Vec<u8>) {
-        let max_payload = self.chunk_size - HEADER_SIZE - 1;
+        let max_payload = self.chunk_size.load(Ordering::Relaxed) - HEADER_SIZE - 1;
 
         if datagram.len() <= max_payload {
             state.frag_queue.push_back(FragmentEntry {
@@ -1153,13 +1182,16 @@ mod tests {
         let ch2 = ch.clone();
         let sent2 = sent.clone();
         let handle = tokio::spawn(async move {
-            ch2.run_send_loop(|data| {
-                let sent = sent2.clone();
-                async move {
-                    sent.lock().await.push(data);
-                    Ok(())
-                }
-            })
+            ch2.run_send_loop(
+                |data| {
+                    let sent = sent2.clone();
+                    async move {
+                        sent.lock().await.push(data);
+                        Ok(())
+                    }
+                },
+                || false,
+            )
             .await
         });
 
@@ -1184,7 +1216,10 @@ mod tests {
         ch.enqueue_datagram(b"data".to_vec()).await;
 
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Advance well past LINK_DEAD_DEADLINE (6s) with no ACKs. 30 × 500ms
         // is 15s — more than enough for the progress deadline to fire.
@@ -1222,7 +1257,10 @@ mod tests {
         ch.enqueue_datagram(b"stuck".to_vec()).await;
 
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Helper: advance virtual time in small chunks with yields between,
         // so each timer firing gets polled by the runtime. Coarse advances
@@ -1278,7 +1316,10 @@ mod tests {
         ch.enqueue_datagram(b"stuck".to_vec()).await;
 
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Let the loop dispatch frag0, clear INTER_FRAME_GAP, re-enter the
         // Wait arm and park on `wake.notified()`.
@@ -1321,7 +1362,10 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Advance in 250ms steps — fine enough that every retransmit timer
         // and the deadline fire promptly.
@@ -1364,7 +1408,10 @@ mod tests {
         ch.enqueue_datagram(b"one".to_vec()).await;
 
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move { ch2.run_send_loop(|_data| async { Ok(()) }).await });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Burn ~4s of the deadline with retransmits — under 6s, still alive.
         for _ in 0..8 {
@@ -1828,13 +1875,16 @@ mod tests {
         let ch_for_task = Arc::clone(&ch);
         let handle = tokio::spawn(async move {
             ch_for_task
-                .run_send_loop(move |bytes| {
-                    let captured = Arc::clone(&captured_for_cb);
-                    async move {
-                        captured.lock().unwrap().push(bytes);
-                        Ok::<(), String>(())
-                    }
-                })
+                .run_send_loop(
+                    move |bytes| {
+                        let captured = Arc::clone(&captured_for_cb);
+                        async move {
+                            captured.lock().unwrap().push(bytes);
+                            Ok::<(), String>(())
+                        }
+                    },
+                    || false,
+                )
                 .await
         });
 

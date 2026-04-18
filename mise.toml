@@ -14,6 +14,7 @@ pnpm = "10"
 java = "temurin-17"
 ktlint = "latest"
 android-sdk = "latest"
+xcodes = "latest"
 
 [env]
 CARGO_TERM_COLOR = "always"
@@ -37,8 +38,8 @@ depends = ["fmt"]
 run = "cargo clippy --workspace --fix"
 
 [tasks.test]
-description = "Run all tests"
-run = "cargo nextest run --workspace"
+description = "Run all tests (includes feature-gated integration tests)"
+run = "cargo nextest run --workspace --all-features"
 
 [tasks.fmt]
 description = "Format all Rust code"
@@ -90,6 +91,15 @@ run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri build"
 [tasks."chat:dev:ios"]
 description = "Run the chat app on iOS device"
 run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri ios dev --open"
+
+[tasks."chat:xcode:ios"]
+description = "Run iOS app with bundled frontend (no dev server) and open Xcode for debugging"
+run = """
+cd demos/iroh-ble-chat && \
+pnpm install && \
+pnpm build && \
+pnpm tauri ios dev --no-dev-server --open
+"""
 
 [tasks."chat:dev:android"]
 description = "Run the chat app on Android device"

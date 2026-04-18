@@ -44,6 +44,13 @@ struct RoutingInner {
     device_to_token: HashMap<DeviceId, Token>,
     token_origin: HashMap<Token, TokenOrigin>,
     discovered: HashMap<KeyPrefix, DeviceId>,
+    /// Prefixes that currently have an active (Connected) PeerEntry pinned
+    /// to a specific DeviceId. Scan advertisements that would remap such a
+    /// prefix onto a different DeviceId are ignored — the typical cause is
+    /// Android's per-advertisement MAC randomization, and eviction of the
+    /// live connection causes in-flight GATT writes to error with GattBusy.
+    /// Maintained by the registry actor from `publish_active_prefixes`.
+    pinned: HashMap<KeyPrefix, DeviceId>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,7 +63,13 @@ enum TokenOrigin {
 pub enum DiscoveryUpdate {
     Unchanged,
     New,
-    Replaced { previous: DeviceId },
+    Replaced {
+        previous: DeviceId,
+    },
+    /// The prefix is currently pinned to a different DeviceId by a live
+    /// PeerEntry, so the scan result was ignored. Callers must not emit
+    /// `Forget` or `Advertised` — the existing connection must keep running.
+    ActivelyPinned,
 }
 
 impl TransportRouting {
@@ -107,17 +120,22 @@ impl TransportRouting {
     /// if its advertising has been noted, otherwise fall back to a
     /// device-keyed token.
     pub fn mint_token_for_source(&self, device: &DeviceId) -> Token {
-        let prefix = {
-            let inner = self.inner.lock().expect("routing mutex poisoned");
-            inner
-                .discovered
-                .iter()
-                .find_map(|(p, d)| (d == device).then_some(*p))
-        };
-        match prefix {
+        match self.prefix_for_device(device) {
             Some(prefix) => self.mint_token_for_prefix(prefix),
             None => self.mint_token_for_device(device),
         }
+    }
+
+    /// Reverse-lookup the `KeyPrefix` that currently maps to `device`, if any.
+    /// Used by the peripheral event pump to stamp inbound peripheral-role
+    /// PeerEntries with the peer identity learned from scanning, so dedup can
+    /// collapse central+peripheral entries for the same peer.
+    pub fn prefix_for_device(&self, device: &DeviceId) -> Option<KeyPrefix> {
+        let inner = self.inner.lock().expect("routing mutex poisoned");
+        inner
+            .discovered
+            .iter()
+            .find_map(|(p, d)| (d == device).then_some(*p))
     }
 
     /// Resolve a token back to the `DeviceId` that should receive outbound
@@ -143,6 +161,11 @@ impl TransportRouting {
     pub fn note_discovery(&self, prefix: KeyPrefix, device: DeviceId) -> DiscoveryUpdate {
         let update = {
             let mut inner = self.inner.lock().expect("routing mutex poisoned");
+            if let Some(pinned) = inner.pinned.get(&prefix)
+                && pinned != &device
+            {
+                return DiscoveryUpdate::ActivelyPinned;
+            }
             match inner.discovered.insert(prefix, device.clone()) {
                 None => DiscoveryUpdate::New,
                 Some(previous) if previous == device => DiscoveryUpdate::Unchanged,
@@ -153,6 +176,15 @@ impl TransportRouting {
             self.wake_send_waiters();
         }
         update
+    }
+
+    /// Replace the set of actively-pinned prefix→DeviceId bindings in one
+    /// atomic step. Called by the registry actor after each `handle()` tick
+    /// to reflect Connected peers. A prefix that disappears from the set is
+    /// no longer protected from scan-driven eviction.
+    pub fn publish_active_prefixes(&self, active: HashMap<KeyPrefix, DeviceId>) {
+        let mut inner = self.inner.lock().expect("routing mutex poisoned");
+        inner.pinned = active;
     }
 
     /// Park a `BleSender::poll_send` waker. Used together with a re-check of
@@ -265,6 +297,74 @@ mod tests {
         let d = blew::DeviceId::from("unknown-mac");
         let t = r.mint_token_for_source(&d);
         assert_eq!(r.device_for_token(t).as_ref(), Some(&d));
+    }
+
+    #[test]
+    fn prefix_for_device_returns_none_when_undiscovered() {
+        let r = TransportRouting::new();
+        let d = blew::DeviceId::from("unseen");
+        assert!(r.prefix_for_device(&d).is_none());
+    }
+
+    #[test]
+    fn prefix_for_device_returns_prefix_after_discovery() {
+        let r = TransportRouting::new();
+        let p: KeyPrefix = [7u8; KEY_PREFIX_LEN];
+        let d = blew::DeviceId::from("seen");
+        r.note_discovery(p, d.clone());
+        assert_eq!(r.prefix_for_device(&d), Some(p));
+    }
+
+    #[test]
+    fn note_discovery_suppresses_eviction_when_prefix_is_pinned() {
+        let r = TransportRouting::new();
+        let prefix: KeyPrefix = [20u8; KEY_PREFIX_LEN];
+        let live = blew::DeviceId::from("live-connection");
+        let noise = blew::DeviceId::from("scan-noise");
+        r.note_discovery(prefix, live.clone());
+        // Registry tells routing: this prefix has a live PeerEntry on `live`.
+        r.publish_active_prefixes(HashMap::from([(prefix, live.clone())]));
+        // A scan result for a different DeviceId must not be allowed to
+        // replace the mapping — that's the "Android MAC randomization evicts
+        // live connection" bug.
+        assert_eq!(
+            r.note_discovery(prefix, noise),
+            DiscoveryUpdate::ActivelyPinned
+        );
+        // discovered map is untouched — device_for_token still points at live.
+        let token = r.mint_token_for_prefix(prefix);
+        assert_eq!(r.device_for_token(token).as_ref(), Some(&live));
+    }
+
+    #[test]
+    fn note_discovery_allows_same_device_when_pinned() {
+        let r = TransportRouting::new();
+        let prefix: KeyPrefix = [21u8; KEY_PREFIX_LEN];
+        let d = blew::DeviceId::from("live");
+        r.note_discovery(prefix, d.clone());
+        r.publish_active_prefixes(HashMap::from([(prefix, d.clone())]));
+        assert_eq!(
+            r.note_discovery(prefix, d),
+            DiscoveryUpdate::Unchanged,
+            "re-advertising the same pinned DeviceId should be Unchanged"
+        );
+    }
+
+    #[test]
+    fn publish_active_prefixes_clears_old_pins() {
+        let r = TransportRouting::new();
+        let prefix: KeyPrefix = [22u8; KEY_PREFIX_LEN];
+        let old = blew::DeviceId::from("old");
+        let new = blew::DeviceId::from("new");
+        r.note_discovery(prefix, old.clone());
+        r.publish_active_prefixes(HashMap::from([(prefix, old.clone())]));
+        // Registry says: this prefix is no longer connected.
+        r.publish_active_prefixes(HashMap::new());
+        // Now a scan result for a new DeviceId should replace normally.
+        assert_eq!(
+            r.note_discovery(prefix, new.clone()),
+            DiscoveryUpdate::Replaced { previous: old }
+        );
     }
 
     #[test]

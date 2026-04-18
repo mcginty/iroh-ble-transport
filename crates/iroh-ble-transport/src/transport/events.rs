@@ -72,11 +72,20 @@ pub async fn run_central_events(
                             .await
                             .is_err()
                         {
-                            tracing::warn!(
+                            tracing::debug!(
                                 "central event pump: inbox closed during forget, shutting down"
                             );
                             break;
                         }
+                    }
+                    DiscoveryUpdate::ActivelyPinned => {
+                        tracing::trace!(
+                            device = %device.id,
+                            ?prefix,
+                            rssi,
+                            "ignoring scan: prefix is actively pinned to a different DeviceId"
+                        );
+                        continue;
                     }
                 }
                 PeerCommand::Advertised {
@@ -115,7 +124,7 @@ pub async fn run_central_events(
             CentralEvent::Restored { devices } => PeerCommand::RestoreFromAdapter { devices },
         };
         if inbox.send(cmd).await.is_err() {
-            tracing::warn!("central event pump: inbox closed, shutting down");
+            tracing::debug!("central event pump: inbox closed, shutting down");
             break;
         }
     }
@@ -126,6 +135,7 @@ pub async fn run_central_events(
 /// `inbox` is closed.
 pub async fn run_peripheral_events(
     peripheral: Arc<Peripheral>,
+    routing: Arc<TransportRouting>,
     inbox: mpsc::Sender<PeerCommand>,
     psm: Option<u16>,
 ) {
@@ -168,7 +178,19 @@ pub async fn run_peripheral_events(
                     subscribed,
                     "peripheral SubscriptionChanged"
                 );
-                continue;
+                if subscribed {
+                    let prefix = routing.prefix_for_device(&client_id);
+                    PeerCommand::PeripheralClientSubscribed {
+                        client_id,
+                        char_uuid,
+                        prefix,
+                    }
+                } else {
+                    PeerCommand::PeripheralClientUnsubscribed {
+                        client_id,
+                        char_uuid,
+                    }
+                }
             }
             PeripheralEvent::ReadRequest {
                 char_uuid,
@@ -181,6 +203,8 @@ pub async fn run_peripheral_events(
                     } else {
                         responder.respond(Vec::new());
                     }
+                } else if char_uuid == crate::transport::transport::IROH_VERSION_CHAR_UUID {
+                    responder.respond(vec![crate::transport::transport::PROTOCOL_VERSION]);
                 } else {
                     responder.respond(Vec::new());
                 }
@@ -188,7 +212,7 @@ pub async fn run_peripheral_events(
             }
         };
         if inbox.send(cmd).await.is_err() {
-            tracing::warn!("peripheral event pump: inbox closed, shutting down");
+            tracing::debug!("peripheral event pump: inbox closed, shutting down");
             break;
         }
     }
@@ -209,7 +233,7 @@ pub async fn run_l2cap_accept(
                 tracing::debug!(device = %device_id, "L2CAP accept: incoming channel");
                 let cmd = PeerCommand::InboundL2capChannel { device_id, channel };
                 if inbox.send(cmd).await.is_err() {
-                    tracing::warn!("l2cap accept loop: inbox closed, shutting down");
+                    tracing::debug!("l2cap accept loop: inbox closed, shutting down");
                     break;
                 }
             }

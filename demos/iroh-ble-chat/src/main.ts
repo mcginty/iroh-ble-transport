@@ -20,6 +20,7 @@ type PeerStatus =
   | "connected"
   | "handshaking"
   | "connecting"
+  | "pending_dial"
   | "reconnecting"
   | "in_topic"
   | "nearby"
@@ -125,15 +126,16 @@ function formatDuration(ms: number): string {
 }
 
 const BLE_PHASE_LABEL: Record<string, string> = {
-  Unknown: "Unknown",
-  Discovered: "Discovered",
-  Connecting: "Connecting",
-  Handshaking: "Handshaking",
-  Connected: "Connected",
-  Draining: "Draining",
-  Reconnecting: "Reconnecting",
-  Restoring: "Restoring",
-  Dead: "Dead",
+  unknown: "Unknown",
+  discovered: "Discovered",
+  pending_dial: "Pending dial",
+  connecting: "Connecting",
+  handshaking: "Handshaking",
+  connected: "Connected",
+  draining: "Draining",
+  reconnecting: "Reconnecting",
+  restoring: "Restoring",
+  dead: "Dead",
 };
 
 // Sender colour palette (8 colours, indexed by hash of EndpointId)
@@ -208,6 +210,7 @@ function updateStatusFromPeers() {
         break;
       case "handshaking":
       case "connecting":
+      case "pending_dial":
       case "reconnecting":
       case "nearby":
         pending++;
@@ -246,13 +249,14 @@ const STATUS_RANK: Record<PeerStatus, number> = {
   connected: 1,
   handshaking: 2,
   connecting: 3,
-  reconnecting: 4,
-  in_topic: 5,
-  nearby: 6,
-  draining: 7,
-  stale: 8,
-  dead: 9,
-  unknown: 10,
+  pending_dial: 4,
+  reconnecting: 5,
+  in_topic: 6,
+  nearby: 7,
+  draining: 8,
+  stale: 9,
+  dead: 10,
+  unknown: 11,
 };
 
 const STATUS_LABEL: Record<PeerStatus, string> = {
@@ -260,6 +264,7 @@ const STATUS_LABEL: Record<PeerStatus, string> = {
   connected: "Connected",
   handshaking: "Handshaking…",
   connecting: "Connecting…",
+  pending_dial: "Dialing…",
   reconnecting: "Reconnecting…",
   in_topic: "In topic",
   nearby: "Nearby",

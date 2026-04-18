@@ -3,7 +3,8 @@
 //! All types in this module are pure data. No I/O, no tokio tasks. Any code
 //! here can be exercised from synchronous unit tests.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
 
@@ -29,10 +30,47 @@ pub enum ConnectRole {
     Peripheral,
 }
 
+/// Shared monotonic clock used by a data-pipe's inbound delivery path to
+/// advertise liveness to the registry. The pipe worker calls `bump()` whenever
+/// a reassembled datagram is handed off to iroh; the registry watchdog reads
+/// `last()` to detect wedged pipes where the peer stack went silent without
+/// emitting a disconnect callback (observed on Android LE in low-power mode
+/// and during iOS background freezes).
+#[derive(Debug, Clone)]
+pub struct LivenessClock {
+    inner: Arc<parking_lot::Mutex<Instant>>,
+}
+
+impl LivenessClock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(Instant::now())),
+        }
+    }
+
+    pub fn bump(&self) {
+        *self.inner.lock() = Instant::now();
+    }
+
+    #[must_use]
+    pub fn last(&self) -> Instant {
+        *self.inner.lock()
+    }
+}
+
+impl Default for LivenessClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PipeHandles {
     pub outbound_tx: tokio::sync::mpsc::Sender<PendingSend>,
     pub inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+    pub swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
+    pub last_rx_at: LivenessClock,
 }
 
 #[derive(Debug)]
@@ -43,12 +81,32 @@ pub struct PeerEntry {
     pub last_rx: Option<Instant>,
     pub last_tx: Option<Instant>,
     pub consecutive_failures: u32,
+    /// Monotonic "which data-pipe generation this peer is on." Bumped every
+    /// time the peer enters `Connected` with a freshly-built pipe. Every
+    /// `SendDatagram` command carries the tx_gen of the pipe it was minted
+    /// for, so a datagram queued against an old pipe (e.g. one that was torn
+    /// down and rebuilt while the send sat in iroh's outbox) can be detected
+    /// and rejected rather than silently delivered on a channel the caller
+    /// never intended. Never decrements; the starting value is 0.
     pub tx_gen: u64,
     pub pending_sends: VecDeque<PendingSend>,
     pub role: ConnectRole,
     pub pipe: Option<PipeHandles>,
     pub rx_backlog: VecDeque<Bytes>,
     pub l2cap_channel: Option<L2capChannel>,
+    /// Peripheral-side subscribed notify characteristics for the current GATT
+    /// session. This lets the registry distinguish an idempotent second-char
+    /// subscribe from a full remote unsubscribe.
+    pub subscribed_chars: HashSet<uuid::Uuid>,
+    /// Peer's 12-byte advertising prefix, learned from a scan. `None` when
+    /// the entry was created by an inbound path (GATT write / L2CAP accept)
+    /// before scan ever saw the advertisement — those peers don't get
+    /// persisted to the `PeerStore` because we have no stable key for them.
+    pub prefix: Option<KeyPrefix>,
+    pub verified_endpoint: Option<iroh_base::EndpointId>,
+    pub verified_at: Option<Instant>,
+    pub l2cap_upgrade_failed: bool,
+    pub verified_live_suppressed_logged: bool,
 }
 
 impl PeerEntry {
@@ -66,6 +124,12 @@ impl PeerEntry {
             pipe: None,
             rx_backlog: VecDeque::new(),
             l2cap_channel: None,
+            subscribed_chars: HashSet::new(),
+            prefix: None,
+            verified_endpoint: None,
+            verified_at: None,
+            l2cap_upgrade_failed: false,
+            verified_live_suppressed_logged: false,
         }
     }
 }
@@ -92,6 +156,8 @@ pub enum DisconnectReason {
     Gatt133,
     Timeout,
     LinkDead,
+    ProtocolMismatch,
+    DedupLoser,
     Unknown(i32),
 }
 
@@ -122,6 +188,11 @@ pub enum PeerPhase {
     Discovered {
         since: Instant,
     },
+    PendingDial {
+        since: Instant,
+        deadline: Instant,
+        prefix: KeyPrefix,
+    },
     Connecting {
         attempt: u32,
         started: Instant,
@@ -130,12 +201,12 @@ pub enum PeerPhase {
     Handshaking {
         since: Instant,
         channel: ChannelHandle,
-        l2cap_deadline: Option<Instant>,
     },
     Connected {
         since: Instant,
         channel: ChannelHandle,
         tx_gen: u64,
+        upgrading: bool,
     },
     Draining {
         since: Instant,
@@ -215,6 +286,15 @@ pub enum PeerCommand {
         device_id: DeviceId,
         error: String,
     },
+    /// Central read the peer's VERSION characteristic and got back a byte
+    /// that does not match our `PROTOCOL_VERSION`. The registry tears the
+    /// peer down into `Dead { ProtocolMismatch }` rather than letting an
+    /// incompatible data pipe start.
+    ProtocolVersionMismatch {
+        device_id: DeviceId,
+        got: u8,
+        want: u8,
+    },
     Stalled {
         device_id: DeviceId,
     },
@@ -227,8 +307,37 @@ pub enum PeerCommand {
     },
     DataPipeReady {
         device_id: DeviceId,
+        tx_gen: u64,
         outbound_tx: tokio::sync::mpsc::Sender<PendingSend>,
         inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
+        swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
+        last_rx_at: LivenessClock,
+    },
+    /// Emitted when `EndpointHooks::after_handshake` fires. The registry
+    /// stamps all PeerEntries whose prefix matches and runs the dedup pass.
+    VerifiedEndpoint {
+        endpoint_id: iroh_base::EndpointId,
+        token: Option<u64>,
+    },
+    /// Emitted by run_peripheral_events when a remote central subscribes
+    /// to C2P or P2C. Registry materializes a Connected{Gatt} PeerEntry
+    /// with role=Peripheral so peripheral-side traffic is visible to dedup.
+    /// `prefix` is filled in when scan has already observed this DeviceId —
+    /// without it the inbound entry can't be collapsed with its outbound
+    /// sibling during the dedup pass, so the UI lists it separately.
+    PeripheralClientSubscribed {
+        client_id: DeviceId,
+        char_uuid: uuid::Uuid,
+        prefix: Option<KeyPrefix>,
+    },
+    PeripheralClientUnsubscribed {
+        client_id: DeviceId,
+        char_uuid: uuid::Uuid,
+    },
+    /// Emitted by the L2CAP pipe worker when its outbound write has been
+    /// blocked on backpressure for longer than L2CAP_HANDOVER_TIMEOUT.
+    L2capHandoverTimeout {
+        device_id: DeviceId,
     },
     Shutdown,
 }
@@ -239,7 +348,10 @@ pub enum PeerAction {
         device_id: DeviceId,
         attempt: u32,
     },
-    OpenL2cap {
+    /// Read the peer's VERSION characteristic and, on mismatch, emit
+    /// [`PeerCommand::ProtocolVersionMismatch`] so the registry can Dead
+    /// the peer instead of running an incompatible data pipe.
+    ReadVersion {
         device_id: DeviceId,
     },
     CloseChannel {
@@ -257,12 +369,45 @@ pub enum PeerAction {
     },
     RebuildGattServer,
     RestartAdvertising,
-    PurgeAllForAdapterOff,
+    RestartL2capListener,
     StartDataPipe {
         device_id: DeviceId,
+        tx_gen: u64,
         role: ConnectRole,
         path: ConnectPath,
         l2cap_channel: Option<L2capChannel>,
+    },
+    /// Winner of a dedup pass asks the driver to attempt an L2CAP open
+    /// for this already-connected GATT peer.
+    UpgradeToL2cap {
+        device_id: DeviceId,
+    },
+    /// L2CAP open succeeded; swap the pipe worker from GATT to L2CAP on
+    /// this peer. The existing GATT worker enters drain-only mode.
+    SwapPipeToL2cap {
+        device_id: DeviceId,
+        channel: L2capChannel,
+        swap_tx: tokio::sync::mpsc::Sender<L2capChannel>,
+    },
+    /// L2CAP handover stalled; kill the L2CAP worker, respawn a GATT
+    /// worker, and stay Connected{Gatt} for the rest of this session.
+    RevertToGattPipe {
+        device_id: DeviceId,
+        tx_gen: u64,
+        role: ConnectRole,
+    },
+    /// Persist a snapshot of this peer to the configured `PeerStore`. Emitted
+    /// when a peer leaves `Connected` for `Draining`: we've seen enough of
+    /// this peer to want to remember them across restarts.
+    PutPeerStore {
+        prefix: KeyPrefix,
+        snapshot: crate::transport::store::PeerSnapshot,
+    },
+    /// Drop a peer from the configured `PeerStore`. Emitted when the registry
+    /// declares the peer permanently unusable (e.g. `Dead { MaxRetries }`):
+    /// there's no reason to keep trying after transport restart.
+    ForgetPeerStore {
+        prefix: KeyPrefix,
     },
     EmitMetric(String),
 }
@@ -305,16 +450,60 @@ mod tests {
     fn data_pipe_variants_are_constructible() {
         let (outbound_tx, _) = tokio::sync::mpsc::channel::<PendingSend>(1);
         let (inbound_tx, _) = tokio::sync::mpsc::channel::<Bytes>(1);
+        let (swap_tx, _) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
         let _cmd = PeerCommand::DataPipeReady {
             device_id: DeviceId::from("x"),
+            tx_gen: 1,
             outbound_tx,
             inbound_tx,
+            swap_tx,
+            last_rx_at: LivenessClock::new(),
         };
         let _act = PeerAction::StartDataPipe {
             device_id: DeviceId::from("x"),
+            tx_gen: 1,
             role: ConnectRole::Central,
             path: ConnectPath::Gatt,
             l2cap_channel: None,
         };
+    }
+
+    #[test]
+    fn new_variants_are_constructible() {
+        let _cmd1 = PeerCommand::VerifiedEndpoint {
+            endpoint_id: iroh_base::SecretKey::from_bytes(&[0u8; 32]).public(),
+            token: None,
+        };
+        let _cmd2 = PeerCommand::PeripheralClientSubscribed {
+            client_id: DeviceId::from("x"),
+            char_uuid: uuid::Uuid::nil(),
+            prefix: None,
+        };
+        let _cmd3 = PeerCommand::PeripheralClientUnsubscribed {
+            client_id: DeviceId::from("x"),
+            char_uuid: uuid::Uuid::nil(),
+        };
+        let _cmd4 = PeerCommand::L2capHandoverTimeout {
+            device_id: DeviceId::from("x"),
+        };
+        let _act1 = PeerAction::UpgradeToL2cap {
+            device_id: DeviceId::from("x"),
+        };
+        let _act2 = PeerAction::RevertToGattPipe {
+            device_id: DeviceId::from("x"),
+            tx_gen: 1,
+            role: ConnectRole::Central,
+        };
+        assert_eq!(DisconnectReason::DedupLoser, DisconnectReason::DedupLoser);
+    }
+
+    #[test]
+    fn peer_entry_initializes_dedup_fields_empty() {
+        let e = PeerEntry::new(DeviceId::from("x"));
+        assert!(e.verified_endpoint.is_none());
+        assert!(e.verified_at.is_none());
+        assert!(!e.l2cap_upgrade_failed);
+        assert!(!e.verified_live_suppressed_logged);
+        assert!(e.subscribed_chars.is_empty());
     }
 }
