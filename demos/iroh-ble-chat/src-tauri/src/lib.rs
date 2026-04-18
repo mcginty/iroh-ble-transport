@@ -1466,7 +1466,9 @@ async fn send_image(app: AppHandle, state: State<'_, Arc<Mutex<AppState>>>) -> R
 
     tracing::debug!(
         peers = peer_ids.len(),
-        image_id, avif_size, "sending image to peers"
+        image_id,
+        avif_size,
+        "sending image to peers"
     );
     let avif_bytes = Arc::new(avif_bytes);
     for peer_id in peer_ids {

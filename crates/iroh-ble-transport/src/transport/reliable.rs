@@ -1182,13 +1182,16 @@ mod tests {
         let ch2 = ch.clone();
         let sent2 = sent.clone();
         let handle = tokio::spawn(async move {
-            ch2.run_send_loop(|data| {
-                let sent = sent2.clone();
-                async move {
-                    sent.lock().await.push(data);
-                    Ok(())
-                }
-            }, || false)
+            ch2.run_send_loop(
+                |data| {
+                    let sent = sent2.clone();
+                    async move {
+                        sent.lock().await.push(data);
+                        Ok(())
+                    }
+                },
+                || false,
+            )
             .await
         });
 
@@ -1213,9 +1216,10 @@ mod tests {
         ch.enqueue_datagram(b"data".to_vec()).await;
 
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move {
-            ch2.run_send_loop(|_data| async { Ok(()) }, || false).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Advance well past LINK_DEAD_DEADLINE (6s) with no ACKs. 30 × 500ms
         // is 15s — more than enough for the progress deadline to fire.
@@ -1253,9 +1257,10 @@ mod tests {
         ch.enqueue_datagram(b"stuck".to_vec()).await;
 
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move {
-            ch2.run_send_loop(|_data| async { Ok(()) }, || false).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Helper: advance virtual time in small chunks with yields between,
         // so each timer firing gets polled by the runtime. Coarse advances
@@ -1311,9 +1316,10 @@ mod tests {
         ch.enqueue_datagram(b"stuck".to_vec()).await;
 
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move {
-            ch2.run_send_loop(|_data| async { Ok(()) }, || false).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Let the loop dispatch frag0, clear INTER_FRAME_GAP, re-enter the
         // Wait arm and park on `wake.notified()`.
@@ -1356,9 +1362,10 @@ mod tests {
 
         let start = tokio::time::Instant::now();
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move {
-            ch2.run_send_loop(|_data| async { Ok(()) }, || false).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Advance in 250ms steps — fine enough that every retransmit timer
         // and the deadline fire promptly.
@@ -1401,9 +1408,10 @@ mod tests {
         ch.enqueue_datagram(b"one".to_vec()).await;
 
         let ch2 = ch.clone();
-        let handle = tokio::spawn(async move {
-            ch2.run_send_loop(|_data| async { Ok(()) }, || false).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { ch2.run_send_loop(|_data| async { Ok(()) }, || false).await },
+            );
 
         // Burn ~4s of the deadline with retransmits — under 6s, still alive.
         for _ in 0..8 {
@@ -1867,13 +1875,16 @@ mod tests {
         let ch_for_task = Arc::clone(&ch);
         let handle = tokio::spawn(async move {
             ch_for_task
-                .run_send_loop(move |bytes| {
-                    let captured = Arc::clone(&captured_for_cb);
-                    async move {
-                        captured.lock().unwrap().push(bytes);
-                        Ok::<(), String>(())
-                    }
-                }, || false)
+                .run_send_loop(
+                    move |bytes| {
+                        let captured = Arc::clone(&captured_for_cb);
+                        async move {
+                            captured.lock().unwrap().push(bytes);
+                            Ok::<(), String>(())
+                        }
+                    },
+                    || false,
+                )
                 .await
         });
 

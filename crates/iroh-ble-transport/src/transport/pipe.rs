@@ -459,22 +459,27 @@ async fn run_gatt_pipe(
         tokio::spawn(tracing::Instrument::instrument(
             async move {
                 channel
-                    .run_send_loop(move |bytes| {
-                        let iface = Arc::clone(&iface);
-                        let device_id = device_id.clone();
-                        let role = role;
-                        async move {
-                            let buf = Bytes::from(bytes);
-                            let result = match role {
-                                ConnectRole::Central => iface.write_c2p(&device_id, buf).await,
-                                ConnectRole::Peripheral => iface.notify_p2c(&device_id, buf).await,
-                            };
-                            result.map_err(|e| format!("{e}"))
-                        }
-                    }, {
-                        let teardown_flag = Arc::clone(&send_loop_teardown);
-                        move || teardown_flag.load(Ordering::Relaxed)
-                    })
+                    .run_send_loop(
+                        move |bytes| {
+                            let iface = Arc::clone(&iface);
+                            let device_id = device_id.clone();
+                            let role = role;
+                            async move {
+                                let buf = Bytes::from(bytes);
+                                let result = match role {
+                                    ConnectRole::Central => iface.write_c2p(&device_id, buf).await,
+                                    ConnectRole::Peripheral => {
+                                        iface.notify_p2c(&device_id, buf).await
+                                    }
+                                };
+                                result.map_err(|e| format!("{e}"))
+                            }
+                        },
+                        {
+                            let teardown_flag = Arc::clone(&send_loop_teardown);
+                            move || teardown_flag.load(Ordering::Relaxed)
+                        },
+                    )
                     .await
             },
             span,
