@@ -6,6 +6,9 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+rust-version = "1.95"
+
 [workspace.metadata.release]
 consolidate-commits = false
 tag-message = "{{crate_name}}: release {{version}}"

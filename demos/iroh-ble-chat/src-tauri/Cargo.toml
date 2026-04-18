@@ -2,6 +2,7 @@
 name = "iroh-ble-chat"
 version = "0.1.0-alpha.6"
 edition = "2021"
+rust-version.workspace = true
 publish = false
 
 [package.metadata.release]

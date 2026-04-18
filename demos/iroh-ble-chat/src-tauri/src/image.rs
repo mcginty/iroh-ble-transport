@@ -172,11 +172,9 @@ async fn handle_image_stream(
     }
 
     let recv_ms = recv_start.elapsed().as_millis();
-    let kbps = if recv_ms > 0 {
-        (avif_data.len() as u128 * 8) / recv_ms
-    } else {
-        0
-    };
+    let kbps = (avif_data.len() as u128 * 8)
+        .checked_div(recv_ms)
+        .unwrap_or(0);
     tracing::debug!(
         image_id,
         bytes = avif_data.len(),
