@@ -27,6 +27,7 @@ use crate::transport::driver::{BlewDriver, Driver, IncomingPacket};
 use crate::transport::events::{run_central_events, run_l2cap_accept, run_peripheral_events};
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
+use crate::transport::hook::VerifiedEndpointEvent;
 use crate::transport::routing::{TOKEN_LEN, TransportRouting, parse_token_addr, token_custom_addr};
 use crate::transport::store::{InMemoryPeerStore, PeerStore};
 use crate::transport::watchdog::run_watchdog;
@@ -67,7 +68,7 @@ pub struct BleTransportConfig {
     /// [`crate::BleDedupHook`] installed on the iroh `Endpoint`. When `None`,
     /// handshake-time dedup is effectively disabled — useful for tests that
     /// don't run a real iroh `Endpoint`.
-    pub verified_rx: Option<tokio::sync::mpsc::UnboundedReceiver<iroh_base::EndpointId>>,
+    pub verified_rx: Option<tokio::sync::mpsc::UnboundedReceiver<VerifiedEndpointEvent>>,
 }
 
 impl Default for BleTransportConfig {
@@ -293,9 +294,12 @@ impl BleTransport {
         if let Some(mut verified_rx) = config.verified_rx {
             let inbox = inbox_tx.clone();
             tokio::spawn(async move {
-                while let Some(endpoint_id) = verified_rx.recv().await {
+                while let Some(verified) = verified_rx.recv().await {
                     if inbox
-                        .send(PeerCommand::VerifiedEndpoint { endpoint_id })
+                        .send(PeerCommand::VerifiedEndpoint {
+                            endpoint_id: verified.endpoint_id,
+                            token: verified.token,
+                        })
                         .await
                         .is_err()
                     {

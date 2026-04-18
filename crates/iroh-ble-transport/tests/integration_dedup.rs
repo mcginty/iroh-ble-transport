@@ -248,11 +248,17 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     // InboundGattFragment). B's should_win(Peripheral, ep_b, ep_a) → ep_b < ep_a
     // → keeps Peripheral → no prune.
     a.inbox_tx
-        .send(PeerCommand::VerifiedEndpoint { endpoint_id: ep_b })
+        .send(PeerCommand::VerifiedEndpoint {
+            endpoint_id: ep_b,
+            token: None,
+        })
         .await
         .unwrap();
     b.inbox_tx
-        .send(PeerCommand::VerifiedEndpoint { endpoint_id: ep_a })
+        .send(PeerCommand::VerifiedEndpoint {
+            endpoint_id: ep_a,
+            token: None,
+        })
         .await
         .unwrap();
 
@@ -420,7 +426,10 @@ async fn advertising_flood_does_not_redial_after_verified() {
 
     // Mark B's prefix as verified.
     a.inbox_tx
-        .send(PeerCommand::VerifiedEndpoint { endpoint_id: ep_b })
+        .send(PeerCommand::VerifiedEndpoint {
+            endpoint_id: ep_b,
+            token: None,
+        })
         .await
         .unwrap();
 
@@ -574,6 +583,7 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
     node.inbox_tx
         .send(PeerCommand::VerifiedEndpoint {
             endpoint_id: ep_peer,
+            token: None,
         })
         .await
         .unwrap();

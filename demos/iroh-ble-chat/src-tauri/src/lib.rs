@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -148,6 +148,36 @@ fn default_nickname(id: &EndpointId) -> String {
     let short = id.fmt_short().to_string();
     format!("user_{}", &short[..short.len().min(6)])
 }
+
+fn gossip_status_str(status: Option<GossipStatus>) -> &'static str {
+    match status {
+        Some(GossipStatus::Direct) => "direct",
+        Some(GossipStatus::InTopic) => "in_topic",
+        Some(GossipStatus::Stale) => "stale",
+        None => "none",
+    }
+}
+
+fn summarize_join_targets(peers: &HashMap<EndpointId, PeerState>, targets: &[EndpointId]) -> String {
+    targets
+        .iter()
+        .map(|peer_id| {
+            if let Some(peer) = peers.get(peer_id) {
+                format!(
+                    "{}(gossip={},ble_phase={},ble_path={})",
+                    peer_id.fmt_short(),
+                    gossip_status_str(peer.gossip),
+                    peer.ble_phase.map(ble_phase_str).unwrap_or("none"),
+                    peer.ble_path.as_deref().unwrap_or("none"),
+                )
+            } else {
+                format!("{}(unknown)", peer_id.fmt_short())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[tauri::command]
 async fn get_node_id(state: State<'_, Arc<Mutex<AppState>>>) -> Result<String, String> {
     let st = state.lock().await;
@@ -315,6 +345,7 @@ async fn start_node(
     tauri::async_runtime::spawn(gossip_event_pump(
         app.clone(),
         state_arc.clone(),
+        sender,
         receiver,
         own_id,
     ));
@@ -334,6 +365,7 @@ async fn start_node(
 async fn gossip_event_pump(
     app: AppHandle,
     state: Arc<Mutex<AppState>>,
+    sender: iroh_gossip::api::GossipSender,
     mut receiver: iroh_gossip::api::GossipReceiver,
     own_id: EndpointId,
 ) {
@@ -354,12 +386,7 @@ async fn gossip_event_pump(
                 peer.last_seen = Instant::now();
                 let ui = peer.to_ui();
                 let _ = app.emit("peer-updated", &ui);
-
-                let mut known = load_known_peers(&st.cache_dir);
-                if !known.contains(&peer_id) {
-                    known.push(peer_id);
-                    save_known_peers(&st.cache_dir, &known);
-                }
+                remember_known_peer(&st.cache_dir, peer_id);
 
                 if !topic_joined {
                     topic_joined = true;
@@ -385,6 +412,7 @@ async fn gossip_event_pump(
             }
             iroh_gossip::api::Event::Received(msg) => {
                 let Ok(chat_msg) = postcard::from_bytes::<ChatMsg>(&msg.content) else {
+                    tracing::warn!(len = msg.content.len(), "failed to decode chat message");
                     continue;
                 };
 
@@ -394,17 +422,56 @@ async fn gossip_event_pump(
                             continue;
                         }
                         let mut st = state.lock().await;
-                        let peer = st
-                            .peers
-                            .entry(*from)
-                            .or_insert_with(|| new_peer_entry(*from));
-                        peer.nickname = Some(nickname.clone());
-                        if peer.gossip.is_none() {
-                            peer.gossip = Some(GossipStatus::InTopic);
-                        }
-                        peer.last_seen = Instant::now();
-                        let ui = peer.to_ui();
+                        let cache_dir = st.cache_dir.clone();
+                        let (
+                            needs_join_nudge,
+                            gossip_status,
+                            ble_phase,
+                            ble_path,
+                            ble_failures,
+                            ui,
+                        ) = {
+                            let peer = st
+                                .peers
+                                .entry(*from)
+                                .or_insert_with(|| new_peer_entry(*from));
+                            peer.nickname = Some(nickname.clone());
+                            let needs_join_nudge = should_nudge_join(peer.gossip);
+                            if peer.gossip.is_none() {
+                                peer.gossip = Some(GossipStatus::InTopic);
+                            }
+                            peer.last_seen = Instant::now();
+                            (
+                                needs_join_nudge,
+                                gossip_status_str(peer.gossip),
+                                peer.ble_phase.map(ble_phase_str).unwrap_or("none"),
+                                peer.ble_path.clone(),
+                                peer.ble_failures,
+                                peer.to_ui(),
+                            )
+                        };
+                        info!(
+                            peer = %from.fmt_short(),
+                            nickname = %nickname,
+                            gossip = gossip_status,
+                            ble_phase = ble_phase,
+                            ble_path = ble_path.as_deref().unwrap_or("none"),
+                            ble_failures,
+                            needs_join_nudge,
+                            "received Hello"
+                        );
+                        remember_known_peer(&cache_dir, *from);
                         let _ = app.emit("peer-updated", &ui);
+                        drop(st);
+
+                        if needs_join_nudge {
+                            tracing::debug!(peer = %from.fmt_short(), "nudging join after inbound Hello");
+                            if let Err(e) = sender.join_peers(vec![*from]).await {
+                                tracing::debug!(peer = %from.fmt_short(), "join_peers after Hello failed: {e}");
+                            } else {
+                                tracing::debug!(peer = %from.fmt_short(), "join_peers after Hello ok");
+                            }
+                        }
                     }
                     ChatMsg::Text {
                         from,
@@ -415,16 +482,46 @@ async fn gossip_event_pump(
                             continue;
                         }
                         let mut st = state.lock().await;
-                        let peer = st
-                            .peers
-                            .entry(*from)
-                            .or_insert_with(|| new_peer_entry(*from));
-                        peer.nickname = Some(nickname.clone());
-                        if peer.gossip.is_none() {
-                            peer.gossip = Some(GossipStatus::InTopic);
-                        }
-                        peer.last_seen = Instant::now();
-                        let ui = peer.to_ui();
+                        let cache_dir = st.cache_dir.clone();
+                        let (
+                            needs_join_nudge,
+                            gossip_status,
+                            ble_phase,
+                            ble_path,
+                            ble_failures,
+                            ui,
+                        ) = {
+                            let peer = st
+                                .peers
+                                .entry(*from)
+                                .or_insert_with(|| new_peer_entry(*from));
+                            peer.nickname = Some(nickname.clone());
+                            let needs_join_nudge = should_nudge_join(peer.gossip);
+                            if peer.gossip.is_none() {
+                                peer.gossip = Some(GossipStatus::InTopic);
+                            }
+                            peer.last_seen = Instant::now();
+                            (
+                                needs_join_nudge,
+                                gossip_status_str(peer.gossip),
+                                peer.ble_phase.map(ble_phase_str).unwrap_or("none"),
+                                peer.ble_path.clone(),
+                                peer.ble_failures,
+                                peer.to_ui(),
+                            )
+                        };
+                        info!(
+                            peer = %from.fmt_short(),
+                            nickname = %nickname,
+                            text_len = text.len(),
+                            gossip = gossip_status,
+                            ble_phase = ble_phase,
+                            ble_path = ble_path.as_deref().unwrap_or("none"),
+                            ble_failures,
+                            needs_join_nudge,
+                            "received Text"
+                        );
+                        remember_known_peer(&cache_dir, *from);
                         let _ = app.emit("peer-updated", &ui);
 
                         let _ = app.emit(
@@ -436,23 +533,81 @@ async fn gossip_event_pump(
                                 "is_self": false,
                             }),
                         );
+                        drop(st);
+
+                        if needs_join_nudge {
+                            tracing::debug!(peer = %from.fmt_short(), "nudging join after inbound Text");
+                            if let Err(e) = sender.join_peers(vec![*from]).await {
+                                tracing::debug!(peer = %from.fmt_short(), "join_peers after Text failed: {e}");
+                            } else {
+                                tracing::debug!(peer = %from.fmt_short(), "join_peers after Text ok");
+                            }
+                        }
                     }
                     ChatMsg::NicknameChanged { from, new_nickname } => {
                         if *from == own_id {
                             continue;
                         }
                         let mut st = state.lock().await;
-                        let peer = st
-                            .peers
-                            .entry(*from)
-                            .or_insert_with(|| new_peer_entry(*from));
-                        peer.nickname = Some(new_nickname.clone());
-                        if peer.gossip.is_none() {
-                            peer.gossip = Some(GossipStatus::InTopic);
-                        }
-                        peer.last_seen = Instant::now();
-                        let ui = peer.to_ui();
+                        let cache_dir = st.cache_dir.clone();
+                        let (
+                            needs_join_nudge,
+                            gossip_status,
+                            ble_phase,
+                            ble_path,
+                            ble_failures,
+                            ui,
+                        ) = {
+                            let peer = st
+                                .peers
+                                .entry(*from)
+                                .or_insert_with(|| new_peer_entry(*from));
+                            peer.nickname = Some(new_nickname.clone());
+                            let needs_join_nudge = should_nudge_join(peer.gossip);
+                            if peer.gossip.is_none() {
+                                peer.gossip = Some(GossipStatus::InTopic);
+                            }
+                            peer.last_seen = Instant::now();
+                            (
+                                needs_join_nudge,
+                                gossip_status_str(peer.gossip),
+                                peer.ble_phase.map(ble_phase_str).unwrap_or("none"),
+                                peer.ble_path.clone(),
+                                peer.ble_failures,
+                                peer.to_ui(),
+                            )
+                        };
+                        info!(
+                            peer = %from.fmt_short(),
+                            new_nickname = %new_nickname,
+                            gossip = gossip_status,
+                            ble_phase = ble_phase,
+                            ble_path = ble_path.as_deref().unwrap_or("none"),
+                            ble_failures,
+                            needs_join_nudge,
+                            "received NicknameChanged"
+                        );
+                        remember_known_peer(&cache_dir, *from);
                         let _ = app.emit("peer-updated", &ui);
+                        drop(st);
+
+                        if needs_join_nudge {
+                            tracing::debug!(
+                                peer = %from.fmt_short(),
+                                "nudging join after inbound NicknameChanged"
+                            );
+                            if let Err(e) = sender.join_peers(vec![*from]).await {
+                                tracing::debug!(
+                                    peer = %from.fmt_short(),
+                                    "join_peers after NicknameChanged failed: {e}"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    peer = %from.fmt_short(),
+                                    "join_peers after NicknameChanged ok"
+                                );
+                            }
+                        }
                     }
                     ChatMsg::ImageStart {
                         from,
@@ -463,6 +618,51 @@ async fn gossip_event_pump(
                         if *from == own_id {
                             continue;
                         }
+                        let (needs_join_nudge, gossip_status, ble_phase, ble_path, ble_failures) = {
+                            let mut st = state.lock().await;
+                            let cache_dir = st.cache_dir.clone();
+                            let (needs_join_nudge, gossip_status, ble_phase, ble_path, ble_failures, ui) = {
+                                let peer = st
+                                    .peers
+                                    .entry(*from)
+                                    .or_insert_with(|| new_peer_entry(*from));
+                                peer.nickname = Some(nickname.clone());
+                                let needs_join_nudge = should_nudge_join(peer.gossip);
+                                if peer.gossip.is_none() {
+                                    peer.gossip = Some(GossipStatus::InTopic);
+                                }
+                                peer.last_seen = Instant::now();
+                                (
+                                    needs_join_nudge,
+                                    gossip_status_str(peer.gossip),
+                                    peer.ble_phase.map(ble_phase_str).unwrap_or("none"),
+                                    peer.ble_path.clone(),
+                                    peer.ble_failures,
+                                    peer.to_ui(),
+                                )
+                            };
+                            remember_known_peer(&cache_dir, *from);
+                            let _ = app.emit("peer-updated", &ui);
+                            (
+                                needs_join_nudge,
+                                gossip_status,
+                                ble_phase,
+                                ble_path,
+                                ble_failures,
+                            )
+                        };
+                        info!(
+                            peer = %from.fmt_short(),
+                            nickname = %nickname,
+                            image_id = *image_id,
+                            image_size = *size,
+                            gossip = gossip_status,
+                            ble_phase = ble_phase,
+                            ble_path = ble_path.as_deref().unwrap_or("none"),
+                            ble_failures,
+                            needs_join_nudge,
+                            "received ImageStart"
+                        );
                         let pending = {
                             let st = state.lock().await;
                             st.pending_images.clone()
@@ -486,6 +686,15 @@ async fn gossip_event_pump(
                                 "is_self": false,
                             }),
                         );
+
+                        if needs_join_nudge {
+                            tracing::debug!(peer = %from.fmt_short(), "nudging join after inbound ImageStart");
+                            if let Err(e) = sender.join_peers(vec![*from]).await {
+                                tracing::debug!(peer = %from.fmt_short(), "join_peers after ImageStart failed: {e}");
+                            } else {
+                                tracing::debug!(peer = %from.fmt_short(), "join_peers after ImageStart ok");
+                            }
+                        }
                     }
                 }
             }
@@ -535,18 +744,7 @@ async fn reconnect_tick(state: Arc<Mutex<AppState>>) {
         let Some(sender) = st.gossip_sender.clone() else {
             continue;
         };
-        let known = load_known_peers(&st.cache_dir);
-        let own = st.own_id();
-        let targets: Vec<EndpointId> = known
-            .into_iter()
-            .filter(|p| *p != own)
-            .filter(|p| {
-                !matches!(
-                    st.peers.get(p).and_then(|s| s.gossip),
-                    Some(GossipStatus::Direct)
-                )
-            })
-            .collect();
+        let targets = collect_join_targets(st.own_id(), &st.peers, load_known_peers(&st.cache_dir));
         drop(st);
 
         if targets.is_empty() {
@@ -590,6 +788,42 @@ fn new_peer_entry(id: EndpointId) -> PeerState {
     }
 }
 
+fn remember_known_peer(cache_dir: &std::path::Path, peer_id: EndpointId) {
+    let mut known = load_known_peers(cache_dir);
+    if !known.contains(&peer_id) {
+        known.push(peer_id);
+        save_known_peers(cache_dir, &known);
+    }
+}
+
+fn should_nudge_join(gossip: Option<GossipStatus>) -> bool {
+    !matches!(gossip, Some(GossipStatus::Direct))
+}
+
+fn collect_join_targets(
+    own_id: EndpointId,
+    peers: &HashMap<EndpointId, PeerState>,
+    known_peers: Vec<EndpointId>,
+) -> Vec<EndpointId> {
+    let mut seen = HashSet::new();
+    let mut targets = Vec::new();
+
+    for peer_id in known_peers
+        .into_iter()
+        .chain(peers.keys().copied())
+        .filter(|peer_id| *peer_id != own_id)
+    {
+        if !seen.insert(peer_id) {
+            continue;
+        }
+        if should_nudge_join(peers.get(&peer_id).and_then(|peer| peer.gossip)) {
+            targets.push(peer_id);
+        }
+    }
+
+    targets
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +856,33 @@ mod tests {
 
         peer.ble_phase = None;
         assert_eq!(peer.ui_status(), "connected");
+    }
+
+    #[test]
+    fn collect_join_targets_includes_non_direct_peers_once() {
+        let own_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let direct_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let in_topic_id = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+        let unknown_id = iroh::SecretKey::from_bytes(&[4u8; 32]).public();
+
+        let mut peers = HashMap::new();
+        let mut direct = new_peer_entry(direct_id);
+        direct.gossip = Some(GossipStatus::Direct);
+        peers.insert(direct_id, direct);
+
+        let mut in_topic = new_peer_entry(in_topic_id);
+        in_topic.gossip = Some(GossipStatus::InTopic);
+        peers.insert(in_topic_id, in_topic);
+
+        peers.insert(unknown_id, new_peer_entry(unknown_id));
+
+        let targets = collect_join_targets(
+            own_id,
+            &peers,
+            vec![own_id, direct_id, in_topic_id, unknown_id, in_topic_id],
+        );
+
+        assert_eq!(targets, vec![in_topic_id, unknown_id]);
     }
 }
 
@@ -863,7 +1124,52 @@ async fn send_message(
     let sender = st.gossip_sender.as_ref().ok_or("Node not started")?.clone();
     let own_id = st.own_id();
     let nickname = st.nickname.clone();
+    let known_peers = load_known_peers(&st.cache_dir);
+    let join_targets = collect_join_targets(own_id, &st.peers, known_peers.clone());
+    let join_target_summary = summarize_join_targets(&st.peers, &join_targets);
+    let direct_peers = st
+        .peers
+        .values()
+        .filter(|peer| matches!(peer.gossip, Some(GossipStatus::Direct)))
+        .count();
+    let in_topic_peers = st
+        .peers
+        .values()
+        .filter(|peer| matches!(peer.gossip, Some(GossipStatus::InTopic)))
+        .count();
+    let stale_peers = st
+        .peers
+        .values()
+        .filter(|peer| matches!(peer.gossip, Some(GossipStatus::Stale)))
+        .count();
+    let total_peers = st.peers.len();
     drop(st);
+
+    info!(
+        text_len = text.len(),
+        total_peers,
+        known_peers = known_peers.len(),
+        direct_peers,
+        in_topic_peers,
+        stale_peers,
+        join_targets = join_targets.len(),
+        "send_message requested"
+    );
+    if !join_target_summary.is_empty() {
+        tracing::debug!(targets = %join_target_summary, "send_message join target summary");
+    }
+
+    if !join_targets.is_empty() {
+        tracing::debug!(
+            count = join_targets.len(),
+            "nudging non-direct peers before broadcast"
+        );
+        if let Err(e) = sender.join_peers(join_targets).await {
+            tracing::debug!("send_message join_peers failed: {e}");
+        } else {
+            tracing::debug!("send_message join_peers ok");
+        }
+    }
 
     let msg = ChatMsg::Text {
         from: own_id,
@@ -878,6 +1184,7 @@ async fn send_message(
         .broadcast(Bytes::from(payload))
         .await
         .map_err(|e| format!("broadcast: {e}"))?;
+    info!(text_len = text.len(), "send_message broadcast ok");
 
     // Gossip doesn't deliver our own broadcasts back to us.
     let _ = app.emit(

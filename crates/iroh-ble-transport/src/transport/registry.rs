@@ -143,8 +143,11 @@ impl Registry {
                 got,
                 want,
             } => self.handle_protocol_version_mismatch(&mut actions, now, device_id, got, want),
-            PeerCommand::VerifiedEndpoint { endpoint_id } => {
-                self.handle_verified_endpoint(&mut actions, now, endpoint_id);
+            PeerCommand::VerifiedEndpoint {
+                endpoint_id,
+                token: _,
+            } => {
+                self.handle_verified_endpoint(&mut actions, now, endpoint_id, None);
             }
             PeerCommand::PeripheralClientSubscribed {
                 client_id,
@@ -163,12 +166,7 @@ impl Registry {
                 client_id,
                 char_uuid,
             } => {
-                self.handle_peripheral_client_unsubscribed(
-                    &mut actions,
-                    now,
-                    client_id,
-                    char_uuid,
-                );
+                self.handle_peripheral_client_unsubscribed(&mut actions, now, client_id, char_uuid);
             }
             PeerCommand::L2capHandoverTimeout { device_id } => {
                 self.handle_l2cap_handover_timeout(&mut actions, device_id);
@@ -182,9 +180,17 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         endpoint_id: iroh_base::EndpointId,
+        exact_device_id: Option<DeviceId>,
     ) {
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
         self.verified_prefixes.insert(prefix, endpoint_id);
+        if let Some(device_id) = exact_device_id.as_ref()
+            && let Some(entry) = self.peers.get_mut(device_id)
+        {
+            entry.prefix = Some(prefix);
+            entry.verified_endpoint = Some(endpoint_id);
+            entry.verified_at = Some(now);
+        }
         for entry in self.peers.values_mut() {
             if entry.prefix == Some(prefix) {
                 entry.verified_endpoint = Some(endpoint_id);
@@ -244,13 +250,19 @@ impl Registry {
 
         if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
             let my_endpoint = self.my_endpoint;
+            let connected_for_prefix = self
+                .peers
+                .values()
+                .filter(|e| e.prefix == Some(prefix) && matches!(e.phase, PeerPhase::Connected { .. }))
+                .count();
             let to_upgrade: Vec<DeviceId> = self
                 .peers
                 .iter()
                 .filter(|(_, e)| {
                     e.prefix == Some(prefix)
                         && !e.l2cap_upgrade_failed
-                        && crate::transport::dedup::should_dial_l2cap(
+                        && Self::should_emit_l2cap_upgrade(
+                            connected_for_prefix,
                             e.role,
                             &my_endpoint,
                             &endpoint_id,
@@ -329,7 +341,10 @@ impl Registry {
         };
         entry.subscribed_chars.remove(&char_uuid);
         if entry.role != crate::transport::peer::ConnectRole::Peripheral
-            || !matches!(entry.phase, PeerPhase::Connected { .. } | PeerPhase::Handshaking { .. })
+            || !matches!(
+                entry.phase,
+                PeerPhase::Connected { .. } | PeerPhase::Handshaking { .. }
+            )
             || !entry.subscribed_chars.is_empty()
         {
             return;
@@ -369,11 +384,14 @@ impl Registry {
             if let Some(entry) = self.peers.get_mut(&device_id) {
                 entry.last_adv = Some(now);
                 entry.prefix = Some(prefix);
+                if !entry.verified_live_suppressed_logged {
+                    tracing::trace!(
+                        device = %device_id,
+                        "suppressing dial: verified live peer already exists for this prefix",
+                    );
+                    entry.verified_live_suppressed_logged = true;
+                }
             }
-            tracing::trace!(
-                device = %device_id,
-                "suppressing dial: verified live peer already exists for this prefix",
-            );
             return;
         }
 
@@ -383,6 +401,7 @@ impl Registry {
             .or_insert_with(|| PeerEntry::new(device_id.clone()));
         entry.last_adv = Some(now);
         entry.prefix = Some(prefix);
+        entry.verified_live_suppressed_logged = false;
         match &entry.phase {
             PeerPhase::Unknown => {
                 if entry.pending_sends.is_empty() {
@@ -616,6 +635,20 @@ impl Registry {
         device_id: DeviceId,
         channel: crate::transport::peer::ChannelHandle,
     ) {
+        let known_prefix = self.peers.get(&device_id).and_then(|entry| entry.prefix);
+        let verified_endpoint = known_prefix
+            .and_then(|prefix| self.verified_prefixes.get(&prefix).copied());
+        let connected_for_prefix = known_prefix
+            .map(|prefix| {
+                self.peers
+                    .values()
+                    .filter(|e| {
+                        e.prefix == Some(prefix) && matches!(e.phase, PeerPhase::Connected { .. })
+                    })
+                    .count()
+                    + 1
+            })
+            .unwrap_or(0);
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
@@ -648,6 +681,22 @@ impl Registry {
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
+        if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
+            if let Some(endpoint_id) = verified_endpoint
+                && !entry.l2cap_upgrade_failed
+                && Self::should_emit_l2cap_upgrade(
+                    connected_for_prefix,
+                    entry.role,
+                    &self.my_endpoint,
+                    &endpoint_id,
+                )
+            {
+                if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                    *upgrading = true;
+                }
+                actions.push(PeerAction::UpgradeToL2cap { device_id });
+            }
+        }
     }
 
     fn handle_connect_failed(
@@ -760,14 +809,14 @@ impl Registry {
         let stale_peripheral_l2cap = matches!(
             &entry.phase,
             PeerPhase::Connected {
-                channel:
-                    crate::transport::peer::ChannelHandle {
-                        path: crate::transport::peer::ConnectPath::L2cap,
-                        ..
-                    },
+                channel: crate::transport::peer::ChannelHandle {
+                    path: crate::transport::peer::ConnectPath::L2cap,
+                    ..
+                },
                 ..
             }
-        ) && entry.role == crate::transport::peer::ConnectRole::Peripheral;
+        ) && entry.role
+            == crate::transport::peer::ConnectRole::Peripheral;
         if stale_peripheral_l2cap {
             if let Some(pipe) = entry.pipe.as_ref() {
                 // A peripheral-side late accept flips the registry path to
@@ -1074,6 +1123,19 @@ impl Registry {
         });
     }
 
+    fn should_emit_l2cap_upgrade(
+        connected_for_prefix: usize,
+        role: crate::transport::peer::ConnectRole,
+        my_endpoint: &iroh_base::EndpointId,
+        peer_endpoint: &iroh_base::EndpointId,
+    ) -> bool {
+        if connected_for_prefix <= 1 {
+            matches!(role, crate::transport::peer::ConnectRole::Central)
+        } else {
+            crate::transport::dedup::should_dial_l2cap(role, my_endpoint, peer_endpoint)
+        }
+    }
+
     fn handle_forget(
         &mut self,
         actions: &mut Vec<PeerAction>,
@@ -1233,9 +1295,7 @@ impl Registry {
                 if let Some(handles) = &entry.pipe {
                     let swap_tx = handles.swap_tx.clone();
                     if let PeerPhase::Connected {
-                        channel,
-                        upgrading,
-                        ..
+                        channel, upgrading, ..
                     } = &mut entry.phase
                     {
                         channel.path = crate::transport::peer::ConnectPath::L2cap;
@@ -1579,7 +1639,33 @@ impl Registry {
                 w.wake();
             }
             let shutdown = matches!(cmd, PeerCommand::Shutdown);
-            let actions = self.handle(cmd);
+            let actions = match cmd {
+                PeerCommand::VerifiedEndpoint { endpoint_id, token } => {
+                    let mut actions = Vec::new();
+                    let now = std::time::Instant::now();
+                    let exact_device_id = token.and_then(|token| routing.device_for_token(token));
+                    if let Some(device_id) = exact_device_id.as_ref() {
+                        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
+                        let previous = match routing.note_discovery(prefix, device_id.clone()) {
+                            crate::transport::routing::DiscoveryUpdate::Replaced { previous } => {
+                                Some(previous)
+                            }
+                            _ => None,
+                        };
+                        if let Some(previous) = previous.as_ref() {
+                            routing.forget_device(previous);
+                        }
+                    }
+                    self.handle_verified_endpoint(
+                        &mut actions,
+                        now,
+                        endpoint_id,
+                        exact_device_id,
+                    );
+                    actions
+                }
+                other => self.handle(other),
+            };
             for action in actions {
                 driver.execute(action).await;
             }
@@ -1802,6 +1888,122 @@ mod tests {
         }
         assert_eq!(reg.peer(&device_id).unwrap().tx_gen, 1);
         assert_eq!(reg.peer(&device_id).unwrap().consecutive_failures, 0);
+    }
+
+    #[test]
+    fn connect_succeeded_emits_l2cap_upgrade_when_verified_prefix_already_known() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x80u8; 32]).public();
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        assert!(
+            my_ep.as_bytes() > peer_ep.as_bytes(),
+            "test presumes HIGH>LOW on derived pubkeys"
+        );
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        let mut reg =
+            Registry::new_for_test_with_policy_and_endpoint(L2capPolicy::PreferL2cap, my_ep);
+        reg.verified_prefixes.insert(peer_prefix, peer_ep);
+        let device_id = blew::DeviceId::from("dev-4-upgrade");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Central;
+            e.prefix = Some(peer_prefix);
+            e.tx_gen = 0;
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+        let ch = ChannelHandle {
+            id: 42,
+            path: ConnectPath::Gatt,
+        };
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: ch,
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::StartDataPipe { device_id: d, role: ConnectRole::Central, .. } if *d == device_id
+            )),
+            "expected StartDataPipe; got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::UpgradeToL2cap { device_id: d } if *d == device_id
+            )),
+            "expected UpgradeToL2cap; got {actions:?}"
+        );
+        match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Connected { tx_gen, upgrading, .. } => {
+                assert_eq!(*tx_gen, 1);
+                assert!(*upgrading);
+            }
+            other => panic!("wrong phase: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn connect_succeeded_emits_l2cap_upgrade_for_lone_lower_central() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let low = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let high = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let (my_ep, peer_ep) = if low.as_bytes() < high.as_bytes() {
+            (low, high)
+        } else {
+            (high, low)
+        };
+        assert!(my_ep.as_bytes() < peer_ep.as_bytes());
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        let mut reg =
+            Registry::new_for_test_with_policy_and_endpoint(L2capPolicy::PreferL2cap, my_ep);
+        reg.verified_prefixes.insert(peer_prefix, peer_ep);
+        let device_id = blew::DeviceId::from("dev-4-lone-lower-central");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Central;
+            e.prefix = Some(peer_prefix);
+            e.tx_gen = 0;
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+        let ch = ChannelHandle {
+            id: 7,
+            path: ConnectPath::Gatt,
+        };
+
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: ch,
+        });
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::UpgradeToL2cap { device_id: d } if *d == device_id
+            )),
+            "lone connected central must get UpgradeToL2cap even when it is the lower endpoint; got {actions:?}"
+        );
+        match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Connected { tx_gen, upgrading, .. } => {
+                assert_eq!(*tx_gen, 1);
+                assert!(*upgrading);
+            }
+            other => panic!("wrong phase: {other:?}"),
+        }
     }
 
     #[test]
@@ -2776,8 +2978,15 @@ mod tests {
         assert!(actions.is_empty());
         let entry = reg.peer(&device_id).unwrap();
         assert!(entry.pipe.is_none(), "stale pipe handles must be ignored");
-        assert_eq!(entry.rx_backlog.len(), 1, "stale ready must not drain backlog");
-        assert!(inbound_rx.try_recv().is_err(), "no fragments should be forwarded");
+        assert_eq!(
+            entry.rx_backlog.len(),
+            1,
+            "stale ready must not drain backlog"
+        );
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "no fragments should be forwarded"
+        );
     }
 
     #[tokio::test]
@@ -3060,11 +3269,17 @@ mod tests {
             client_id: client.clone(),
             char_uuid: first,
         });
-        assert!(actions.is_empty(), "single-char unsubscribe must be idempotent");
+        assert!(
+            actions.is_empty(),
+            "single-char unsubscribe must be idempotent"
+        );
         let entry = reg.peer(&client).unwrap();
         assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
         assert_eq!(entry.subscribed_chars.len(), 1);
-        assert!(entry.pipe.is_some(), "live pipe should remain until last char unsubscribes");
+        assert!(
+            entry.pipe.is_some(),
+            "live pipe should remain until last char unsubscribes"
+        );
 
         let actions = reg.handle(PeerCommand::PeripheralClientUnsubscribed {
             client_id: client.clone(),
@@ -3073,16 +3288,23 @@ mod tests {
         assert!(actions.is_empty(), "no pending sends to ack in this setup");
         let entry = reg.peer(&client).unwrap();
         assert!(entry.subscribed_chars.is_empty());
-        assert!(entry.pipe.is_none(), "last-char unsubscribe must drop pipe handles");
+        assert!(
+            entry.pipe.is_none(),
+            "last-char unsubscribe must drop pipe handles"
+        );
         match &entry.phase {
-            PeerPhase::Draining { reason, .. } => assert_eq!(*reason, DisconnectReason::RemoteClose),
+            PeerPhase::Draining { reason, .. } => {
+                assert_eq!(*reason, DisconnectReason::RemoteClose)
+            }
             other => panic!("expected Draining(RemoteClose), got {other:?}"),
         }
     }
 
     #[test]
     fn peripheral_client_subscribed_restarts_stale_l2cap_pipe_as_gatt() {
-        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PendingSend, PeerPhase, PipeHandles};
+        use crate::transport::peer::{
+            ChannelHandle, ConnectPath, ConnectRole, PeerPhase, PendingSend, PipeHandles,
+        };
         use uuid::uuid;
 
         let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
@@ -3162,6 +3384,7 @@ mod tests {
         // Simulate having already verified the peer via a prior central-role handshake.
         reg.handle(PeerCommand::VerifiedEndpoint {
             endpoint_id: peer_endpoint,
+            token: None,
         });
 
         let client = DeviceId::from("inbound-verified");
@@ -3342,7 +3565,7 @@ mod tests {
     #[tokio::test]
     async fn inbound_fragment_while_peripheral_on_l2cap_with_live_pipe_stays_on_l2cap() {
         use crate::transport::peer::{
-            ChannelHandle, ConnectPath, ConnectRole, FragmentSource, PendingSend, PeerPhase,
+            ChannelHandle, ConnectPath, ConnectRole, FragmentSource, PeerPhase, PendingSend,
             PipeHandles,
         };
 
@@ -3379,10 +3602,17 @@ mod tests {
             bytes: bytes::Bytes::from_static(b"tail-gatt"),
         });
 
-        assert!(actions.is_empty(), "tail GATT should not rebuild a live L2CAP peer");
+        assert!(
+            actions.is_empty(),
+            "tail GATT should not rebuild a live L2CAP peer"
+        );
         let entry = reg.peer(&device_id).expect("entry preserved");
         assert!(entry.pipe.is_some(), "live pipe must remain installed");
-        assert_eq!(entry.rx_backlog.len(), 0, "tail fragment should flow through the live pipe");
+        assert_eq!(
+            entry.rx_backlog.len(),
+            0,
+            "tail fragment should flow through the live pipe"
+        );
         match &entry.phase {
             PeerPhase::Connected {
                 tx_gen,
@@ -4413,6 +4643,7 @@ mod tests {
 
         let _actions = reg.handle(PeerCommand::VerifiedEndpoint {
             endpoint_id: endpoint,
+            token: None,
         });
 
         assert_eq!(reg.verified_prefixes.get(&prefix), Some(&endpoint));
@@ -4432,12 +4663,170 @@ mod tests {
         reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
         reg.peers.get_mut(&dev).unwrap().prefix = Some(prefix_from_endpoint(&ep_b));
 
-        let _ = reg.handle(PeerCommand::VerifiedEndpoint { endpoint_id: ep_a });
+        let _ = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: ep_a,
+            token: None,
+        });
 
         assert!(
             reg.peers[&dev].verified_endpoint.is_none(),
             "entry for different prefix must not be stamped"
         );
+    }
+
+    #[tokio::test]
+    async fn verified_endpoint_rebinds_routing_to_exact_live_device_from_token() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicU64;
+
+        use async_trait::async_trait;
+        use arc_swap::ArcSwap;
+        use bytes::Bytes;
+
+        use crate::transport::driver::Driver;
+        use crate::transport::interface::BleInterface;
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
+        use crate::transport::routing::{DiscoveryUpdate, TransportRouting, prefix_from_endpoint};
+        use crate::transport::store::InMemoryPeerStore;
+
+        struct DummyIface;
+
+        #[async_trait]
+        impl BleInterface for DummyIface {
+            async fn connect(&self, _: &DeviceId) -> crate::error::BleResult<ChannelHandle> {
+                Ok(ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                })
+            }
+            async fn disconnect(&self, _: &DeviceId) -> crate::error::BleResult<()> {
+                Ok(())
+            }
+            async fn write_c2p(&self, _: &DeviceId, _: Bytes) -> crate::error::BleResult<()> {
+                Ok(())
+            }
+            async fn notify_p2c(&self, _: &DeviceId, _: Bytes) -> crate::error::BleResult<()> {
+                Ok(())
+            }
+            async fn read_psm(&self, _: &DeviceId) -> crate::error::BleResult<Option<u16>> {
+                Ok(None)
+            }
+            async fn read_version(&self, _: &DeviceId) -> crate::error::BleResult<Option<u8>> {
+                Ok(None)
+            }
+            async fn open_l2cap(
+                &self,
+                _: &DeviceId,
+                _: u16,
+            ) -> crate::error::BleResult<blew::L2capChannel> {
+                unimplemented!()
+            }
+            async fn start_scan(&self) -> crate::error::BleResult<()> {
+                Ok(())
+            }
+            async fn stop_scan(&self) -> crate::error::BleResult<()> {
+                Ok(())
+            }
+            async fn rebuild_server(&self) -> crate::error::BleResult<()> {
+                Ok(())
+            }
+            async fn restart_advertising(&self) -> crate::error::BleResult<()> {
+                Ok(())
+            }
+            async fn restart_l2cap_listener(&self) -> crate::error::BleResult<Option<u16>> {
+                Ok(None)
+            }
+            async fn is_powered(&self) -> bool {
+                true
+            }
+            async fn refresh(&self, _: &DeviceId) -> crate::error::BleResult<()> {
+                Ok(())
+            }
+            async fn mtu(&self, _: &DeviceId) -> u16 {
+                23
+            }
+        }
+
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x11u8; 32]).public();
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0x22u8; 32]).public();
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+        let live_dev = DeviceId::from("live-peripheral");
+        let stale_scan_dev = DeviceId::from("stale-scan");
+
+        let routing = Arc::new(TransportRouting::new());
+        assert_eq!(
+            routing.note_discovery(peer_prefix, stale_scan_dev.clone()),
+            DiscoveryUpdate::New
+        );
+        let token = routing.mint_token_for_device(&live_dev);
+
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+        reg.peers
+            .insert(live_dev.clone(), PeerEntry::new(live_dev.clone()));
+        {
+            let entry = reg.peers.get_mut(&live_dev).unwrap();
+            entry.role = ConnectRole::Peripheral;
+            entry.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 7,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let snapshots = Arc::new(ArcSwap::from_pointee(SnapshotMaps::default()));
+        let wakers = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let (inbox_tx, inbox_rx) = tokio::sync::mpsc::channel(8);
+        let (incoming_tx, _incoming_rx) = tokio::sync::mpsc::channel(1);
+        let driver = Driver::new(
+            Arc::new(DummyIface),
+            inbox_tx.clone(),
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(InMemoryPeerStore::new()),
+        );
+
+        let snapshots_for_actor = Arc::clone(&snapshots);
+        let routing_for_actor = Arc::clone(&routing);
+        let wakers_for_actor = Arc::clone(&wakers);
+        let actor = tokio::spawn(async move {
+            reg.run(
+                inbox_rx,
+                driver,
+                snapshots_for_actor,
+                wakers_for_actor,
+                routing_for_actor,
+            )
+            .await;
+        });
+
+        inbox_tx
+            .send(PeerCommand::VerifiedEndpoint {
+                endpoint_id: peer_ep,
+                token: Some(token),
+            })
+            .await
+            .unwrap();
+        inbox_tx.send(PeerCommand::Shutdown).await.unwrap();
+        actor.await.unwrap();
+
+        assert_eq!(
+            routing.device_for_endpoint(&peer_ep),
+            Some(live_dev.clone()),
+            "verified peer must route back to the exact live peripheral client, not the stale scan id"
+        );
+
+        let snap = snapshots.load();
+        let state = snap
+            .peer_states
+            .get(&live_dev)
+            .expect("live device must still be tracked");
+        assert_eq!(state.verified_endpoint, Some(peer_ep));
+        assert_eq!(state.phase_kind, PhaseKind::Connected);
     }
 
     #[test]
@@ -4537,7 +4926,40 @@ mod tests {
         let after = &reg.peers[&alive_dev];
         assert!(after.last_adv.is_some(), "last_adv must be stamped");
         assert_eq!(after.prefix, Some(prefix));
+        assert!(
+            after.verified_live_suppressed_logged,
+            "first suppressed advert should trip the one-shot log guard"
+        );
         assert!(matches!(after.phase, PeerPhase::Connected { .. }));
+    }
+
+    #[test]
+    fn advertised_unsuppressed_clears_verified_live_log_guard() {
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let mut reg = Registry::new_for_test();
+        let endpoint = iroh_base::SecretKey::from_bytes(&[8u8; 32]).public();
+        let prefix = prefix_from_endpoint(&endpoint);
+        let dev_id = DeviceId::from("fresh-reset");
+
+        reg.peers.insert(dev_id.clone(), PeerEntry::new(dev_id.clone()));
+        reg.peers.get_mut(&dev_id).unwrap().verified_live_suppressed_logged = true;
+
+        let _ = reg.handle(PeerCommand::Advertised {
+            prefix,
+            device: blew::BleDevice {
+                id: dev_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        assert!(
+            !reg.peers[&dev_id].verified_live_suppressed_logged,
+            "normal advert handling must reset the one-shot suppression log guard"
+        );
     }
 
     #[test]
@@ -4795,6 +5217,7 @@ mod tests {
 
         let _ = reg.handle(PeerCommand::VerifiedEndpoint {
             endpoint_id: peer_ep,
+            token: None,
         });
 
         assert!(
@@ -4851,6 +5274,7 @@ mod tests {
 
         let _ = reg.handle(PeerCommand::VerifiedEndpoint {
             endpoint_id: peer_ep,
+            token: None,
         });
 
         assert!(
@@ -4911,6 +5335,7 @@ mod tests {
 
         let _ = reg.handle(PeerCommand::VerifiedEndpoint {
             endpoint_id: peer_ep,
+            token: None,
         });
 
         assert!(
@@ -4968,6 +5393,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::VerifiedEndpoint {
             endpoint_id: peer_ep,
+            token: None,
         });
 
         assert!(
@@ -4975,6 +5401,57 @@ mod tests {
                 |a| matches!(a, PeerAction::UpgradeToL2cap { device_id } if device_id == &dev)
             ),
             "winner must get UpgradeToL2cap; got {actions:?}"
+        );
+        match &reg.peers[&dev].phase {
+            PeerPhase::Connected { upgrading, .. } => assert!(*upgrading),
+            other => panic!("expected Connected{{upgrading:true}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upgrade_to_l2cap_emitted_for_lone_lower_central_after_verified() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let low = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let high = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let (my_ep, peer_ep) = if low.as_bytes() < high.as_bytes() {
+            (low, high)
+        } else {
+            (high, low)
+        };
+        assert!(my_ep.as_bytes() < peer_ep.as_bytes());
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        let mut reg =
+            Registry::new_for_test_with_policy_and_endpoint(L2capPolicy::PreferL2cap, my_ep);
+        let dev = DeviceId::from("peer-lone-lower-central");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        {
+            let e = reg.peers.get_mut(&dev).unwrap();
+            e.prefix = Some(peer_prefix);
+            e.role = ConnectRole::Central;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let actions = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_ep,
+            token: None,
+        });
+
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, PeerAction::UpgradeToL2cap { device_id } if device_id == &dev)
+            ),
+            "lone connected central must get UpgradeToL2cap even when it is the lower endpoint; got {actions:?}"
         );
         match &reg.peers[&dev].phase {
             PeerPhase::Connected { upgrading, .. } => assert!(*upgrading),
@@ -5017,6 +5494,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::VerifiedEndpoint {
             endpoint_id: peer_ep,
+            token: None,
         });
 
         assert!(
@@ -5061,6 +5539,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::VerifiedEndpoint {
             endpoint_id: peer_ep,
+            token: None,
         });
         assert!(
             !actions
@@ -5246,19 +5725,15 @@ mod tests {
             device_id: dev.clone(),
         });
 
-        assert!(
-            actions.iter().any(
-                |a| matches!(
-                    a,
-                    PeerAction::RevertToGattPipe {
-                        device_id,
-                        role,
-                        ..
-                    }
-                    if device_id == &dev && role == &ConnectRole::Central
-                )
-            )
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PeerAction::RevertToGattPipe {
+                device_id,
+                role,
+                ..
+            }
+            if device_id == &dev && role == &ConnectRole::Central
+        )));
         let e = &reg.peers[&dev];
         assert!(e.l2cap_upgrade_failed);
         match &e.phase {

@@ -12,6 +12,7 @@ use std::task::{Context, Poll};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Duration;
 
@@ -52,6 +53,7 @@ enum ActiveWorker {
     Gatt {
         outbound_fwd_tx: mpsc::Sender<PendingSend>,
         inbound_fwd_tx: mpsc::Sender<Bytes>,
+        shutdown_tx: oneshot::Sender<()>,
         handle: JoinHandle<()>,
     },
     L2cap {
@@ -273,12 +275,14 @@ fn spawn_gatt_worker(
 ) -> ActiveWorker {
     let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(32);
     let (inbound_fwd_tx, inbound_fwd_rx) = mpsc::channel::<Bytes>(64);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(run_gatt_pipe(
         iface,
         device_id,
         role,
         outbound_fwd_rx,
         inbound_fwd_rx,
+        shutdown_rx,
         incoming_tx,
         registry_tx,
         retransmit_counter,
@@ -287,6 +291,7 @@ fn spawn_gatt_worker(
     ActiveWorker::Gatt {
         outbound_fwd_tx,
         inbound_fwd_tx,
+        shutdown_tx,
         handle,
     }
 }
@@ -319,7 +324,14 @@ fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout:
         // abort the task — dropping the JoinHandle alone would only detach it,
         // letting a wedged worker leak.
         let mut handle = match old {
-            ActiveWorker::Gatt { handle, .. } => handle,
+            ActiveWorker::Gatt {
+                shutdown_tx,
+                handle,
+                ..
+            } => {
+                let _ = shutdown_tx.send(());
+                handle
+            }
             ActiveWorker::L2cap { handle, .. } => handle,
         };
         match tokio::time::timeout(timeout, &mut handle).await {
@@ -351,6 +363,7 @@ async fn run_gatt_pipe(
     role: ConnectRole,
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     mut inbound_rx: mpsc::Receiver<Bytes>,
+    mut shutdown_rx: oneshot::Receiver<()>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
     retransmit_counter: Arc<AtomicU64>,
@@ -445,6 +458,11 @@ async fn run_gatt_pipe(
                     }
                     None => break,
                 }
+            }
+            shutdown = &mut shutdown_rx => {
+                let _ = shutdown;
+                tracing::trace!(device = %device_id, "gatt pipe quiesce requested");
+                break;
             }
             join = &mut send_loop_handle => {
                 send_loop_done = true;
@@ -648,5 +666,45 @@ mod tests {
         })
         .await
         .expect("expected NotifyP2c call");
+    }
+
+    #[tokio::test]
+    async fn gatt_worker_quiesce_exits_without_stalled() {
+        let iface = Arc::new(MockBleInterface::new());
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let (registry_tx, mut registry_rx) = mpsc::channel::<PeerCommand>(4);
+
+        let worker = spawn_gatt_worker(
+            iface as Arc<dyn BleInterface>,
+            blew::DeviceId::from("pipe-quiesce"),
+            ConnectRole::Central,
+            incoming_tx,
+            registry_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+
+        let (shutdown_tx, handle) = match worker {
+            ActiveWorker::Gatt {
+                shutdown_tx,
+                handle,
+                ..
+            } => (shutdown_tx, handle),
+            ActiveWorker::L2cap { .. } => panic!("expected GATT worker"),
+        };
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("gatt worker should exit promptly")
+            .expect("gatt worker should not panic");
+
+        assert!(
+            matches!(
+                registry_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "quiesce should not emit Stalled"
+        );
     }
 }

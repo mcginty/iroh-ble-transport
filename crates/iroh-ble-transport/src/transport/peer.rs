@@ -69,6 +69,7 @@ pub struct PeerEntry {
     pub verified_endpoint: Option<iroh_base::EndpointId>,
     pub verified_at: Option<Instant>,
     pub l2cap_upgrade_failed: bool,
+    pub verified_live_suppressed_logged: bool,
 }
 
 impl PeerEntry {
@@ -91,6 +92,7 @@ impl PeerEntry {
             verified_endpoint: None,
             verified_at: None,
             l2cap_upgrade_failed: false,
+            verified_live_suppressed_logged: false,
         }
     }
 }
@@ -277,6 +279,7 @@ pub enum PeerCommand {
     /// stamps all PeerEntries whose prefix matches and runs the dedup pass.
     VerifiedEndpoint {
         endpoint_id: iroh_base::EndpointId,
+        token: Option<u64>,
     },
     /// Emitted by run_peripheral_events when a remote central subscribes
     /// to C2P or P2C. Registry materializes a Connected{Gatt} PeerEntry
@@ -430,6 +433,7 @@ mod tests {
     fn new_variants_are_constructible() {
         let _cmd1 = PeerCommand::VerifiedEndpoint {
             endpoint_id: iroh_base::SecretKey::from_bytes(&[0u8; 32]).public(),
+            token: None,
         };
         let _cmd2 = PeerCommand::PeripheralClientSubscribed {
             client_id: DeviceId::from("x"),
@@ -460,6 +464,7 @@ mod tests {
         assert!(e.verified_endpoint.is_none());
         assert!(e.verified_at.is_none());
         assert!(!e.l2cap_upgrade_failed);
+        assert!(!e.verified_live_suppressed_logged);
         assert!(e.subscribed_chars.is_empty());
     }
 }
