@@ -183,7 +183,10 @@ async fn run_pipe_supervisor(
                     continue;
                 };
                 if active.is_l2cap() {
-                    tracing::warn!(device = %device_id, "swap requested but already on L2CAP; ignoring");
+                    tracing::debug!(
+                        device = %device_id,
+                        "ignoring redundant L2CAP swap request; already on L2CAP"
+                    );
                     continue;
                 }
                 let new_active = spawn_l2cap_worker(

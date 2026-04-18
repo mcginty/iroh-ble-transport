@@ -62,6 +62,41 @@ where
     ))
 }
 
+fn log_peer_metric(metric: &str) {
+    if let Some(error) = metric.strip_prefix("connect_failed:") {
+        tracing::debug!(%error, "BLE connect attempt failed");
+        return;
+    }
+
+    if let Some(device_id) = metric.strip_prefix("restore_unknown_device=") {
+        tracing::debug!(device = device_id, "adapter restored unknown BLE device");
+        return;
+    }
+
+    if let Some(error) = metric.strip_prefix("l2cap_fallback_to_gatt:") {
+        tracing::info!(%error, "falling back to GATT after L2CAP failure");
+        return;
+    }
+
+    match metric {
+        "connected_pipe_wedged" => {
+            tracing::warn!("active BLE data pipe made no forward progress; draining connection");
+        }
+        "l2cap_duplicate_accept" => {
+            tracing::debug!("ignoring duplicate inbound L2CAP channel");
+        }
+        "l2cap_late_accept_swapped" => {
+            tracing::debug!("accepted late inbound L2CAP channel and swapped active pipe");
+        }
+        "l2cap_late_accept_after_gatt" => {
+            tracing::debug!("accepted inbound L2CAP channel after GATT path without live pipe");
+        }
+        _ => {
+            tracing::trace!(metric = %metric, "peer metric");
+        }
+    }
+}
+
 pub struct Driver<I: BleInterface> {
     iface: Arc<I>,
     inbox: mpsc::Sender<PeerCommand>,
@@ -207,7 +242,7 @@ impl<I: BleInterface> Driver<I> {
             }
 
             PeerAction::EmitMetric(ev) => {
-                tracing::trace!(metric = %ev, "peer metric");
+                log_peer_metric(&ev);
             }
 
             PeerAction::StartDataPipe {
@@ -270,7 +305,7 @@ impl<I: BleInterface> Driver<I> {
             } => {
                 tokio::spawn(async move {
                     if swap_tx.send(channel).await.is_err() {
-                        tracing::warn!(device = %device_id, "swap_tx closed; pipe supervisor already gone");
+                        tracing::debug!(device = %device_id, "swap_tx closed; pipe supervisor already gone");
                     }
                 });
             }
@@ -579,7 +614,9 @@ impl BleInterface for BlewDriver {
         // Re-opening requires plumbing the fresh listener stream back to the
         // accept supervisor and publishing the new PSM to the peripheral read
         // responder; neither is wired yet. Log for now.
-        tracing::warn!("restart_l2cap_listener: not yet implemented end-to-end");
+        tracing::info!(
+            "adapter restarted without rebuilding L2CAP listener; inbound L2CAP upgrades remain disabled until transport restart"
+        );
         Ok(None)
     }
 

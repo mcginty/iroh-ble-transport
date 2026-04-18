@@ -72,7 +72,7 @@ pub async fn run_central_events(
                             .await
                             .is_err()
                         {
-                            tracing::warn!(
+                            tracing::debug!(
                                 "central event pump: inbox closed during forget, shutting down"
                             );
                             break;
@@ -124,7 +124,7 @@ pub async fn run_central_events(
             CentralEvent::Restored { devices } => PeerCommand::RestoreFromAdapter { devices },
         };
         if inbox.send(cmd).await.is_err() {
-            tracing::warn!("central event pump: inbox closed, shutting down");
+            tracing::debug!("central event pump: inbox closed, shutting down");
             break;
         }
     }
@@ -212,7 +212,7 @@ pub async fn run_peripheral_events(
             }
         };
         if inbox.send(cmd).await.is_err() {
-            tracing::warn!("peripheral event pump: inbox closed, shutting down");
+            tracing::debug!("peripheral event pump: inbox closed, shutting down");
             break;
         }
     }
@@ -233,7 +233,7 @@ pub async fn run_l2cap_accept(
                 tracing::debug!(device = %device_id, "L2CAP accept: incoming channel");
                 let cmd = PeerCommand::InboundL2capChannel { device_id, channel };
                 if inbox.send(cmd).await.is_err() {
-                    tracing::warn!("l2cap accept loop: inbox closed, shutting down");
+                    tracing::debug!("l2cap accept loop: inbox closed, shutting down");
                     break;
                 }
             }
