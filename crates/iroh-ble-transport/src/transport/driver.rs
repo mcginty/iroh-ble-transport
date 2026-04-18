@@ -222,12 +222,14 @@ impl<I: BleInterface> Driver<I> {
                     mpsc::channel::<crate::transport::peer::PendingSend>(32);
                 let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(64);
                 let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+                let last_rx_at = crate::transport::peer::LivenessClock::new();
                 let iface: Arc<dyn BleInterface> = Arc::clone(&self.iface) as Arc<dyn BleInterface>;
                 let incoming_tx = self.incoming_tx.clone();
                 let inbox = self.inbox.clone();
                 let retransmit_counter = Arc::clone(&self.retransmit_counter);
                 let truncation_counter = Arc::clone(&self.truncation_counter);
                 let dev_for_ready = device_id.clone();
+                let pipe_last_rx_at = last_rx_at.clone();
                 tokio::spawn(async move {
                     run_data_pipe(
                         iface,
@@ -242,6 +244,7 @@ impl<I: BleInterface> Driver<I> {
                         swap_rx,
                         retransmit_counter,
                         truncation_counter,
+                        pipe_last_rx_at,
                     )
                     .await;
                 });
@@ -251,6 +254,7 @@ impl<I: BleInterface> Driver<I> {
                     outbound_tx,
                     inbound_tx,
                     swap_tx,
+                    last_rx_at,
                 };
                 if self.inbox.send(ready).await.is_err() {
                     tracing::debug!("inbox closed before DataPipeReady forwarded");
@@ -280,12 +284,14 @@ impl<I: BleInterface> Driver<I> {
                     mpsc::channel::<crate::transport::peer::PendingSend>(32);
                 let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(64);
                 let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+                let last_rx_at = crate::transport::peer::LivenessClock::new();
                 let iface: Arc<dyn BleInterface> = Arc::clone(&self.iface) as Arc<dyn BleInterface>;
                 let incoming_tx = self.incoming_tx.clone();
                 let inbox = self.inbox.clone();
                 let retransmit_counter = Arc::clone(&self.retransmit_counter);
                 let truncation_counter = Arc::clone(&self.truncation_counter);
                 let dev_for_ready = device_id.clone();
+                let pipe_last_rx_at = last_rx_at.clone();
                 tokio::spawn(async move {
                     run_data_pipe(
                         iface,
@@ -300,6 +306,7 @@ impl<I: BleInterface> Driver<I> {
                         swap_rx,
                         retransmit_counter,
                         truncation_counter,
+                        pipe_last_rx_at,
                     )
                     .await;
                 });
@@ -309,6 +316,7 @@ impl<I: BleInterface> Driver<I> {
                     outbound_tx,
                     inbound_tx,
                     swap_tx,
+                    last_rx_at,
                 };
                 if self.inbox.send(ready).await.is_err() {
                     tracing::debug!("inbox closed before DataPipeReady (revert) forwarded");

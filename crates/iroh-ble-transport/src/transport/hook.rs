@@ -50,10 +50,14 @@ impl BleDedupHook {
 
 impl EndpointHooks for BleDedupHook {
     async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
-        let token = conn.selected_path().and_then(|path| match path.remote_addr() {
-            TransportAddr::Custom(addr) if addr.id() == BLE_TRANSPORT_ID => parse_token_addr(addr).ok(),
-            _ => None,
-        });
+        let token = conn
+            .selected_path()
+            .and_then(|path| match path.remote_addr() {
+                TransportAddr::Custom(addr) if addr.id() == BLE_TRANSPORT_ID => {
+                    parse_token_addr(addr).ok()
+                }
+                _ => None,
+            });
         let _ = self.tx.send(VerifiedEndpointEvent {
             endpoint_id: conn.remote_id(),
             token,

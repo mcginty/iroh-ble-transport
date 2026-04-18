@@ -4,6 +4,7 @@
 //! here can be exercised from synchronous unit tests.
 
 use std::collections::{HashSet, VecDeque};
+use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
 
@@ -29,11 +30,47 @@ pub enum ConnectRole {
     Peripheral,
 }
 
+/// Shared monotonic clock used by a data-pipe's inbound delivery path to
+/// advertise liveness to the registry. The pipe worker calls `bump()` whenever
+/// a reassembled datagram is handed off to iroh; the registry watchdog reads
+/// `last()` to detect wedged pipes where the peer stack went silent without
+/// emitting a disconnect callback (observed on Android LE in low-power mode
+/// and during iOS background freezes).
+#[derive(Debug, Clone)]
+pub struct LivenessClock {
+    inner: Arc<parking_lot::Mutex<Instant>>,
+}
+
+impl LivenessClock {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(Instant::now())),
+        }
+    }
+
+    pub fn bump(&self) {
+        *self.inner.lock() = Instant::now();
+    }
+
+    #[must_use]
+    pub fn last(&self) -> Instant {
+        *self.inner.lock()
+    }
+}
+
+impl Default for LivenessClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PipeHandles {
     pub outbound_tx: tokio::sync::mpsc::Sender<PendingSend>,
     pub inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
     pub swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
+    pub last_rx_at: LivenessClock,
 }
 
 #[derive(Debug)]
@@ -274,6 +311,7 @@ pub enum PeerCommand {
         outbound_tx: tokio::sync::mpsc::Sender<PendingSend>,
         inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
         swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
+        last_rx_at: LivenessClock,
     },
     /// Emitted when `EndpointHooks::after_handshake` fires. The registry
     /// stamps all PeerEntries whose prefix matches and runs the dedup pass.
@@ -419,6 +457,7 @@ mod tests {
             outbound_tx,
             inbound_tx,
             swap_tx,
+            last_rx_at: LivenessClock::new(),
         };
         let _act = PeerAction::StartDataPipe {
             device_id: DeviceId::from("x"),

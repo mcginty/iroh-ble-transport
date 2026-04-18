@@ -71,6 +71,7 @@ pub(super) fn spawn_l2cap_io_tasks<R, W>(
     writer: W,
     device_id: blew::DeviceId,
     incoming_tx: mpsc::Sender<IncomingPacket>,
+    last_rx_at: crate::transport::peer::LivenessClock,
 ) -> (
     mpsc::Sender<Vec<u8>>,
     JoinHandle<()>,
@@ -108,6 +109,7 @@ where
         loop {
             match read_framed_datagram(&mut reader).await {
                 Ok(Some(data)) => {
+                    last_rx_at.bump();
                     if incoming_tx
                         .send(IncomingPacket {
                             device_id: device_id.clone(),
@@ -225,8 +227,13 @@ mod tests {
         let (a_rd, a_wr) = split(central_side);
         let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
         let device_id = blew::DeviceId::from("l2cap-test");
-        let (tx, _send_task, _recv_task, _done) =
-            super::spawn_l2cap_io_tasks(a_rd, a_wr, device_id.clone(), incoming_tx);
+        let (tx, _send_task, _recv_task, _done) = super::spawn_l2cap_io_tasks(
+            a_rd,
+            a_wr,
+            device_id.clone(),
+            incoming_tx,
+            crate::transport::peer::LivenessClock::new(),
+        );
 
         let (mut b_rd, mut b_wr) = split(peripheral_side);
 
@@ -256,8 +263,13 @@ mod tests {
         let (a_rd, a_wr) = split(central_side);
         let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
         let device_id = blew::DeviceId::from("device-id-stamp");
-        let (_tx, _send_task, _recv_task, _done) =
-            super::spawn_l2cap_io_tasks(a_rd, a_wr, device_id.clone(), incoming_tx);
+        let (_tx, _send_task, _recv_task, _done) = super::spawn_l2cap_io_tasks(
+            a_rd,
+            a_wr,
+            device_id.clone(),
+            incoming_tx,
+            crate::transport::peer::LivenessClock::new(),
+        );
 
         let (_b_rd, mut b_wr) = split(peripheral_side);
         for i in 0_u8..3 {
@@ -282,8 +294,13 @@ mod tests {
         let (a, b) = L2capChannel::pair(8192);
         let (a_rd, a_wr) = split(a);
         let (incoming_tx, _incoming_rx) = mpsc::channel(16);
-        let (_tx, _send_task, _recv_task, done) =
-            super::spawn_l2cap_io_tasks(a_rd, a_wr, blew::DeviceId::from("exit-test"), incoming_tx);
+        let (_tx, _send_task, _recv_task, done) = super::spawn_l2cap_io_tasks(
+            a_rd,
+            a_wr,
+            blew::DeviceId::from("exit-test"),
+            incoming_tx,
+            crate::transport::peer::LivenessClock::new(),
+        );
 
         drop(b);
 
@@ -302,6 +319,7 @@ mod tests {
             a_wr,
             blew::DeviceId::from("abort-test"),
             incoming_tx,
+            crate::transport::peer::LivenessClock::new(),
         );
 
         send_task.abort();

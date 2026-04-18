@@ -48,7 +48,14 @@ struct PeerState {
     ble_path: Option<String>,
     ble_failures: u32,
     last_seen: Instant,
+    last_join_nudge: Option<Instant>,
 }
+
+/// Min interval between inbound-message-driven `join_peers` nudges per peer.
+/// Inbound gossip messages from non-Direct peers can arrive rapidly (mesh
+/// fan-out); without this gate each one fired a fresh dial, compounding
+/// with `reconnect_tick` to thrash BLE.
+const JOIN_NUDGE_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 struct PeerStateUI {
@@ -158,7 +165,10 @@ fn gossip_status_str(status: Option<GossipStatus>) -> &'static str {
     }
 }
 
-fn summarize_join_targets(peers: &HashMap<EndpointId, PeerState>, targets: &[EndpointId]) -> String {
+fn summarize_join_targets(
+    peers: &HashMap<EndpointId, PeerState>,
+    targets: &[EndpointId],
+) -> String {
     targets
         .iter()
         .map(|peer_id| {
@@ -436,7 +446,11 @@ async fn gossip_event_pump(
                                 .entry(*from)
                                 .or_insert_with(|| new_peer_entry(*from));
                             peer.nickname = Some(nickname.clone());
-                            let needs_join_nudge = should_nudge_join(peer.gossip);
+                            let needs_join_nudge =
+                                should_nudge_join_inbound(peer.gossip, peer.last_join_nudge);
+                            if needs_join_nudge {
+                                peer.last_join_nudge = Some(Instant::now());
+                            }
                             if peer.gossip.is_none() {
                                 peer.gossip = Some(GossipStatus::InTopic);
                             }
@@ -496,7 +510,11 @@ async fn gossip_event_pump(
                                 .entry(*from)
                                 .or_insert_with(|| new_peer_entry(*from));
                             peer.nickname = Some(nickname.clone());
-                            let needs_join_nudge = should_nudge_join(peer.gossip);
+                            let needs_join_nudge =
+                                should_nudge_join_inbound(peer.gossip, peer.last_join_nudge);
+                            if needs_join_nudge {
+                                peer.last_join_nudge = Some(Instant::now());
+                            }
                             if peer.gossip.is_none() {
                                 peer.gossip = Some(GossipStatus::InTopic);
                             }
@@ -563,7 +581,11 @@ async fn gossip_event_pump(
                                 .entry(*from)
                                 .or_insert_with(|| new_peer_entry(*from));
                             peer.nickname = Some(new_nickname.clone());
-                            let needs_join_nudge = should_nudge_join(peer.gossip);
+                            let needs_join_nudge =
+                                should_nudge_join_inbound(peer.gossip, peer.last_join_nudge);
+                            if needs_join_nudge {
+                                peer.last_join_nudge = Some(Instant::now());
+                            }
                             if peer.gossip.is_none() {
                                 peer.gossip = Some(GossipStatus::InTopic);
                             }
@@ -621,13 +643,24 @@ async fn gossip_event_pump(
                         let (needs_join_nudge, gossip_status, ble_phase, ble_path, ble_failures) = {
                             let mut st = state.lock().await;
                             let cache_dir = st.cache_dir.clone();
-                            let (needs_join_nudge, gossip_status, ble_phase, ble_path, ble_failures, ui) = {
+                            let (
+                                needs_join_nudge,
+                                gossip_status,
+                                ble_phase,
+                                ble_path,
+                                ble_failures,
+                                ui,
+                            ) = {
                                 let peer = st
                                     .peers
                                     .entry(*from)
                                     .or_insert_with(|| new_peer_entry(*from));
                                 peer.nickname = Some(nickname.clone());
-                                let needs_join_nudge = should_nudge_join(peer.gossip);
+                                let needs_join_nudge =
+                                    should_nudge_join_inbound(peer.gossip, peer.last_join_nudge);
+                                if needs_join_nudge {
+                                    peer.last_join_nudge = Some(Instant::now());
+                                }
                                 if peer.gossip.is_none() {
                                     peer.gossip = Some(GossipStatus::InTopic);
                                 }
@@ -785,6 +818,7 @@ fn new_peer_entry(id: EndpointId) -> PeerState {
         ble_path: None,
         ble_failures: 0,
         last_seen: Instant::now(),
+        last_join_nudge: None,
     }
 }
 
@@ -796,7 +830,20 @@ fn remember_known_peer(cache_dir: &std::path::Path, peer_id: EndpointId) {
     }
 }
 
-fn should_nudge_join(gossip: Option<GossipStatus>) -> bool {
+/// Decide whether an inbound gossip message should nudge `join_peers`. Gated
+/// per-peer so a burst of forwarded messages from a non-Direct peer doesn't
+/// redial on every one — `reconnect_tick` still polls globally every 10 s.
+fn should_nudge_join_inbound(gossip: Option<GossipStatus>, last_nudge: Option<Instant>) -> bool {
+    if matches!(gossip, Some(GossipStatus::Direct)) {
+        return false;
+    }
+    match last_nudge {
+        Some(t) => t.elapsed() >= JOIN_NUDGE_MIN_INTERVAL,
+        None => true,
+    }
+}
+
+fn should_nudge_join_periodic(gossip: Option<GossipStatus>) -> bool {
     !matches!(gossip, Some(GossipStatus::Direct))
 }
 
@@ -816,12 +863,33 @@ fn collect_join_targets(
         if !seen.insert(peer_id) {
             continue;
         }
-        if should_nudge_join(peers.get(&peer_id).and_then(|peer| peer.gossip)) {
+        if should_nudge_join_periodic(peers.get(&peer_id).and_then(|peer| peer.gossip)) {
             targets.push(peer_id);
         }
     }
 
     targets
+}
+
+fn merge_verified_ble_snapshot(
+    own_id: EndpointId,
+    peers: &mut HashMap<EndpointId, PeerState>,
+    snapshot: &[BlePeerInfo],
+) -> Vec<EndpointId> {
+    let mut inserted = Vec::new();
+    for info in snapshot {
+        let Some(peer_id) = info.verified_endpoint else {
+            continue;
+        };
+        if peer_id == own_id {
+            continue;
+        }
+        if let std::collections::hash_map::Entry::Vacant(slot) = peers.entry(peer_id) {
+            slot.insert(new_peer_entry(peer_id));
+            inserted.push(peer_id);
+        }
+    }
+    inserted
 }
 
 #[cfg(test)]
@@ -884,6 +952,79 @@ mod tests {
 
         assert_eq!(targets, vec![in_topic_id, unknown_id]);
     }
+
+    #[test]
+    fn should_nudge_join_inbound_throttles_within_interval() {
+        assert!(
+            should_nudge_join_inbound(Some(GossipStatus::InTopic), None),
+            "never-nudged, non-Direct: must nudge"
+        );
+        assert!(
+            !should_nudge_join_inbound(Some(GossipStatus::Direct), None),
+            "Direct: must not nudge"
+        );
+        let recent = Instant::now() - (JOIN_NUDGE_MIN_INTERVAL / 2);
+        assert!(
+            !should_nudge_join_inbound(Some(GossipStatus::InTopic), Some(recent)),
+            "within throttle window: must not nudge"
+        );
+        let stale = Instant::now() - (JOIN_NUDGE_MIN_INTERVAL * 2);
+        assert!(
+            should_nudge_join_inbound(Some(GossipStatus::InTopic), Some(stale)),
+            "past throttle window: must nudge"
+        );
+    }
+
+    #[test]
+    fn merge_verified_ble_snapshot_materializes_only_verified_non_self_peers() {
+        let own_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let verified_peer = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
+        let existing_peer = iroh::SecretKey::from_bytes(&[3u8; 32]).public();
+
+        let mut peers = HashMap::new();
+        peers.insert(existing_peer, new_peer_entry(existing_peer));
+
+        let inserted = merge_verified_ble_snapshot(
+            own_id,
+            &mut peers,
+            &[
+                BlePeerInfo {
+                    device_id: "dev-verified".into(),
+                    phase: BlePeerPhase::Connected,
+                    consecutive_failures: 0,
+                    connect_path: Some(ConnectPath::Gatt),
+                    verified_endpoint: Some(verified_peer),
+                },
+                BlePeerInfo {
+                    device_id: "dev-existing".into(),
+                    phase: BlePeerPhase::Connected,
+                    consecutive_failures: 0,
+                    connect_path: Some(ConnectPath::L2cap),
+                    verified_endpoint: Some(existing_peer),
+                },
+                BlePeerInfo {
+                    device_id: "dev-self".into(),
+                    phase: BlePeerPhase::Connected,
+                    consecutive_failures: 0,
+                    connect_path: Some(ConnectPath::Gatt),
+                    verified_endpoint: Some(own_id),
+                },
+                BlePeerInfo {
+                    device_id: "dev-unverified".into(),
+                    phase: BlePeerPhase::Connected,
+                    consecutive_failures: 0,
+                    connect_path: Some(ConnectPath::Gatt),
+                    verified_endpoint: None,
+                },
+            ],
+        );
+
+        assert_eq!(inserted, vec![verified_peer]);
+        assert!(peers.contains_key(&verified_peer));
+        assert!(peers.contains_key(&existing_peer));
+        assert!(!peers.contains_key(&own_id));
+        assert_eq!(peers.len(), 2);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -926,8 +1067,15 @@ async fn transport_state_tick(
             .map(|info| (info.device_id.to_string(), info))
             .collect();
 
-        {
+        let mut discovery_nudge_targets: Vec<EndpointId> = Vec::new();
+        let gossip_sender = {
             let mut st = state.lock().await;
+            let sender = st.gossip_sender.clone();
+            let cache_dir = st.cache_dir.clone();
+            let inserted = merge_verified_ble_snapshot(st.own_id(), &mut st.peers, &snapshot);
+            for peer_id in inserted {
+                remember_known_peer(&cache_dir, peer_id);
+            }
             for peer in st.peers.values_mut() {
                 let info = transport
                     .device_for_endpoint(&peer.id)
@@ -940,6 +1088,30 @@ async fn transport_state_tick(
                     ConnectPath::L2cap => "l2cap".to_string(),
                 });
 
+                // BLE just noticed a peer we've been told about. Kick
+                // `join_peers` immediately instead of waiting for the 10s
+                // `reconnect_tick`: the typical case is iroh-gossip's first
+                // dial timed out before slow BLE scanning surfaced the
+                // advert, and otherwise the peer sits in Discovered until
+                // the next tick boundary.
+                let is_new_sighting = peer.ble_phase.is_none()
+                    && matches!(
+                        new_phase,
+                        Some(
+                            BlePeerPhase::Discovered
+                                | BlePeerPhase::Connecting
+                                | BlePeerPhase::Handshaking
+                                | BlePeerPhase::Connected
+                        )
+                    );
+                if is_new_sighting && should_nudge_join_inbound(peer.gossip, peer.last_join_nudge) {
+                    peer.last_join_nudge = Some(Instant::now());
+                    discovery_nudge_targets.push(peer.id);
+                }
+
+                if info.is_some() {
+                    peer.last_seen = Instant::now();
+                }
                 if peer.ble_phase != new_phase
                     || peer.ble_failures != new_failures
                     || peer.ble_path != new_path
@@ -948,6 +1120,22 @@ async fn transport_state_tick(
                     peer.ble_failures = new_failures;
                     peer.ble_path = new_path;
                     let _ = app.emit("peer-updated", &peer.to_ui());
+                }
+            }
+            sender
+        };
+
+        if let Some(sender) = gossip_sender {
+            for peer_id in discovery_nudge_targets {
+                tracing::debug!(
+                    peer = %peer_id.fmt_short(),
+                    "nudging join on fresh BLE discovery"
+                );
+                if let Err(e) = sender.join_peers(vec![peer_id]).await {
+                    tracing::debug!(
+                        peer = %peer_id.fmt_short(),
+                        "join_peers after discovery failed: {e}"
+                    );
                 }
             }
         }

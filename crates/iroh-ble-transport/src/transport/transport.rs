@@ -25,9 +25,9 @@ use uuid::{Uuid, uuid};
 use crate::error::{BleError, BleResult};
 use crate::transport::driver::{BlewDriver, Driver, IncomingPacket};
 use crate::transport::events::{run_central_events, run_l2cap_accept, run_peripheral_events};
+use crate::transport::hook::VerifiedEndpointEvent;
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
-use crate::transport::hook::VerifiedEndpointEvent;
 use crate::transport::routing::{TOKEN_LEN, TransportRouting, parse_token_addr, token_custom_addr};
 use crate::transport::store::{InMemoryPeerStore, PeerStore};
 use crate::transport::watchdog::run_watchdog;
@@ -388,6 +388,7 @@ impl BleTransport {
                 phase: BlePeerPhase::from(state.phase_kind),
                 consecutive_failures: state.consecutive_failures,
                 connect_path: state.connect_path,
+                verified_endpoint: state.verified_endpoint,
             })
             .collect()
     }
@@ -399,6 +400,7 @@ pub struct BlePeerInfo {
     pub phase: BlePeerPhase,
     pub consecutive_failures: u32,
     pub connect_path: Option<ConnectPath>,
+    pub verified_endpoint: Option<EndpointId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

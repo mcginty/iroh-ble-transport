@@ -12,7 +12,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use iroh_ble_transport::transport::driver::IncomingPacket;
 use iroh_ble_transport::transport::interface::BleInterface;
-use iroh_ble_transport::transport::peer::{ConnectPath, ConnectRole, PeerCommand, PendingSend};
+use iroh_ble_transport::transport::peer::{
+    ConnectPath, ConnectRole, LivenessClock, PeerCommand, PendingSend,
+};
 use iroh_ble_transport::transport::pipe::run_data_pipe;
 use iroh_ble_transport::transport::test_util::{CallKind, MockBleInterface};
 use tokio::io::AsyncReadExt;
@@ -50,6 +52,7 @@ async fn swap_to_l2cap_does_not_deadlock_and_routes_subsequent_sends() {
         swap_rx,
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        LivenessClock::new(),
     ));
 
     // Queue a datagram on the GATT path and verify the iface sees a WriteC2p.
@@ -164,6 +167,7 @@ async fn supervisor_shuts_down_cleanly_on_outbound_close() {
         swap_rx,
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        LivenessClock::new(),
     ));
 
     drop(outbound_tx);

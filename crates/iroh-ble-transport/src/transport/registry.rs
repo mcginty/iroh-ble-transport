@@ -23,6 +23,15 @@ const DRAINING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const RESTORING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 const DEAD_GC_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 pub(crate) const L2CAP_SELECT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// Max time a `Connected` pipe may go without producing an inbound datagram
+/// before the registry treats it as wedged and synthesizes `Stalled`. The
+/// wire-level QUIC keepalive runs at 5 s so a healthy link should bump its
+/// `LivenessClock` at roughly that cadence (packets flow both ways); 45 s
+/// is ~9× that and tolerates substantial jitter / transient scan stalls
+/// without false-positiving. Covers the wedged-pipe case where the peer's
+/// BLE stack freezes without emitting a disconnect callback (observed on
+/// Android LE in low-power mode and during iOS background suspension).
+pub(crate) const CONNECTED_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(45);
 
 #[derive(Debug)]
 pub struct Registry {
@@ -120,7 +129,15 @@ impl Registry {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
-            } => self.handle_data_pipe_ready(device_id, tx_gen, outbound_tx, inbound_tx, swap_tx),
+                last_rx_at,
+            } => self.handle_data_pipe_ready(
+                device_id,
+                tx_gen,
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+                last_rx_at,
+            ),
             PeerCommand::OpenL2capSucceeded {
                 device_id,
                 channel: l2cap_chan,
@@ -232,7 +249,26 @@ impl Registry {
                     let role = self.peers[*did].role;
                     crate::transport::dedup::should_win(role, &my_endpoint, &endpoint_id)
                 })
-                .cloned();
+                .cloned()
+                .or_else(|| {
+                    // No candidate carries the expected surviving role (e.g. peer
+                    // dialed us twice from different MACs — two Peripheral entries
+                    // on the lower-endpoint side). Draining all of them would
+                    // leave the prefix without a live pipe. Keep the most recently
+                    // Connected entry; ties broken by DeviceId so both sides of a
+                    // symmetric collision converge.
+                    candidates
+                        .iter()
+                        .max_by_key(|did| {
+                            let entry = &self.peers[*did];
+                            let since = match &entry.phase {
+                                PeerPhase::Connected { since, .. } => *since,
+                                _ => now,
+                            };
+                            (since, did.to_string())
+                        })
+                        .cloned()
+                });
             for did in candidates {
                 if Some(&did) == winner.as_ref() {
                     continue;
@@ -253,7 +289,9 @@ impl Registry {
             let connected_for_prefix = self
                 .peers
                 .values()
-                .filter(|e| e.prefix == Some(prefix) && matches!(e.phase, PeerPhase::Connected { .. }))
+                .filter(|e| {
+                    e.prefix == Some(prefix) && matches!(e.phase, PeerPhase::Connected { .. })
+                })
                 .count();
             let to_upgrade: Vec<DeviceId> = self
                 .peers
@@ -321,10 +359,9 @@ impl Registry {
         // worker must be displaced.
         if let PeerPhase::Connected { channel, .. } = &entry.phase
             && entry.role == crate::transport::peer::ConnectRole::Peripheral
+            && channel.path == crate::transport::peer::ConnectPath::Gatt
         {
-            if channel.path == crate::transport::peer::ConnectPath::Gatt {
-                return;
-            }
+            return;
         }
         Self::restart_peripheral_gatt_pipe(entry, actions, now, client_id, None, Some(char_uuid));
     }
@@ -636,8 +673,8 @@ impl Registry {
         channel: crate::transport::peer::ChannelHandle,
     ) {
         let known_prefix = self.peers.get(&device_id).and_then(|entry| entry.prefix);
-        let verified_endpoint = known_prefix
-            .and_then(|prefix| self.verified_prefixes.get(&prefix).copied());
+        let verified_endpoint =
+            known_prefix.and_then(|prefix| self.verified_prefixes.get(&prefix).copied());
         let connected_for_prefix = known_prefix
             .map(|prefix| {
                 self.peers
@@ -681,21 +718,20 @@ impl Registry {
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
-        if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
-            if let Some(endpoint_id) = verified_endpoint
-                && !entry.l2cap_upgrade_failed
-                && Self::should_emit_l2cap_upgrade(
-                    connected_for_prefix,
-                    entry.role,
-                    &self.my_endpoint,
-                    &endpoint_id,
-                )
-            {
-                if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
-                    *upgrading = true;
-                }
-                actions.push(PeerAction::UpgradeToL2cap { device_id });
+        if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap)
+            && let Some(endpoint_id) = verified_endpoint
+            && !entry.l2cap_upgrade_failed
+            && Self::should_emit_l2cap_upgrade(
+                connected_for_prefix,
+                entry.role,
+                &self.my_endpoint,
+                &endpoint_id,
+            )
+        {
+            if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                *upgrading = true;
             }
+            actions.push(PeerAction::UpgradeToL2cap { device_id });
         }
     }
 
@@ -871,10 +907,23 @@ impl Registry {
         // Any other phase (Discovered / Connecting / Reconnecting /
         // Draining / Dead / Unknown): the peer is actively writing to us,
         // which is the strongest liveness signal we have. Override the
-        // stale phase and rebuild as a fresh peripheral Connected so the
-        // new pipe can be spun up.
+        // stale phase and rebuild as Connected so the new pipe can be spun
+        // up. Role follows the fragment source: `PeripheralReceivedC2p`
+        // means peer dialed us (we're the peripheral-role server),
+        // `CentralReceivedP2c` means we dialed them and are receiving
+        // notifications (we're the central-role client). Rebuilding with
+        // the wrong role wires the pipe to a characteristic the local
+        // stack doesn't own and writes black-hole.
+        let role = match source {
+            crate::transport::peer::FragmentSource::CentralReceivedP2c => {
+                crate::transport::peer::ConnectRole::Central
+            }
+            crate::transport::peer::FragmentSource::PeripheralReceivedC2p => {
+                crate::transport::peer::ConnectRole::Peripheral
+            }
+        };
         entry.pipe = None;
-        entry.role = crate::transport::peer::ConnectRole::Peripheral;
+        entry.role = role;
         entry.tx_gen += 1;
         entry.phase = PeerPhase::Connected {
             since: now,
@@ -889,7 +938,7 @@ impl Registry {
         actions.push(PeerAction::StartDataPipe {
             device_id: device_id.clone(),
             tx_gen: entry.tx_gen,
-            role: crate::transport::peer::ConnectRole::Peripheral,
+            role,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
@@ -1028,6 +1077,7 @@ impl Registry {
             PendingDialExpired,
             DrainingToDead,
             RestoringToDead,
+            ConnectedWedged,
         }
 
         let mut decisions: Vec<(DeviceId, TickAction)> = Vec::new();
@@ -1048,6 +1098,18 @@ impl Registry {
                     if tick_now.saturating_duration_since(*since) > RESTORING_TIMEOUT =>
                 {
                     Some(TickAction::RestoringToDead)
+                }
+                PeerPhase::Connected { .. } => {
+                    // Wedged-pipe check: if the pipe's LivenessClock hasn't
+                    // bumped in CONNECTED_IDLE_DEADLINE we synthesize Stalled
+                    // so the routing layer's pinning can release and the
+                    // peer can be rediscovered under a new DeviceId (e.g.
+                    // after a MAC rotation on the return trip). No pipe
+                    // handles yet → can't observe liveness; leave it alone.
+                    entry.pipe.as_ref().and_then(|h| {
+                        let elapsed = tick_now.saturating_duration_since(h.last_rx_at.last());
+                        (elapsed > CONNECTED_IDLE_DEADLINE).then_some(TickAction::ConnectedWedged)
+                    })
                 }
                 _ => None,
             };
@@ -1101,6 +1163,24 @@ impl Registry {
                         reason: crate::transport::peer::DeadReason::Forgotten,
                         at: tick_now,
                     };
+                }
+                TickAction::ConnectedWedged => {
+                    let channel = if let PeerPhase::Connected { channel, .. } = &entry.phase {
+                        Some(channel.clone())
+                    } else {
+                        None
+                    };
+                    let reason = crate::transport::peer::DisconnectReason::LinkDead;
+                    let drain_acks = Self::drain_to_draining(entry, tick_now, reason.clone());
+                    actions.extend(drain_acks);
+                    if let Some(ch) = channel {
+                        actions.push(PeerAction::CloseChannel {
+                            device_id: device_id.clone(),
+                            channel: ch,
+                            reason,
+                        });
+                    }
+                    actions.push(PeerAction::EmitMetric("connected_pipe_wedged".into()));
                 }
             }
         }
@@ -1220,6 +1300,7 @@ impl Registry {
         outbound_tx: tokio::sync::mpsc::Sender<crate::transport::peer::PendingSend>,
         inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
         swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
+        last_rx_at: crate::transport::peer::LivenessClock,
     ) {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
@@ -1247,6 +1328,7 @@ impl Registry {
             outbound_tx,
             inbound_tx,
             swap_tx,
+            last_rx_at,
         });
     }
 
@@ -1465,17 +1547,21 @@ impl Registry {
                             // must move to L2CAP together.
                             if let Some(handles) = &entry.pipe {
                                 let swap_tx = handles.swap_tx.clone();
-                                entry.tx_gen += 1;
-                                let tx_gen = entry.tx_gen;
-                                entry.phase = PeerPhase::Connected {
-                                    since: now,
-                                    channel: crate::transport::peer::ChannelHandle {
-                                        id: 0,
-                                        path: crate::transport::peer::ConnectPath::L2cap,
-                                    },
-                                    tx_gen,
-                                    upgrading: false,
-                                };
+                                // Keep tx_gen stable — the swap reuses the
+                                // existing outbound_tx handle, so in-flight
+                                // SendDatagrams addressed to the current
+                                // generation are still valid. Bumping here
+                                // would bounce them through QUIC retransmit
+                                // for no reason.
+                                if let PeerPhase::Connected {
+                                    channel: phase_channel,
+                                    upgrading,
+                                    ..
+                                } = &mut entry.phase
+                                {
+                                    phase_channel.path = crate::transport::peer::ConnectPath::L2cap;
+                                    *upgrading = false;
+                                }
                                 actions.push(PeerAction::EmitMetric(
                                     "l2cap_late_accept_swapped".into(),
                                 ));
@@ -1656,12 +1742,7 @@ impl Registry {
                             routing.forget_device(previous);
                         }
                     }
-                    self.handle_verified_endpoint(
-                        &mut actions,
-                        now,
-                        endpoint_id,
-                        exact_device_id,
-                    );
+                    self.handle_verified_endpoint(&mut actions, now, endpoint_id, exact_device_id);
                     actions
                 }
                 other => self.handle(other),
@@ -1942,7 +2023,9 @@ mod tests {
             "expected UpgradeToL2cap; got {actions:?}"
         );
         match &reg.peer(&device_id).unwrap().phase {
-            PeerPhase::Connected { tx_gen, upgrading, .. } => {
+            PeerPhase::Connected {
+                tx_gen, upgrading, ..
+            } => {
                 assert_eq!(*tx_gen, 1);
                 assert!(*upgrading);
             }
@@ -1998,7 +2081,9 @@ mod tests {
             "lone connected central must get UpgradeToL2cap even when it is the lower endpoint; got {actions:?}"
         );
         match &reg.peer(&device_id).unwrap().phase {
-            PeerPhase::Connected { tx_gen, upgrading, .. } => {
+            PeerPhase::Connected {
+                tx_gen, upgrading, ..
+            } => {
                 assert_eq!(*tx_gen, 1);
                 assert!(*upgrading);
             }
@@ -2668,6 +2753,134 @@ mod tests {
         ));
     }
 
+    fn tick_wedged_pipe_test_body(path: crate::transport::peer::ConnectPath) {
+        use crate::transport::peer::{ChannelHandle, DisconnectReason, LivenessClock, PipeHandles};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-wedged");
+
+        // LivenessClock::new() stamps Instant::now(), so driving the tick
+        // to `that + deadline + epsilon` gives us a pipe that has been
+        // silent for exactly the idle-deadline window.
+        let clock = LivenessClock::new();
+        let bumped_at = clock.last();
+
+        let (outbound_tx, _outbound_rx) =
+            tokio::sync::mpsc::channel::<crate::transport::peer::PendingSend>(4);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
+
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle { id: 42, path },
+                tx_gen: 1,
+                upgrading: false,
+            };
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+                last_rx_at: clock,
+            });
+            e
+        });
+
+        let tick_now = bumped_at + CONNECTED_IDLE_DEADLINE + std::time::Duration::from_millis(10);
+        let actions = reg.handle(PeerCommand::Tick(tick_now));
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::CloseChannel { .. })),
+            "expected CloseChannel on wedged {path:?} pipe; got {actions:?}",
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::EmitMetric(s) if s == "connected_pipe_wedged"
+            )),
+            "expected connected_pipe_wedged metric; got {actions:?}",
+        );
+        assert!(
+            matches!(
+                reg.peer(&device_id).unwrap().phase,
+                PeerPhase::Draining {
+                    reason: DisconnectReason::LinkDead,
+                    ..
+                }
+            ),
+            "expected Draining{{LinkDead}}; got {:?}",
+            reg.peer(&device_id).unwrap().phase,
+        );
+    }
+
+    #[test]
+    fn tick_wedged_gatt_pipe_drains_and_closes_channel_after_idle_deadline() {
+        tick_wedged_pipe_test_body(crate::transport::peer::ConnectPath::Gatt);
+    }
+
+    #[test]
+    fn tick_wedged_l2cap_pipe_drains_and_closes_channel_after_idle_deadline() {
+        tick_wedged_pipe_test_body(crate::transport::peer::ConnectPath::L2cap);
+    }
+
+    #[test]
+    fn tick_does_not_wedge_pipe_when_liveness_is_fresh() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, LivenessClock, PipeHandles};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-live-gatt");
+
+        let (outbound_tx, _outbound_rx) =
+            tokio::sync::mpsc::channel::<crate::transport::peer::PendingSend>(4);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
+
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+                last_rx_at: LivenessClock::new(),
+            });
+            e
+        });
+
+        // Only 1s past fresh-new clock: well inside the deadline.
+        let tick_now = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let actions = reg.handle(PeerCommand::Tick(tick_now));
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::CloseChannel { .. })),
+            "fresh pipe must not be declared wedged; got {actions:?}",
+        );
+        assert!(
+            !actions.iter().any(|a| matches!(
+                a,
+                PeerAction::EmitMetric(s) if s == "connected_pipe_wedged"
+            )),
+            "fresh pipe must not emit wedge metric; got {actions:?}",
+        );
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Connected { .. }
+        ));
+    }
+
     #[test]
     fn stalled_on_non_connected_peer_is_noop() {
         let mut reg = Registry::new_for_test();
@@ -2888,6 +3101,7 @@ mod tests {
             outbound_tx,
             inbound_tx,
             swap_tx,
+            last_rx_at: crate::transport::peer::LivenessClock::new(),
         });
         assert!(actions.is_empty());
 
@@ -2933,6 +3147,7 @@ mod tests {
             outbound_tx,
             inbound_tx,
             swap_tx,
+            last_rx_at: crate::transport::peer::LivenessClock::new(),
         });
         assert!(actions.is_empty());
         assert_eq!(reg.peer(&device_id).unwrap().rx_backlog.len(), 0);
@@ -2973,6 +3188,7 @@ mod tests {
             outbound_tx,
             inbound_tx,
             swap_tx,
+            last_rx_at: crate::transport::peer::LivenessClock::new(),
         });
 
         assert!(actions.is_empty());
@@ -3015,6 +3231,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e
         });
@@ -3062,6 +3279,7 @@ mod tests {
                     outbound_tx,
                     inbound_tx,
                     swap_tx,
+                    last_rx_at: crate::transport::peer::LivenessClock::new(),
                 });
                 e
             });
@@ -3113,6 +3331,7 @@ mod tests {
                     outbound_tx,
                     inbound_tx,
                     swap_tx,
+                    last_rx_at: crate::transport::peer::LivenessClock::new(),
                 });
                 e
             });
@@ -3261,6 +3480,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e
         });
@@ -3329,6 +3549,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e
         });
@@ -3486,6 +3707,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e
         });
@@ -3592,6 +3814,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e
         });
@@ -3689,6 +3912,49 @@ mod tests {
     }
 
     #[test]
+    fn inbound_central_p2c_fragment_rebuilds_as_central_not_peripheral() {
+        use crate::transport::peer::{ConnectRole, FragmentSource};
+
+        // A P2C notification landing while the central entry is
+        // Reconnecting (e.g. we dialed, connection dropped briefly, peer's
+        // old notification subscription is still flushing) must rebuild
+        // the pipe as Central — not Peripheral — otherwise the pipe
+        // would try to call notify_p2c on a characteristic we don't own
+        // and outbound traffic black-holes.
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-central-rebuild");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Central;
+            e.phase = PeerPhase::Reconnecting {
+                attempt: 1,
+                next_at: std::time::Instant::now(),
+                reason: crate::transport::peer::DisconnectReason::Timeout,
+            };
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::InboundGattFragment {
+            device_id: device_id.clone(),
+            source: FragmentSource::CentralReceivedP2c,
+            bytes: bytes::Bytes::from_static(b"notif"),
+        });
+
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
+        assert_eq!(
+            entry.role,
+            ConnectRole::Central,
+            "role must follow fragment source: P2C from central side"
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            PeerAction::StartDataPipe { role: ConnectRole::Central, device_id: d, .. }
+                if d == &device_id
+        )));
+    }
+
+    #[test]
     fn forget_evicts_connected_entry_and_emits_close_channel() {
         use crate::transport::peer::{
             ChannelHandle, ConnectPath, DeadReason, PendingSend, PipeHandles,
@@ -3717,6 +3983,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e.pending_sends.push_back(PendingSend {
                 tx_gen: 4,
@@ -3825,6 +4092,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e.pending_sends.push_back(PendingSend {
                 tx_gen: 1,
@@ -4079,6 +4347,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e.pending_sends.push_back(PendingSend {
                 tx_gen: 5,
@@ -4144,6 +4413,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e
         });
@@ -4172,10 +4442,19 @@ mod tests {
                 channel, tx_gen, ..
             } => {
                 assert_eq!(channel.path, ConnectPath::L2cap, "path swapped to L2cap");
-                assert_eq!(*tx_gen, 4, "tx_gen incremented across the swap");
+                assert_eq!(
+                    *tx_gen, 3,
+                    "tx_gen preserved across the in-place swap so in-flight \
+                     SendDatagrams keyed on the current gen remain valid"
+                );
             }
             other => panic!("expected Connected(L2cap), got {other:?}"),
         }
+        assert_eq!(
+            reg.peer(&device_id).unwrap().tx_gen,
+            3,
+            "entry.tx_gen must also stay put"
+        );
     }
 
     #[test]
@@ -4205,6 +4484,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e
         });
@@ -4679,8 +4959,8 @@ mod tests {
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
 
-        use async_trait::async_trait;
         use arc_swap::ArcSwap;
+        use async_trait::async_trait;
         use bytes::Bytes;
 
         use crate::transport::driver::Driver;
@@ -4942,8 +5222,12 @@ mod tests {
         let prefix = prefix_from_endpoint(&endpoint);
         let dev_id = DeviceId::from("fresh-reset");
 
-        reg.peers.insert(dev_id.clone(), PeerEntry::new(dev_id.clone()));
-        reg.peers.get_mut(&dev_id).unwrap().verified_live_suppressed_logged = true;
+        reg.peers
+            .insert(dev_id.clone(), PeerEntry::new(dev_id.clone()));
+        reg.peers
+            .get_mut(&dev_id)
+            .unwrap()
+            .verified_live_suppressed_logged = true;
 
         let _ = reg.handle(PeerCommand::Advertised {
             prefix,
@@ -5357,6 +5641,74 @@ mod tests {
     }
 
     #[test]
+    fn dedup_same_role_collision_keeps_most_recent_not_all_drained() {
+        use crate::transport::peer::{
+            ChannelHandle, ConnectPath, ConnectRole, DisconnectReason, PeerPhase,
+        };
+        use crate::transport::routing::prefix_from_endpoint;
+
+        // LOW side (my < peer) means `should_win(Peripheral, ..)` is the
+        // only true branch. Two Peripheral entries (peer dialed us twice
+        // from different MACs) both return true and the existing
+        // find() picks one — that case is already covered. The broken
+        // case this guards against is the *other* side: two Central
+        // entries on the HIGH side would both be valid winners, but two
+        // Peripheral entries on the HIGH side lose `should_win` and,
+        // before this fix, were all drained.
+        let my_ep = iroh_base::SecretKey::from_bytes(&[0x80u8; 32]).public();
+        let peer_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        assert!(
+            my_ep.as_bytes() > peer_ep.as_bytes(),
+            "test invariant: HIGH endpoint side",
+        );
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+        let dev_old = DeviceId::from("peer-first-mac");
+        let dev_new = DeviceId::from("peer-second-mac");
+        let older = std::time::Instant::now();
+        let newer = older + std::time::Duration::from_millis(500);
+
+        for (did, since) in [(&dev_old, older), (&dev_new, newer)] {
+            reg.peers.insert(did.clone(), PeerEntry::new(did.clone()));
+            let e = reg.peers.get_mut(did).unwrap();
+            e.prefix = Some(peer_prefix);
+            e.role = ConnectRole::Peripheral;
+            e.phase = PeerPhase::Connected {
+                since,
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let _ = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_ep,
+            token: None,
+        });
+
+        assert!(
+            matches!(&reg.peers[&dev_new].phase, PeerPhase::Connected { .. }),
+            "most recently Connected entry must survive; got {:?}",
+            reg.peers[&dev_new].phase,
+        );
+        assert!(
+            matches!(
+                &reg.peers[&dev_old].phase,
+                PeerPhase::Draining {
+                    reason: DisconnectReason::DedupLoser,
+                    ..
+                },
+            ),
+            "older duplicate must drain as DedupLoser; got {:?}",
+            reg.peers[&dev_old].phase,
+        );
+    }
+
+    #[test]
     fn upgrade_to_l2cap_emitted_on_winner_after_verified() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
         use crate::transport::routing::prefix_from_endpoint;
@@ -5578,6 +5930,7 @@ mod tests {
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
+                last_rx_at: crate::transport::peer::LivenessClock::new(),
             });
             e
         });

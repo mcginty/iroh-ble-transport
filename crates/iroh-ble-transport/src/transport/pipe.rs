@@ -39,7 +39,7 @@ use crate::transport::dedup::L2CAP_HANDOVER_TIMEOUT;
 use crate::transport::driver::IncomingPacket;
 use crate::transport::interface::BleInterface;
 use crate::transport::mtu::{ATT_OVERHEAD, MIN_SANE_MTU, resolve_chunk_size};
-use crate::transport::peer::{ConnectPath, ConnectRole, PeerCommand, PendingSend};
+use crate::transport::peer::{ConnectPath, ConnectRole, LivenessClock, PeerCommand, PendingSend};
 use crate::transport::reliable::ReliableChannel;
 
 /// Conservative initial chunk size for a freshly started GATT pipe, used
@@ -82,6 +82,7 @@ pub async fn run_data_pipe(
     swap_rx: mpsc::Receiver<blew::L2capChannel>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
+    last_rx_at: LivenessClock,
 ) {
     run_pipe_supervisor(
         iface,
@@ -96,6 +97,7 @@ pub async fn run_data_pipe(
         swap_rx,
         retransmit_counter,
         truncation_counter,
+        last_rx_at,
     )
     .await;
 }
@@ -114,6 +116,7 @@ async fn run_pipe_supervisor(
     swap_rx: mpsc::Receiver<blew::L2capChannel>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
+    last_rx_at: LivenessClock,
 ) {
     let mut swap_rx: Option<mpsc::Receiver<blew::L2capChannel>> = Some(swap_rx);
     let mut active = match initial_path {
@@ -125,6 +128,7 @@ async fn run_pipe_supervisor(
             registry_tx.clone(),
             Arc::clone(&retransmit_counter),
             Arc::clone(&truncation_counter),
+            last_rx_at.clone(),
         ),
         ConnectPath::L2cap => {
             let Some(channel) = initial_l2cap else {
@@ -136,6 +140,7 @@ async fn run_pipe_supervisor(
                 channel,
                 incoming_tx.clone(),
                 registry_tx.clone(),
+                last_rx_at.clone(),
             )
         }
     };
@@ -184,6 +189,7 @@ async fn run_pipe_supervisor(
                     channel,
                     incoming_tx.clone(),
                     registry_tx.clone(),
+                    last_rx_at.clone(),
                 );
                 let old = std::mem::replace(&mut active, new_active);
                 spawn_drain_old_worker(old, device_id.clone(), L2CAP_HANDOVER_TIMEOUT);
@@ -272,6 +278,7 @@ fn spawn_gatt_worker(
     registry_tx: mpsc::Sender<PeerCommand>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
+    last_rx_at: LivenessClock,
 ) -> ActiveWorker {
     let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(32);
     let (inbound_fwd_tx, inbound_fwd_rx) = mpsc::channel::<Bytes>(64);
@@ -287,6 +294,7 @@ fn spawn_gatt_worker(
         registry_tx,
         retransmit_counter,
         truncation_counter,
+        last_rx_at,
     ));
     ActiveWorker::Gatt {
         outbound_fwd_tx,
@@ -301,6 +309,7 @@ fn spawn_l2cap_worker(
     channel: blew::L2capChannel,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
+    last_rx_at: LivenessClock,
 ) -> ActiveWorker {
     let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(32);
     let handle = tokio::spawn(run_l2cap_pipe(
@@ -309,6 +318,7 @@ fn spawn_l2cap_worker(
         outbound_fwd_rx,
         incoming_tx,
         registry_tx,
+        last_rx_at,
     ));
     ActiveWorker::L2cap {
         outbound_fwd_tx,
@@ -368,6 +378,7 @@ async fn run_gatt_pipe(
     registry_tx: mpsc::Sender<PeerCommand>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
+    last_rx_at: LivenessClock,
 ) {
     // Start with a conservative chunk size so the select loop can begin
     // processing inbound fragments immediately. Blocking on the MTU resolver
@@ -449,6 +460,7 @@ async fn run_gatt_pipe(
                             len = data.len(),
                             "pipe reassembled datagram -> incoming_tx"
                         );
+                        last_rx_at.bump();
                         let _ = incoming_tx
                             .send(IncomingPacket {
                                 device_id: device_id.clone(),
@@ -494,6 +506,7 @@ async fn run_l2cap_pipe(
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
+    last_rx_at: LivenessClock,
 ) {
     let (reader, writer) = tokio::io::split(channel);
 
@@ -502,6 +515,7 @@ async fn run_l2cap_pipe(
         writer,
         device_id.clone(),
         incoming_tx,
+        last_rx_at,
     );
 
     let mut io_died = false;
@@ -595,6 +609,7 @@ mod tests {
             swap_rx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            LivenessClock::new(),
         ));
 
         outbound_tx
@@ -641,6 +656,7 @@ mod tests {
             swap_rx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            LivenessClock::new(),
         ));
 
         outbound_tx
@@ -682,6 +698,7 @@ mod tests {
             registry_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            LivenessClock::new(),
         );
 
         let (shutdown_tx, handle) = match worker {
@@ -699,12 +716,14 @@ mod tests {
             .expect("gatt worker should exit promptly")
             .expect("gatt worker should not panic");
 
+        // Worker exit drops its registry_tx clone, so `Disconnected` is the
+        // expected steady state here. Either Empty or Disconnected satisfies
+        // "nothing was ever sent"; only an `Ok(...)` would indicate a leaked
+        // Stalled notification.
+        let got = registry_rx.try_recv();
         assert!(
-            matches!(
-                registry_rx.try_recv(),
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-            ),
-            "quiesce should not emit Stalled"
+            got.is_err(),
+            "quiesce must not emit any PeerCommand; got {got:?}"
         );
     }
 }
