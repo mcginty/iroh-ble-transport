@@ -7,7 +7,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
@@ -54,10 +54,12 @@ enum ActiveWorker {
         outbound_fwd_tx: mpsc::Sender<PendingSend>,
         inbound_fwd_tx: mpsc::Sender<Bytes>,
         shutdown_tx: oneshot::Sender<()>,
+        teardown_flag: Arc<AtomicBool>,
         handle: JoinHandle<()>,
     },
     L2cap {
         outbound_fwd_tx: mpsc::Sender<PendingSend>,
+        teardown_flag: Arc<AtomicBool>,
         handle: JoinHandle<()>,
     },
 }
@@ -192,6 +194,12 @@ async fn run_pipe_supervisor(
                     last_rx_at.clone(),
                 );
                 let old = std::mem::replace(&mut active, new_active);
+                tracing::debug!(
+                    device = %device_id,
+                    old_path = "Gatt",
+                    new_path = "L2cap",
+                    "retiring old pipe after L2CAP handover"
+                );
                 spawn_drain_old_worker(old, device_id.clone(), L2CAP_HANDOVER_TIMEOUT);
             }
         }
@@ -204,15 +212,32 @@ async fn run_pipe_supervisor(
     // cannot hold the caller hostage — on timeout we abort the task rather
     // than letting the JoinHandle drop (which would only detach it).
     let mut handle = match active {
-        ActiveWorker::Gatt { handle, .. } => handle,
-        ActiveWorker::L2cap { handle, .. } => handle,
+        ActiveWorker::Gatt {
+            teardown_flag,
+            handle,
+            ..
+        } => {
+            teardown_flag.store(true, Ordering::Relaxed);
+            handle
+        }
+        ActiveWorker::L2cap {
+            teardown_flag,
+            handle,
+            ..
+        } => {
+            teardown_flag.store(true, Ordering::Relaxed);
+            handle
+        }
     };
     if tokio::time::timeout(L2CAP_HANDOVER_TIMEOUT, &mut handle)
         .await
         .is_err()
     {
         handle.abort();
-        tracing::debug!(device = %device_id, "pipe supervisor: worker did not exit within handover timeout; aborted");
+        tracing::debug!(
+            device = %device_id,
+            "pipe supervisor: worker did not exit within handover timeout; aborted during teardown"
+        );
     }
 }
 
@@ -283,6 +308,7 @@ fn spawn_gatt_worker(
     let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(32);
     let (inbound_fwd_tx, inbound_fwd_rx) = mpsc::channel::<Bytes>(64);
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let teardown_flag = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn(run_gatt_pipe(
         iface,
         device_id,
@@ -290,6 +316,7 @@ fn spawn_gatt_worker(
         outbound_fwd_rx,
         inbound_fwd_rx,
         shutdown_rx,
+        Arc::clone(&teardown_flag),
         incoming_tx,
         registry_tx,
         retransmit_counter,
@@ -300,6 +327,7 @@ fn spawn_gatt_worker(
         outbound_fwd_tx,
         inbound_fwd_tx,
         shutdown_tx,
+        teardown_flag,
         handle,
     }
 }
@@ -312,16 +340,19 @@ fn spawn_l2cap_worker(
     last_rx_at: LivenessClock,
 ) -> ActiveWorker {
     let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(32);
+    let teardown_flag = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn(run_l2cap_pipe(
         device_id,
         channel,
         outbound_fwd_rx,
+        Arc::clone(&teardown_flag),
         incoming_tx,
         registry_tx,
         last_rx_at,
     ));
     ActiveWorker::L2cap {
         outbound_fwd_tx,
+        teardown_flag,
         handle,
     }
 }
@@ -336,20 +367,36 @@ fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout:
         let mut handle = match old {
             ActiveWorker::Gatt {
                 shutdown_tx,
+                teardown_flag,
                 handle,
                 ..
             } => {
+                teardown_flag.store(true, Ordering::Relaxed);
                 let _ = shutdown_tx.send(());
                 handle
             }
-            ActiveWorker::L2cap { handle, .. } => handle,
+            ActiveWorker::L2cap {
+                teardown_flag,
+                handle,
+                ..
+            } => {
+                teardown_flag.store(true, Ordering::Relaxed);
+                handle
+            }
         };
         match tokio::time::timeout(timeout, &mut handle).await {
             Ok(Ok(())) => {
-                tracing::debug!(device = %device_id, "old pipe worker drained cleanly");
+                tracing::debug!(
+                    device = %device_id,
+                    "old pipe worker drained cleanly during teardown"
+                );
             }
             Ok(Err(join_err)) => {
-                tracing::debug!(device = %device_id, ?join_err, "old pipe worker join error");
+                tracing::debug!(
+                    device = %device_id,
+                    ?join_err,
+                    "old pipe worker join error during teardown"
+                );
             }
             Err(_elapsed) => {
                 handle.abort();
@@ -359,7 +406,7 @@ fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout:
                 // time; not actionable, so debug rather than warn.
                 tracing::debug!(
                     device = %device_id,
-                    "old pipe worker did not drain within handover timeout; aborted"
+                    "old pipe worker did not drain within handover timeout; aborted during teardown"
                 );
             }
         }
@@ -374,6 +421,7 @@ async fn run_gatt_pipe(
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     mut inbound_rx: mpsc::Receiver<Bytes>,
     mut shutdown_rx: oneshot::Receiver<()>,
+    teardown_flag: Arc<AtomicBool>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
     retransmit_counter: Arc<AtomicU64>,
@@ -403,6 +451,7 @@ async fn run_gatt_pipe(
         let channel = Arc::clone(&channel);
         let iface = Arc::clone(&iface);
         let device_id = device_id.clone();
+        let send_loop_teardown = Arc::clone(&teardown_flag);
         let span = tracing::info_span!("ble_pipe", device = %device_id);
         tokio::spawn(tracing::Instrument::instrument(
             async move {
@@ -419,6 +468,9 @@ async fn run_gatt_pipe(
                             };
                             result.map_err(|e| format!("{e}"))
                         }
+                    }, {
+                        let teardown_flag = Arc::clone(&send_loop_teardown);
+                        move || teardown_flag.load(Ordering::Relaxed)
                     })
                     .await
             },
@@ -473,6 +525,7 @@ async fn run_gatt_pipe(
             }
             shutdown = &mut shutdown_rx => {
                 let _ = shutdown;
+                teardown_flag.store(true, Ordering::Relaxed);
                 tracing::trace!(device = %device_id, "gatt pipe quiesce requested");
                 break;
             }
@@ -504,6 +557,7 @@ async fn run_l2cap_pipe(
     device_id: blew::DeviceId,
     channel: blew::L2capChannel,
     mut outbound_rx: mpsc::Receiver<PendingSend>,
+    teardown_flag: Arc<AtomicBool>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
     last_rx_at: LivenessClock,
@@ -516,6 +570,7 @@ async fn run_l2cap_pipe(
         device_id.clone(),
         incoming_tx,
         last_rx_at,
+        Arc::clone(&teardown_flag),
     );
 
     let mut io_died = false;
@@ -540,10 +595,17 @@ async fn run_l2cap_pipe(
                                 );
                             }
                             Err(_closed) => {
-                                tracing::warn!(
-                                    device = %device_id,
-                                    "l2cap pipe: send task channel closed; stopping"
-                                );
+                                if teardown_flag.load(Ordering::Relaxed) {
+                                    tracing::debug!(
+                                        device = %device_id,
+                                        "l2cap pipe: send task channel closed during teardown; stopping"
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        device = %device_id,
+                                        "l2cap pipe: send task channel closed unexpectedly; stopping"
+                                    );
+                                }
                                 send.waker.wake();
                                 io_died = true;
                                 break;

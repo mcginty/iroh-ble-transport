@@ -9,6 +9,7 @@
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -72,6 +73,7 @@ pub(super) fn spawn_l2cap_io_tasks<R, W>(
     device_id: blew::DeviceId,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     last_rx_at: crate::transport::peer::LivenessClock,
+    tearing_down: Arc<AtomicBool>,
 ) -> (
     mpsc::Sender<Vec<u8>>,
     JoinHandle<()>,
@@ -89,12 +91,17 @@ where
     let dev = device_id.clone();
     let send_guard = NotifyOnDrop(Arc::clone(&done));
     let mut writer = writer;
+    let send_teardown = Arc::clone(&tearing_down);
     let send_task = tokio::spawn(async move {
         let _guard = send_guard;
         while let Some(datagram) = outbound_rx.recv().await {
             trace!(device = %dev, len = datagram.len(), "l2cap send task -> write_framed_datagram");
             if let Err(e) = write_framed_datagram(&mut writer, &datagram).await {
-                warn!(device = %dev, ?e, "l2cap send task exiting on error");
+                if send_teardown.load(Ordering::Relaxed) {
+                    debug!(device = %dev, ?e, "l2cap send task exiting during teardown");
+                } else {
+                    warn!(device = %dev, ?e, "l2cap send task exiting on writer error");
+                }
                 break;
             }
             trace!(device = %dev, "l2cap send task wrote datagram");
@@ -104,6 +111,7 @@ where
 
     let recv_guard = NotifyOnDrop(Arc::clone(&done));
     let mut reader = reader;
+    let recv_teardown = Arc::clone(&tearing_down);
     let recv_task = tokio::spawn(async move {
         let _guard = recv_guard;
         loop {
@@ -127,7 +135,11 @@ where
                     break;
                 }
                 Err(e) => {
-                    warn!(device = %device_id, ?e, "l2cap recv task exiting on error");
+                    if recv_teardown.load(Ordering::Relaxed) {
+                        debug!(device = %device_id, ?e, "l2cap recv task exiting during teardown");
+                    } else {
+                        warn!(device = %device_id, ?e, "l2cap recv task exiting on reader error");
+                    }
                     break;
                 }
             }
@@ -233,6 +245,7 @@ mod tests {
             device_id.clone(),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         let (mut b_rd, mut b_wr) = split(peripheral_side);
@@ -269,6 +282,7 @@ mod tests {
             device_id.clone(),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         let (_b_rd, mut b_wr) = split(peripheral_side);
@@ -300,6 +314,7 @@ mod tests {
             blew::DeviceId::from("exit-test"),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         drop(b);
@@ -320,6 +335,7 @@ mod tests {
             blew::DeviceId::from("abort-test"),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
         );
 
         send_task.abort();
