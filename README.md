@@ -15,11 +15,16 @@ other over BLE.
 Built on top of [blew](https://github.com/mcginty/blew), a cross-platform BLE
 library for Rust.
 
+## Requirements
+
+- Rust **1.95** or newer
+
 ## High-level functionality
 
 - Each node advertises a GATT service whose UUID encodes its public key prefix
 - Peers discover each other from advertising packets without connecting
-- Upon connection, clients will try to connect via L2CAP, with a GATT fallback
+- Connections start on GATT, then upgrade to L2CAP when available
+- If L2CAP setup fails or times out, the connection falls back to GATT
 
 ## Supported Platforms
 
@@ -57,7 +62,9 @@ cargo run --example iroh_ble -p iroh-ble-transport -- <endpoint-id>
 There's a Tauri-based demo group chat app to show off Iroh BLE connectivity in
 `demos/iroh-ble-chat`. More details on this app will follow, but please do not
 use it for anything sensitive, it is not secure or in any way was written as a
-toy solely to demonstrate the underlying transport.
+toy solely to demonstrate the underlying transport. The app starts with
+debug-event capture disabled by default so tester logs stay low-noise unless
+explicitly expanded.
 
 ## License
 
