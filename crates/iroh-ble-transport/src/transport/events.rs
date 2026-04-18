@@ -178,14 +178,18 @@ pub async fn run_peripheral_events(
                     subscribed,
                     "peripheral SubscriptionChanged"
                 );
-                if !subscribed {
-                    continue;
-                }
-                let prefix = routing.prefix_for_device(&client_id);
-                PeerCommand::PeripheralClientSubscribed {
-                    client_id,
-                    char_uuid,
-                    prefix,
+                if subscribed {
+                    let prefix = routing.prefix_for_device(&client_id);
+                    PeerCommand::PeripheralClientSubscribed {
+                        client_id,
+                        char_uuid,
+                        prefix,
+                    }
+                } else {
+                    PeerCommand::PeripheralClientUnsubscribed {
+                        client_id,
+                        char_uuid,
+                    }
                 }
             }
             PeripheralEvent::ReadRequest {

@@ -45,6 +45,21 @@ pub fn should_win(
     }
 }
 
+/// Return `true` iff this side should actively open the upgraded L2CAP
+/// channel. The dedup winner is still a pair of complementary entries
+/// (higher endpoint keeps Central, lower endpoint keeps Peripheral), but
+/// only the central winner should dial the CoC channel. The peripheral
+/// winner must remain accept-only or both sides race to create parallel
+/// channels for the same peer.
+#[must_use]
+pub fn should_dial_l2cap(
+    this_role: ConnectRole,
+    my_endpoint: &EndpointId,
+    peer_endpoint: &EndpointId,
+) -> bool {
+    matches!(this_role, ConnectRole::Central) && should_win(this_role, my_endpoint, peer_endpoint)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,5 +102,13 @@ mod tests {
             high_keeps_central && low_keeps_peripheral,
             "both sides must agree on surviving connection"
         );
+    }
+
+    #[test]
+    fn only_central_winner_dials_l2cap() {
+        let high = endpoint_with_first_byte(0xFF);
+        let low = endpoint_with_first_byte(0x01);
+        assert!(should_dial_l2cap(ConnectRole::Central, &high, &low));
+        assert!(!should_dial_l2cap(ConnectRole::Peripheral, &low, &high));
     }
 }

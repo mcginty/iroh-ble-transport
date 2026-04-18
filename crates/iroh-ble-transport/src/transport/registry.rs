@@ -94,9 +94,9 @@ impl Registry {
             }
             PeerCommand::InboundGattFragment {
                 device_id,
-                source: _,
+                source,
                 bytes,
-            } => self.handle_inbound_gatt_fragment(&mut actions, now, device_id, bytes),
+            } => self.handle_inbound_gatt_fragment(&mut actions, now, device_id, source, bytes),
             PeerCommand::CentralDisconnected { device_id, cause } => {
                 self.handle_central_disconnected(&mut actions, now, device_id, cause);
             }
@@ -116,10 +116,11 @@ impl Registry {
             PeerCommand::Shutdown => self.handle_shutdown(&mut actions),
             PeerCommand::DataPipeReady {
                 device_id,
+                tx_gen,
                 outbound_tx,
                 inbound_tx,
                 swap_tx,
-            } => self.handle_data_pipe_ready(device_id, outbound_tx, inbound_tx, swap_tx),
+            } => self.handle_data_pipe_ready(device_id, tx_gen, outbound_tx, inbound_tx, swap_tx),
             PeerCommand::OpenL2capSucceeded {
                 device_id,
                 channel: l2cap_chan,
@@ -156,6 +157,17 @@ impl Registry {
                     client_id,
                     char_uuid,
                     prefix,
+                );
+            }
+            PeerCommand::PeripheralClientUnsubscribed {
+                client_id,
+                char_uuid,
+            } => {
+                self.handle_peripheral_client_unsubscribed(
+                    &mut actions,
+                    now,
+                    client_id,
+                    char_uuid,
                 );
             }
             PeerCommand::L2capHandoverTimeout { device_id } => {
@@ -231,12 +243,18 @@ impl Registry {
         }
 
         if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
+            let my_endpoint = self.my_endpoint;
             let to_upgrade: Vec<DeviceId> = self
                 .peers
                 .iter()
                 .filter(|(_, e)| {
                     e.prefix == Some(prefix)
                         && !e.l2cap_upgrade_failed
+                        && crate::transport::dedup::should_dial_l2cap(
+                            e.role,
+                            &my_endpoint,
+                            &endpoint_id,
+                        )
                         && matches!(
                             e.phase,
                             PeerPhase::Connected {
@@ -267,7 +285,7 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         client_id: DeviceId,
-        _char_uuid: uuid::Uuid,
+        char_uuid: uuid::Uuid,
         prefix: Option<crate::transport::peer::KeyPrefix>,
     ) {
         let verified = prefix.and_then(|p| self.verified_prefixes.get(&p).copied());
@@ -284,31 +302,46 @@ impl Registry {
             entry.verified_endpoint = Some(eid);
             entry.verified_at = Some(now);
         }
-        // Idempotent across C2P/P2C: if we already materialized a
-        // Peripheral-role Connected entry on the first subscribe, the second
-        // characteristic's SubscriptionChanged must not restart the pipe.
-        if matches!(&entry.phase, PeerPhase::Connected { .. })
+        entry.subscribed_chars.insert(char_uuid);
+        // Idempotent across C2P/P2C for the live GATT pipe, but if we're
+        // currently on L2CAP this subscribe is a stronger signal that the
+        // remote central has started a fresh GATT session and the stale L2CAP
+        // worker must be displaced.
+        if let PeerPhase::Connected { channel, .. } = &entry.phase
             && entry.role == crate::transport::peer::ConnectRole::Peripheral
+        {
+            if channel.path == crate::transport::peer::ConnectPath::Gatt {
+                return;
+            }
+        }
+        Self::restart_peripheral_gatt_pipe(entry, actions, now, client_id, None, Some(char_uuid));
+    }
+
+    fn handle_peripheral_client_unsubscribed(
+        &mut self,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        client_id: DeviceId,
+        char_uuid: uuid::Uuid,
+    ) {
+        let Some(entry) = self.peers.get_mut(&client_id) else {
+            return;
+        };
+        entry.subscribed_chars.remove(&char_uuid);
+        if entry.role != crate::transport::peer::ConnectRole::Peripheral
+            || !matches!(entry.phase, PeerPhase::Connected { .. } | PeerPhase::Handshaking { .. })
+            || !entry.subscribed_chars.is_empty()
         {
             return;
         }
-        entry.role = crate::transport::peer::ConnectRole::Peripheral;
-        entry.tx_gen += 1;
-        entry.phase = PeerPhase::Connected {
-            since: now,
-            channel: crate::transport::peer::ChannelHandle {
-                id: entry.tx_gen,
-                path: crate::transport::peer::ConnectPath::Gatt,
-            },
-            tx_gen: entry.tx_gen,
-            upgrading: false,
-        };
-        actions.push(PeerAction::StartDataPipe {
-            device_id: client_id,
-            role: crate::transport::peer::ConnectRole::Peripheral,
-            path: crate::transport::peer::ConnectPath::Gatt,
-            l2cap_channel: None,
-        });
+        entry.rx_backlog.clear();
+        let broken_pipe_acks = Self::drain_to_draining(
+            entry,
+            now,
+            crate::transport::peer::DisconnectReason::RemoteClose,
+        );
+        actions.extend(broken_pipe_acks);
+        self.prune_verified_prefixes();
     }
 
     fn handle_advertised(
@@ -598,6 +631,7 @@ impl Registry {
         actions.push(PeerAction::ReadVersion {
             device_id: device_id.clone(),
         });
+        entry.subscribed_chars.clear();
         entry.tx_gen += 1;
         let tx_gen = entry.tx_gen;
         entry.phase = PeerPhase::Connected {
@@ -609,6 +643,7 @@ impl Registry {
         let role = entry.role;
         actions.push(PeerAction::StartDataPipe {
             device_id: device_id.clone(),
+            tx_gen,
             role,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
@@ -658,6 +693,7 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        source: crate::transport::peer::FragmentSource,
         bytes: bytes::Bytes,
     ) {
         use std::collections::hash_map::Entry;
@@ -684,6 +720,7 @@ impl Registry {
             entry.rx_backlog.push_back(bytes);
             actions.push(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
+                tx_gen: 1,
                 role: crate::transport::peer::ConnectRole::Peripheral,
                 path: crate::transport::peer::ConnectPath::Gatt,
                 l2cap_channel: None,
@@ -712,11 +749,51 @@ impl Registry {
             let role = entry.role;
             actions.push(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
+                tx_gen,
                 role,
                 path: crate::transport::peer::ConnectPath::Gatt,
                 l2cap_channel: None,
             });
             return;
+        }
+
+        let stale_peripheral_l2cap = matches!(
+            &entry.phase,
+            PeerPhase::Connected {
+                channel:
+                    crate::transport::peer::ChannelHandle {
+                        path: crate::transport::peer::ConnectPath::L2cap,
+                        ..
+                    },
+                ..
+            }
+        ) && entry.role == crate::transport::peer::ConnectRole::Peripheral;
+        if stale_peripheral_l2cap {
+            if let Some(pipe) = entry.pipe.as_ref() {
+                // A peripheral-side late accept flips the registry path to
+                // L2CAP before the in-flight GATT tail has fully drained. Keep
+                // delivering those fragments into the live pipe instead of
+                // rebuilding back to GATT and splitting the session.
+                if pipe.inbound_tx.try_send(bytes).is_err() {
+                    // Reliable protocol will retransmit if this fragment
+                    // mattered and the live pipe could not accept it.
+                }
+                return;
+            }
+            if matches!(
+                source,
+                crate::transport::peer::FragmentSource::PeripheralReceivedC2p
+            ) {
+                Self::restart_peripheral_gatt_pipe(
+                    entry,
+                    actions,
+                    now,
+                    device_id,
+                    Some(bytes),
+                    None,
+                );
+                return;
+            }
         }
 
         if matches!(entry.phase, PeerPhase::Connected { .. }) {
@@ -762,6 +839,43 @@ impl Registry {
         entry.rx_backlog.push_back(bytes);
         actions.push(PeerAction::StartDataPipe {
             device_id: device_id.clone(),
+            tx_gen: entry.tx_gen,
+            role: crate::transport::peer::ConnectRole::Peripheral,
+            path: crate::transport::peer::ConnectPath::Gatt,
+            l2cap_channel: None,
+        });
+    }
+
+    fn restart_peripheral_gatt_pipe(
+        entry: &mut PeerEntry,
+        actions: &mut Vec<PeerAction>,
+        now: std::time::Instant,
+        device_id: DeviceId,
+        first_fragment: Option<bytes::Bytes>,
+        subscribed_char: Option<uuid::Uuid>,
+    ) {
+        entry.pipe = None;
+        entry.role = crate::transport::peer::ConnectRole::Peripheral;
+        entry.subscribed_chars.clear();
+        if let Some(char_uuid) = subscribed_char {
+            entry.subscribed_chars.insert(char_uuid);
+        }
+        entry.tx_gen += 1;
+        entry.phase = PeerPhase::Connected {
+            since: now,
+            channel: crate::transport::peer::ChannelHandle {
+                id: entry.tx_gen,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+            tx_gen: entry.tx_gen,
+            upgrading: false,
+        };
+        if let Some(bytes) = first_fragment {
+            entry.rx_backlog.push_back(bytes);
+        }
+        actions.push(PeerAction::StartDataPipe {
+            device_id,
+            tx_gen: entry.tx_gen,
             role: crate::transport::peer::ConnectRole::Peripheral,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
@@ -1040,6 +1154,7 @@ impl Registry {
     fn handle_data_pipe_ready(
         &mut self,
         device_id: DeviceId,
+        tx_gen: u64,
         outbound_tx: tokio::sync::mpsc::Sender<crate::transport::peer::PendingSend>,
         inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
         swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
@@ -1047,6 +1162,9 @@ impl Registry {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
+        if entry.tx_gen != tx_gen {
+            return;
+        }
         // Drain rx_backlog first (preserves arrival order).
         while let Some(bytes) = entry.rx_backlog.pop_front() {
             if inbound_tx.try_send(bytes).is_err() {
@@ -1091,6 +1209,7 @@ impl Registry {
                     path: crate::transport::peer::ConnectPath::L2cap,
                 };
                 entry.l2cap_channel = Some(l2cap_chan);
+                entry.subscribed_chars.clear();
                 entry.tx_gen += 1;
                 let tx_gen = entry.tx_gen;
                 entry.phase = PeerPhase::Connected {
@@ -1102,6 +1221,7 @@ impl Registry {
                 let role = entry.role;
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    tx_gen,
                     role,
                     path: crate::transport::peer::ConnectPath::L2cap,
                     l2cap_channel: entry.l2cap_channel.take(),
@@ -1112,7 +1232,13 @@ impl Registry {
             } => {
                 if let Some(handles) = &entry.pipe {
                     let swap_tx = handles.swap_tx.clone();
-                    if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+                    if let PeerPhase::Connected {
+                        channel,
+                        upgrading,
+                        ..
+                    } = &mut entry.phase
+                    {
+                        channel.path = crate::transport::peer::ConnectPath::L2cap;
                         *upgrading = false;
                     }
                     actions.push(PeerAction::SwapPipeToL2cap {
@@ -1164,6 +1290,7 @@ impl Registry {
                 // and thrash the same attempt. Cleared on teardown by
                 // `drain_to_draining` so a future reconnect retries L2CAP.
                 entry.l2cap_upgrade_failed = true;
+                entry.subscribed_chars.clear();
                 entry.tx_gen += 1;
                 let tx_gen = entry.tx_gen;
                 entry.phase = PeerPhase::Connected {
@@ -1175,6 +1302,7 @@ impl Registry {
                 let role = entry.role;
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    tx_gen,
                     role,
                     path: crate::transport::peer::ConnectPath::Gatt,
                     l2cap_channel: None,
@@ -1203,13 +1331,23 @@ impl Registry {
     ) {
         if let Some(entry) = self.peers.get_mut(&device_id) {
             entry.l2cap_upgrade_failed = true;
-            if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
+            let role = entry.role;
+            let tx_gen = entry.tx_gen;
+            if let PeerPhase::Connected {
+                channel, upgrading, ..
+            } = &mut entry.phase
+            {
+                channel.path = crate::transport::peer::ConnectPath::Gatt;
                 *upgrading = false;
                 tracing::warn!(
                     device = %device_id,
                     "L2CAP pipe handover timed out; reverting to GATT for this connection"
                 );
-                actions.push(PeerAction::RevertToGattPipe { device_id });
+                actions.push(PeerAction::RevertToGattPipe {
+                    device_id,
+                    tx_gen,
+                    role,
+                });
             }
         }
     }
@@ -1240,6 +1378,7 @@ impl Registry {
                 let inserted = v.insert(e);
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    tx_gen: 1,
                     role: crate::transport::peer::ConnectRole::Peripheral,
                     path: crate::transport::peer::ConnectPath::L2cap,
                     l2cap_channel: inserted.l2cap_channel.take(),
@@ -1313,6 +1452,7 @@ impl Registry {
                     let role = entry.role;
                     actions.push(PeerAction::StartDataPipe {
                         device_id: device_id.clone(),
+                        tx_gen,
                         role,
                         path: crate::transport::peer::ConnectPath::L2cap,
                         l2cap_channel: entry.l2cap_channel.take(),
@@ -2542,6 +2682,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::DataPipeReady {
             device_id: device_id.clone(),
+            tx_gen: 7,
             outbound_tx,
             inbound_tx,
             swap_tx,
@@ -2574,6 +2715,7 @@ mod tests {
                 tx_gen: 1,
                 upgrading: false,
             };
+            e.tx_gen = 1;
             e.rx_backlog.push_back(bytes::Bytes::from_static(b"A"));
             e.rx_backlog.push_back(bytes::Bytes::from_static(b"B"));
             e
@@ -2585,6 +2727,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::DataPipeReady {
             device_id: device_id.clone(),
+            tx_gen: 1,
             outbound_tx,
             inbound_tx,
             swap_tx,
@@ -2594,6 +2737,47 @@ mod tests {
 
         assert_eq!(inbound_rx.recv().await.unwrap().as_ref(), b"A");
         assert_eq!(inbound_rx.recv().await.unwrap().as_ref(), b"B");
+    }
+
+    #[tokio::test]
+    async fn stale_data_pipe_ready_does_not_install_handles_or_drain_backlog() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PendingSend};
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-stale-ready");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 4,
+                upgrading: false,
+            };
+            e.tx_gen = 4;
+            e.rx_backlog.push_back(bytes::Bytes::from_static(b"queued"));
+            e
+        });
+
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(8);
+        let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(8);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
+
+        let actions = reg.handle(PeerCommand::DataPipeReady {
+            device_id: device_id.clone(),
+            tx_gen: 3,
+            outbound_tx,
+            inbound_tx,
+            swap_tx,
+        });
+
+        assert!(actions.is_empty());
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(entry.pipe.is_none(), "stale pipe handles must be ignored");
+        assert_eq!(entry.rx_backlog.len(), 1, "stale ready must not drain backlog");
+        assert!(inbound_rx.try_recv().is_err(), "no fragments should be forwarded");
     }
 
     #[tokio::test]
@@ -2835,6 +3019,134 @@ mod tests {
     }
 
     #[test]
+    fn peripheral_unsubscribe_only_drains_after_last_char() {
+        use crate::transport::peer::{
+            ChannelHandle, ConnectPath, ConnectRole, DisconnectReason, PendingSend, PipeHandles,
+        };
+        use uuid::uuid;
+
+        let mut reg = Registry::new_for_test();
+        let client = DeviceId::from("inbound-unsub");
+        let first = uuid!("69726f02-8e45-4c2c-b3a5-331f3098b5c2");
+        let second = uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2");
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(4);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
+
+        reg.peers.insert(client.clone(), {
+            let mut e = PeerEntry::new(client.clone());
+            e.role = ConnectRole::Peripheral;
+            e.tx_gen = 2;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 2,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 2,
+                upgrading: false,
+            };
+            e.subscribed_chars.insert(first);
+            e.subscribed_chars.insert(second);
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+            });
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::PeripheralClientUnsubscribed {
+            client_id: client.clone(),
+            char_uuid: first,
+        });
+        assert!(actions.is_empty(), "single-char unsubscribe must be idempotent");
+        let entry = reg.peer(&client).unwrap();
+        assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
+        assert_eq!(entry.subscribed_chars.len(), 1);
+        assert!(entry.pipe.is_some(), "live pipe should remain until last char unsubscribes");
+
+        let actions = reg.handle(PeerCommand::PeripheralClientUnsubscribed {
+            client_id: client.clone(),
+            char_uuid: second,
+        });
+        assert!(actions.is_empty(), "no pending sends to ack in this setup");
+        let entry = reg.peer(&client).unwrap();
+        assert!(entry.subscribed_chars.is_empty());
+        assert!(entry.pipe.is_none(), "last-char unsubscribe must drop pipe handles");
+        match &entry.phase {
+            PeerPhase::Draining { reason, .. } => assert_eq!(*reason, DisconnectReason::RemoteClose),
+            other => panic!("expected Draining(RemoteClose), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peripheral_client_subscribed_restarts_stale_l2cap_pipe_as_gatt() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PendingSend, PeerPhase, PipeHandles};
+        use uuid::uuid;
+
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+        let client = DeviceId::from("inbound-stale-l2cap");
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(4);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
+        reg.peers.insert(client.clone(), {
+            let mut e = PeerEntry::new(client.clone());
+            e.role = ConnectRole::Peripheral;
+            e.tx_gen = 2;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 9,
+                    path: ConnectPath::L2cap,
+                },
+                tx_gen: 2,
+                upgrading: false,
+            };
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+            });
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::PeripheralClientSubscribed {
+            client_id: client.clone(),
+            char_uuid: uuid!("69726f03-8e45-4c2c-b3a5-331f3098b5c2"),
+            prefix: None,
+        });
+
+        let entry = reg.peers.get(&client).expect("entry preserved");
+        assert_eq!(entry.role, ConnectRole::Peripheral);
+        assert!(entry.pipe.is_none(), "stale pipe handles must be dropped");
+        match &entry.phase {
+            PeerPhase::Connected {
+                tx_gen,
+                channel:
+                    ChannelHandle {
+                        path: ConnectPath::Gatt,
+                        ..
+                    },
+                ..
+            } => assert_eq!(*tx_gen, 3),
+            other => panic!("expected Connected(Gatt), got {other:?}"),
+        }
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::StartDataPipe {
+                    device_id,
+                    role: ConnectRole::Peripheral,
+                    path: ConnectPath::Gatt,
+                    ..
+                } if device_id == &client
+            )),
+            "expected StartDataPipe(Gatt) for restarted peripheral session; got {actions:?}"
+        );
+    }
+
+    #[test]
     fn peripheral_client_subscribed_with_known_prefix_is_eligible_for_dedup() {
         use crate::transport::peer::{ConnectRole, KEY_PREFIX_LEN, PeerPhase};
         use iroh_base::SecretKey;
@@ -2963,6 +3275,127 @@ mod tests {
 
         assert_eq!(inbound_rx.recv().await.unwrap().as_ref(), b"frag");
         assert_eq!(reg.peer(&device_id).unwrap().rx_backlog.len(), 0);
+    }
+
+    #[test]
+    fn inbound_fragment_while_peripheral_on_l2cap_without_live_pipe_rebuilds_as_gatt() {
+        use crate::transport::peer::{
+            ChannelHandle, ConnectPath, ConnectRole, FragmentSource, PeerPhase,
+        };
+
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-l2cap-restart");
+
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Peripheral;
+            e.tx_gen = 2;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 7,
+                    path: ConnectPath::L2cap,
+                },
+                tx_gen: 2,
+                upgrading: false,
+            };
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::InboundGattFragment {
+            device_id: device_id.clone(),
+            source: FragmentSource::PeripheralReceivedC2p,
+            bytes: bytes::Bytes::from_static(b"fresh-gatt"),
+        });
+
+        let entry = reg.peer(&device_id).expect("entry preserved");
+        assert_eq!(entry.role, ConnectRole::Peripheral);
+        assert!(entry.pipe.is_none(), "stale L2CAP pipe must be dropped");
+        match &entry.phase {
+            PeerPhase::Connected {
+                tx_gen,
+                channel:
+                    ChannelHandle {
+                        path: ConnectPath::Gatt,
+                        ..
+                    },
+                ..
+            } => assert_eq!(*tx_gen, 3),
+            other => panic!("expected Connected(Gatt), got {other:?}"),
+        }
+        assert_eq!(entry.rx_backlog.len(), 1);
+        assert_eq!(&entry.rx_backlog[0][..], b"fresh-gatt");
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::StartDataPipe {
+                    device_id: d,
+                    role: ConnectRole::Peripheral,
+                    path: ConnectPath::Gatt,
+                    ..
+                } if d == &device_id
+            )),
+            "expected StartDataPipe(Gatt) after rebuilding stale L2CAP session; got {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_fragment_while_peripheral_on_l2cap_with_live_pipe_stays_on_l2cap() {
+        use crate::transport::peer::{
+            ChannelHandle, ConnectPath, ConnectRole, FragmentSource, PendingSend, PeerPhase,
+            PipeHandles,
+        };
+
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-l2cap-tail");
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel::<PendingSend>(4);
+        let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
+
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Peripheral;
+            e.tx_gen = 2;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 7,
+                    path: ConnectPath::L2cap,
+                },
+                tx_gen: 2,
+                upgrading: false,
+            };
+            e.pipe = Some(PipeHandles {
+                outbound_tx,
+                inbound_tx,
+                swap_tx,
+            });
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::InboundGattFragment {
+            device_id: device_id.clone(),
+            source: FragmentSource::PeripheralReceivedC2p,
+            bytes: bytes::Bytes::from_static(b"tail-gatt"),
+        });
+
+        assert!(actions.is_empty(), "tail GATT should not rebuild a live L2CAP peer");
+        let entry = reg.peer(&device_id).expect("entry preserved");
+        assert!(entry.pipe.is_some(), "live pipe must remain installed");
+        assert_eq!(entry.rx_backlog.len(), 0, "tail fragment should flow through the live pipe");
+        match &entry.phase {
+            PeerPhase::Connected {
+                tx_gen,
+                channel:
+                    ChannelHandle {
+                        path: ConnectPath::L2cap,
+                        ..
+                    },
+                ..
+            } => assert_eq!(*tx_gen, 2),
+            other => panic!("expected Connected(L2cap), got {other:?}"),
+        }
+        assert_eq!(inbound_rx.recv().await.unwrap().as_ref(), b"tail-gatt");
     }
 
     #[test]
@@ -3382,6 +3815,7 @@ mod tests {
                     path: ConnectPath::L2cap,
                     l2cap_channel: Some(_),
                     device_id: d,
+                    ..
                 } if *d == device_id
             )),
             "expected StartDataPipe(L2cap, Peripheral) with channel; got {actions:?}"
@@ -4549,6 +4983,55 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_to_l2cap_not_emitted_on_accept_only_side_after_verified() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let a = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let b = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
+        let (my_ep, peer_ep) = if a.as_bytes() < b.as_bytes() {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        let mut reg =
+            Registry::new_for_test_with_policy_and_endpoint(L2capPolicy::PreferL2cap, my_ep);
+        let dev = DeviceId::from("peer");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        {
+            let e = reg.peers.get_mut(&dev).unwrap();
+            e.prefix = Some(peer_prefix);
+            e.role = ConnectRole::Peripheral;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let actions = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: peer_ep,
+        });
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::UpgradeToL2cap { .. })),
+            "accept-only side must not open L2CAP; got {actions:?}"
+        );
+        match &reg.peers[&dev].phase {
+            PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
+            other => panic!("expected Connected{{upgrading:false}}, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn upgrade_to_l2cap_not_emitted_when_policy_disabled() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
         use crate::transport::routing::prefix_from_endpoint;
@@ -4638,7 +5121,12 @@ mod tests {
         );
         let entry = reg.peer(&device_id).unwrap();
         match &entry.phase {
-            PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
+            PeerPhase::Connected {
+                channel, upgrading, ..
+            } => {
+                assert_eq!(channel.path, ConnectPath::L2cap);
+                assert!(!*upgrading);
+            }
             other => panic!("expected Connected, got {other:?}"),
         }
     }
@@ -4748,7 +5236,7 @@ mod tests {
                 since: std::time::Instant::now(),
                 channel: ChannelHandle {
                     id: 1,
-                    path: ConnectPath::Gatt,
+                    path: ConnectPath::L2cap,
                 },
                 tx_gen: 1,
                 upgrading: true,
@@ -4760,13 +5248,26 @@ mod tests {
 
         assert!(
             actions.iter().any(
-                |a| matches!(a, PeerAction::RevertToGattPipe { device_id } if device_id == &dev)
+                |a| matches!(
+                    a,
+                    PeerAction::RevertToGattPipe {
+                        device_id,
+                        role,
+                        ..
+                    }
+                    if device_id == &dev && role == &ConnectRole::Central
+                )
             )
         );
         let e = &reg.peers[&dev];
         assert!(e.l2cap_upgrade_failed);
         match &e.phase {
-            PeerPhase::Connected { upgrading, .. } => assert!(!*upgrading),
+            PeerPhase::Connected {
+                channel, upgrading, ..
+            } => {
+                assert_eq!(channel.path, ConnectPath::Gatt);
+                assert!(!*upgrading);
+            }
             other => panic!("expected Connected, got {other:?}"),
         }
     }

@@ -78,9 +78,6 @@ fn ble_phase_str(phase: BlePeerPhase) -> &'static str {
 
 impl PeerState {
     fn ui_status(&self) -> &'static str {
-        if matches!(self.gossip, Some(GossipStatus::Direct)) {
-            return "connected";
-        }
         match self.ble_phase {
             Some(BlePeerPhase::Connected) => "connected",
             Some(BlePeerPhase::Handshaking) => "handshaking",
@@ -88,7 +85,9 @@ impl PeerState {
             Some(BlePeerPhase::Reconnecting | BlePeerPhase::Restoring) => "reconnecting",
             Some(BlePeerPhase::PendingDial) => "pending_dial",
             Some(BlePeerPhase::Discovered | BlePeerPhase::Unknown) => {
-                if matches!(self.gossip, Some(GossipStatus::InTopic)) {
+                if matches!(self.gossip, Some(GossipStatus::Direct)) {
+                    "connected"
+                } else if matches!(self.gossip, Some(GossipStatus::InTopic)) {
                     "in_topic"
                 } else {
                     "nearby"
@@ -97,6 +96,7 @@ impl PeerState {
             Some(BlePeerPhase::Draining) => "draining",
             Some(BlePeerPhase::Dead) => "dead",
             None => match self.gossip {
+                Some(GossipStatus::Direct) => "connected",
                 Some(GossipStatus::InTopic) => "in_topic",
                 Some(GossipStatus::Stale) => "stale",
                 _ => "unknown",
@@ -587,6 +587,41 @@ fn new_peer_entry(id: EndpointId) -> PeerState {
         ble_path: None,
         ble_failures: 0,
         last_seen: Instant::now(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_peer() -> PeerState {
+        let endpoint = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        new_peer_entry(endpoint)
+    }
+
+    #[test]
+    fn ui_status_prefers_non_connected_ble_phase_over_stale_direct_gossip() {
+        let mut peer = test_peer();
+        peer.gossip = Some(GossipStatus::Direct);
+        peer.ble_phase = Some(BlePeerPhase::Reconnecting);
+        assert_eq!(peer.ui_status(), "reconnecting");
+
+        peer.ble_phase = Some(BlePeerPhase::Draining);
+        assert_eq!(peer.ui_status(), "draining");
+
+        peer.ble_phase = Some(BlePeerPhase::Dead);
+        assert_eq!(peer.ui_status(), "dead");
+    }
+
+    #[test]
+    fn ui_status_allows_direct_gossip_to_fill_in_unknown_ble_phase() {
+        let mut peer = test_peer();
+        peer.gossip = Some(GossipStatus::Direct);
+        peer.ble_phase = Some(BlePeerPhase::Unknown);
+        assert_eq!(peer.ui_status(), "connected");
+
+        peer.ble_phase = None;
+        assert_eq!(peer.ui_status(), "connected");
     }
 }
 

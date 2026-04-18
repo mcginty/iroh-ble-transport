@@ -3,7 +3,7 @@
 //! All types in this module are pure data. No I/O, no tokio tasks. Any code
 //! here can be exercised from synchronous unit tests.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::task::Waker;
 use std::time::Instant;
 
@@ -57,6 +57,10 @@ pub struct PeerEntry {
     pub pipe: Option<PipeHandles>,
     pub rx_backlog: VecDeque<Bytes>,
     pub l2cap_channel: Option<L2capChannel>,
+    /// Peripheral-side subscribed notify characteristics for the current GATT
+    /// session. This lets the registry distinguish an idempotent second-char
+    /// subscribe from a full remote unsubscribe.
+    pub subscribed_chars: HashSet<uuid::Uuid>,
     /// Peer's 12-byte advertising prefix, learned from a scan. `None` when
     /// the entry was created by an inbound path (GATT write / L2CAP accept)
     /// before scan ever saw the advertisement — those peers don't get
@@ -82,6 +86,7 @@ impl PeerEntry {
             pipe: None,
             rx_backlog: VecDeque::new(),
             l2cap_channel: None,
+            subscribed_chars: HashSet::new(),
             prefix: None,
             verified_endpoint: None,
             verified_at: None,
@@ -263,6 +268,7 @@ pub enum PeerCommand {
     },
     DataPipeReady {
         device_id: DeviceId,
+        tx_gen: u64,
         outbound_tx: tokio::sync::mpsc::Sender<PendingSend>,
         inbound_tx: tokio::sync::mpsc::Sender<bytes::Bytes>,
         swap_tx: tokio::sync::mpsc::Sender<blew::L2capChannel>,
@@ -282,6 +288,10 @@ pub enum PeerCommand {
         client_id: DeviceId,
         char_uuid: uuid::Uuid,
         prefix: Option<KeyPrefix>,
+    },
+    PeripheralClientUnsubscribed {
+        client_id: DeviceId,
+        char_uuid: uuid::Uuid,
     },
     /// Emitted by the L2CAP pipe worker when its outbound write has been
     /// blocked on backpressure for longer than L2CAP_HANDOVER_TIMEOUT.
@@ -321,6 +331,7 @@ pub enum PeerAction {
     RestartL2capListener,
     StartDataPipe {
         device_id: DeviceId,
+        tx_gen: u64,
         role: ConnectRole,
         path: ConnectPath,
         l2cap_channel: Option<L2capChannel>,
@@ -341,6 +352,8 @@ pub enum PeerAction {
     /// worker, and stay Connected{Gatt} for the rest of this session.
     RevertToGattPipe {
         device_id: DeviceId,
+        tx_gen: u64,
+        role: ConnectRole,
     },
     /// Persist a snapshot of this peer to the configured `PeerStore`. Emitted
     /// when a peer leaves `Connected` for `Draining`: we've seen enough of
@@ -399,12 +412,14 @@ mod tests {
         let (swap_tx, _) = tokio::sync::mpsc::channel::<blew::L2capChannel>(1);
         let _cmd = PeerCommand::DataPipeReady {
             device_id: DeviceId::from("x"),
+            tx_gen: 1,
             outbound_tx,
             inbound_tx,
             swap_tx,
         };
         let _act = PeerAction::StartDataPipe {
             device_id: DeviceId::from("x"),
+            tx_gen: 1,
             role: ConnectRole::Central,
             path: ConnectPath::Gatt,
             l2cap_channel: None,
@@ -421,7 +436,11 @@ mod tests {
             char_uuid: uuid::Uuid::nil(),
             prefix: None,
         };
-        let _cmd3 = PeerCommand::L2capHandoverTimeout {
+        let _cmd3 = PeerCommand::PeripheralClientUnsubscribed {
+            client_id: DeviceId::from("x"),
+            char_uuid: uuid::Uuid::nil(),
+        };
+        let _cmd4 = PeerCommand::L2capHandoverTimeout {
             device_id: DeviceId::from("x"),
         };
         let _act1 = PeerAction::UpgradeToL2cap {
@@ -429,6 +448,8 @@ mod tests {
         };
         let _act2 = PeerAction::RevertToGattPipe {
             device_id: DeviceId::from("x"),
+            tx_gen: 1,
+            role: ConnectRole::Central,
         };
         assert_eq!(DisconnectReason::DedupLoser, DisconnectReason::DedupLoser);
     }
@@ -439,5 +460,6 @@ mod tests {
         assert!(e.verified_endpoint.is_none());
         assert!(e.verified_at.is_none());
         assert!(!e.l2cap_upgrade_failed);
+        assert!(e.subscribed_chars.is_empty());
     }
 }

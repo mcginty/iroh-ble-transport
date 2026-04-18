@@ -212,6 +212,7 @@ impl<I: BleInterface> Driver<I> {
 
             PeerAction::StartDataPipe {
                 device_id,
+                tx_gen,
                 role,
                 path,
                 l2cap_channel,
@@ -246,6 +247,7 @@ impl<I: BleInterface> Driver<I> {
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
+                    tx_gen,
                     outbound_tx,
                     inbound_tx,
                     swap_tx,
@@ -268,7 +270,11 @@ impl<I: BleInterface> Driver<I> {
                     }
                 });
             }
-            PeerAction::RevertToGattPipe { device_id } => {
+            PeerAction::RevertToGattPipe {
+                device_id,
+                tx_gen,
+                role,
+            } => {
                 tracing::debug!(device = %device_id, "RevertToGattPipe: spawning fresh GATT pipe");
                 let (outbound_tx, outbound_rx) =
                     mpsc::channel::<crate::transport::peer::PendingSend>(32);
@@ -284,7 +290,7 @@ impl<I: BleInterface> Driver<I> {
                     run_data_pipe(
                         iface,
                         device_id,
-                        crate::transport::peer::ConnectRole::Central,
+                        role,
                         crate::transport::peer::ConnectPath::Gatt,
                         None,
                         outbound_rx,
@@ -299,6 +305,7 @@ impl<I: BleInterface> Driver<I> {
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
+                    tx_gen,
                     outbound_tx,
                     inbound_tx,
                     swap_tx,
@@ -708,6 +715,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("start-pipe"),
+                tx_gen: 7,
                 role: ConnectRole::Central,
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
@@ -719,8 +727,11 @@ mod tests {
             .unwrap()
             .unwrap();
         match cmd {
-            PeerCommand::DataPipeReady { device_id, .. } => {
+            PeerCommand::DataPipeReady {
+                device_id, tx_gen, ..
+            } => {
                 assert_eq!(device_id, blew::DeviceId::from("start-pipe"));
+                assert_eq!(tx_gen, 7);
             }
             other => panic!("expected DataPipeReady, got {other:?}"),
         }
@@ -745,6 +756,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("start-pipe-peri"),
+                tx_gen: 9,
                 role: ConnectRole::Peripheral,
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
@@ -756,8 +768,11 @@ mod tests {
             .unwrap()
             .unwrap();
         match cmd {
-            PeerCommand::DataPipeReady { device_id, .. } => {
+            PeerCommand::DataPipeReady {
+                device_id, tx_gen, ..
+            } => {
                 assert_eq!(device_id, blew::DeviceId::from("start-pipe-peri"));
+                assert_eq!(tx_gen, 9);
             }
             other => panic!("expected DataPipeReady, got {other:?}"),
         }
@@ -849,6 +864,8 @@ mod tests {
         driver
             .execute(PeerAction::RevertToGattPipe {
                 device_id: blew::DeviceId::from("revert-dev"),
+                tx_gen: 11,
+                role: crate::transport::peer::ConnectRole::Central,
             })
             .await;
 
@@ -857,8 +874,11 @@ mod tests {
             .unwrap()
             .unwrap();
         match cmd {
-            PeerCommand::DataPipeReady { device_id, .. } => {
+            PeerCommand::DataPipeReady {
+                device_id, tx_gen, ..
+            } => {
                 assert_eq!(device_id, blew::DeviceId::from("revert-dev"));
+                assert_eq!(tx_gen, 11);
             }
             other => panic!("expected DataPipeReady after revert, got {other:?}"),
         }
