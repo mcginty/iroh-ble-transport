@@ -697,9 +697,13 @@ async function initNode() {
     renderMembers();
     updateStatusFromPeers();
 
-    const welcomeP = chatMessages.querySelector(".welcome p");
-    if (welcomeP) {
-      welcomeP.innerHTML = "Node is ready.<br>Tap ＋ to add a peer.";
+    const welcome = chatMessages.querySelector(".welcome");
+    if (welcome) {
+      welcome.innerHTML = `
+        <div class="welcome-icon" aria-hidden="true">⬡</div>
+        <p class="welcome-title">BlewChat</p>
+        <p>Node is ready.<br>Tap ＋ to add a peer.</p>
+      `;
     }
 
     msgInput.disabled = false;

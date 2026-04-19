@@ -369,6 +369,8 @@ async fn start_node(
     ));
     tauri::async_runtime::spawn(reconnect_tick(state_arc));
 
+    info!(node = %own_id.fmt_short(), "BLE transport ready; scanning for peers");
+
     Ok(result)
 }
 
