@@ -6,9 +6,10 @@
 //! See `docs/superpowers/specs/2026-04-14-dynamic-mtu-chunk-size-design.md`
 //! for the full rationale.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use blew::DeviceId;
+use tokio::time::Instant;
 
 use crate::transport::interface::BleInterface;
 
