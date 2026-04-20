@@ -1631,7 +1631,7 @@ async fn get_peers(state: State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<PeerSta
 async fn request_ble_permissions() -> bool {
     #[cfg(target_os = "android")]
     {
-        use tokio_stream::StreamExt as _;
+        use n0_future::StreamExt as _;
 
         if tauri_plugin_blew::are_ble_permissions_granted() {
             return true;
