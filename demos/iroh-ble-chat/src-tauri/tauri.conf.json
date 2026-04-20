@@ -36,7 +36,7 @@
       "autoIncrementVersionCode": true
     },
     "iOS": {
-      "bundleVersion": "80"
+      "bundleVersion": "87"
     }
   },
   "plugins": {
