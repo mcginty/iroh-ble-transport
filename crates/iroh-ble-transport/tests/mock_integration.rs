@@ -27,8 +27,12 @@ fn test_routing() -> Arc<TransportRouting> {
     Arc::new(TransportRouting::new())
 }
 
-fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-    (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+    (
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    )
 }
 
 fn waker_from_channel(tx: mpsc::Sender<()>) -> std::task::Waker {
@@ -64,13 +68,14 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
     let (tx, rx) = mpsc::channel::<PeerCommand>(256);
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
@@ -171,13 +176,14 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
     let (tx, rx) = mpsc::channel::<PeerCommand>(256);
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
@@ -240,13 +246,14 @@ async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
     let (tx, rx) = mpsc::channel::<PeerCommand>(256);
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
@@ -305,13 +312,14 @@ async fn version_mismatch_deads_peer_and_closes_channel() {
     let (tx, rx) = mpsc::channel::<PeerCommand>(64);
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(8);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
@@ -393,13 +401,14 @@ async fn version_match_lets_data_pipe_start() {
     let (tx, rx) = mpsc::channel::<PeerCommand>(64);
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(8);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
@@ -457,8 +466,8 @@ async fn mock_fabric_handles_bidirectional_traffic() {
     let central_snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let peripheral_snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
 
-    let (c_retransmits, c_truncations) = zero_counters();
-    let (p_retransmits, p_truncations) = zero_counters();
+    let (c_retransmits, c_truncations, c_empty_frames) = zero_counters();
+    let (p_retransmits, p_truncations, p_empty_frames) = zero_counters();
 
     let central_driver = Driver::new(
         fabric.central.clone(),
@@ -466,6 +475,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         central_incoming_tx,
         c_retransmits,
         c_truncations,
+        c_empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let peripheral_driver = Driver::new(
@@ -474,6 +484,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         peripheral_incoming_tx,
         p_retransmits,
         p_truncations,
+        p_empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
 
@@ -620,13 +631,14 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     let (tx, rx) = mpsc::channel::<PeerCommand>(256);
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
@@ -735,13 +747,14 @@ async fn connect_failure_retries_on_next_tick() {
     let (tx, rx) = mpsc::channel::<PeerCommand>(256);
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);

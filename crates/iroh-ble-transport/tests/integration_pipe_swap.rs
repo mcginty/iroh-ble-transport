@@ -52,6 +52,7 @@ async fn swap_to_l2cap_does_not_deadlock_and_routes_subsequent_sends() {
         swap_rx,
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
         LivenessClock::new(),
     ));
 
@@ -165,6 +166,7 @@ async fn supervisor_shuts_down_cleanly_on_outbound_close() {
         incoming_tx,
         registry_tx,
         swap_rx,
+        Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
         LivenessClock::new(),

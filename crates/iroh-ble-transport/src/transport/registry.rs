@@ -4892,6 +4892,7 @@ mod tests {
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(InMemoryPeerStore::new()),
         );
 

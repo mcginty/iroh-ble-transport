@@ -9,7 +9,7 @@
 
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
@@ -67,6 +67,7 @@ impl Drop for NotifyOnDrop {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn spawn_l2cap_io_tasks<R, W>(
     reader: R,
     writer: W,
@@ -74,6 +75,7 @@ pub(super) fn spawn_l2cap_io_tasks<R, W>(
     incoming_tx: mpsc::Sender<IncomingPacket>,
     last_rx_at: crate::transport::peer::LivenessClock,
     tearing_down: Arc<AtomicBool>,
+    empty_frames_counter: Arc<AtomicU64>,
 ) -> (
     mpsc::Sender<Vec<u8>>,
     JoinHandle<()>,
@@ -118,6 +120,20 @@ where
             match read_framed_datagram(&mut reader).await {
                 Ok(Some(data)) => {
                     last_rx_at.bump();
+                    // Guard iroh's `socket.rs:575` div-by-zero panic on
+                    // `stride == 0`. A `[0x00, 0x00]` frame on the wire
+                    // (either from a noq/iroh regression on the peer's
+                    // outbound side, or from a misbehaving peer) decodes
+                    // to an empty payload; forwarding it would panic the
+                    // iroh socket driver. Drop + count for diagnosis.
+                    if data.is_empty() {
+                        empty_frames_counter.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            device = %device_id,
+                            "l2cap recv task dropping zero-length frame (would trip iroh stride=0 panic)"
+                        );
+                        continue;
+                    }
                     if incoming_tx
                         .send(IncomingPacket {
                             device_id: device_id.clone(),
@@ -246,6 +262,7 @@ mod tests {
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
         );
 
         let (mut b_rd, mut b_wr) = split(peripheral_side);
@@ -283,6 +300,7 @@ mod tests {
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
         );
 
         let (_b_rd, mut b_wr) = split(peripheral_side);
@@ -315,6 +333,7 @@ mod tests {
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
         );
 
         drop(b);
@@ -322,6 +341,47 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), done.notified())
             .await
             .expect("done notify should fire when I/O task exits");
+    }
+
+    #[tokio::test]
+    async fn spawn_l2cap_io_tasks_drops_zero_length_frame_and_counts() {
+        use tokio::sync::mpsc;
+
+        let (central_side, peripheral_side) = L2capChannel::pair(8192);
+        let (a_rd, a_wr) = split(central_side);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        let empty_frames = Arc::new(AtomicU64::new(0));
+        let device_id = blew::DeviceId::from("empty-frame-recv");
+        let (_tx, _send_task, _recv_task, _done) = super::spawn_l2cap_io_tasks(
+            a_rd,
+            a_wr,
+            device_id.clone(),
+            incoming_tx,
+            crate::transport::peer::LivenessClock::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&empty_frames),
+        );
+
+        // Peer writes a zero-length framed datagram (`[0x00, 0x00]`), then a
+        // normal one. The recv task should drop the empty frame (bumping
+        // `empty_frames`) and deliver only the normal one.
+        let (_b_rd, mut b_wr) = split(peripheral_side);
+        b_wr.write_all(&0_u16.to_le_bytes()).await.unwrap();
+        super::write_framed_datagram(&mut b_wr, b"real")
+            .await
+            .unwrap();
+
+        let pkt = tokio::time::timeout(std::time::Duration::from_secs(1), incoming_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkt.device_id, device_id);
+        assert_eq!(pkt.data.as_ref(), b"real");
+        assert_eq!(
+            empty_frames.load(Ordering::Relaxed),
+            1,
+            "empty frame must be counted and dropped"
+        );
     }
 
     #[tokio::test]
@@ -336,6 +396,7 @@ mod tests {
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
         );
 
         send_task.abort();

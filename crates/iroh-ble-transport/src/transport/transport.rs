@@ -164,6 +164,13 @@ pub struct BleMetricsSnapshot {
     pub rx_bytes: u64,
     pub retransmits: u64,
     pub truncations: u64,
+    /// Count of zero-length datagrams dropped on the L2CAP path (either
+    /// before being framed on the wire, or after being received). A
+    /// non-zero value indicates either an upstream noq/iroh regression
+    /// handing us empty Transmits, or a misbehaving peer emitting
+    /// `[0x00, 0x00]` frames. Guards iroh's `socket.rs` div-by-zero panic
+    /// on `stride == 0`.
+    pub empty_frames: u64,
 }
 
 pub struct BleTransport {
@@ -174,6 +181,7 @@ pub struct BleTransport {
     rx_bytes: Arc<AtomicU64>,
     retransmits: Arc<AtomicU64>,
     truncations: Arc<AtomicU64>,
+    empty_frames: Arc<AtomicU64>,
     /// Wakers parked by `BleSender::poll_send` when `try_send` sees `Full`.
     /// The registry actor drains and wakes the whole list each time it pops
     /// a command — fair across N concurrent senders, unlike a single-slot
@@ -246,6 +254,7 @@ impl BleTransport {
         let rx_bytes = Arc::new(AtomicU64::new(0));
         let retransmits = Arc::new(AtomicU64::new(0));
         let truncations = Arc::new(AtomicU64::new(0));
+        let empty_frames = Arc::new(AtomicU64::new(0));
         let inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(Vec::new()));
 
         let iface = Arc::new(BlewDriver::new(
@@ -260,6 +269,7 @@ impl BleTransport {
             incoming_tx,
             Arc::clone(&retransmits),
             Arc::clone(&truncations),
+            Arc::clone(&empty_frames),
             Arc::clone(&config.store),
         );
 
@@ -339,6 +349,7 @@ impl BleTransport {
             rx_bytes,
             retransmits,
             truncations,
+            empty_frames,
             inbox_capacity_wakers,
             store: config.store,
         })
@@ -351,6 +362,7 @@ impl BleTransport {
             rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
             retransmits: self.retransmits.load(Ordering::Relaxed),
             truncations: self.truncations.load(Ordering::Relaxed),
+            empty_frames: self.empty_frames.load(Ordering::Relaxed),
         }
     }
 
@@ -464,6 +476,7 @@ impl CustomTransport for BleTransport {
             sender,
             routing: Arc::clone(&self.routing),
             rx_bytes: Arc::clone(&self.rx_bytes),
+            empty_frames: Arc::clone(&self.empty_frames),
         }))
     }
 }
@@ -474,6 +487,7 @@ struct BleEndpoint {
     sender: Arc<BleSender>,
     routing: Arc<TransportRouting>,
     rx_bytes: Arc<AtomicU64>,
+    empty_frames: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for BleEndpoint {
@@ -519,6 +533,18 @@ impl CustomEndpoint for BleEndpoint {
                     return Poll::Ready(Err(io::Error::other("BLE transport channel closed")));
                 }
                 Poll::Ready(Some(packet)) => {
+                    // Defensive backstop for iroh's `socket.rs:575` div-by-zero
+                    // on `stride == 0`. The pipe layer should already filter
+                    // empties, but keep this guard so a future regression in
+                    // the framing path cannot panic the socket driver.
+                    if packet.data.is_empty() {
+                        self.empty_frames.fetch_add(1, Ordering::Relaxed);
+                        tracing::warn!(
+                            device = %packet.device_id,
+                            "BleEndpoint::poll_recv dropping zero-length packet (would trip iroh stride=0 panic)"
+                        );
+                        continue;
+                    }
                     if bufs[filled].len() < packet.data.len() {
                         tracing::warn!(
                             len = packet.data.len(),

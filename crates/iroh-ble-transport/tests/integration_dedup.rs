@@ -25,8 +25,12 @@ use iroh_ble_transport::transport::{
 };
 use tokio::sync::mpsc;
 
-fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-    (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+    (
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    )
 }
 
 fn ble_device(id: &DeviceId) -> BleDevice {
@@ -76,7 +80,7 @@ fn spawn_node_with_endpoint(
 ) -> TestNode {
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(64);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
 
     let driver = Driver::new(
         Arc::clone(&iface),
@@ -84,6 +88,7 @@ fn spawn_node_with_endpoint(
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let registry = Registry::new_for_test_with_policy_and_endpoint(policy, endpoint);

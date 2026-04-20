@@ -84,6 +84,7 @@ pub async fn run_data_pipe(
     swap_rx: mpsc::Receiver<blew::L2capChannel>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
+    empty_frames_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
 ) {
     run_pipe_supervisor(
@@ -99,6 +100,7 @@ pub async fn run_data_pipe(
         swap_rx,
         retransmit_counter,
         truncation_counter,
+        empty_frames_counter,
         last_rx_at,
     )
     .await;
@@ -118,6 +120,7 @@ async fn run_pipe_supervisor(
     swap_rx: mpsc::Receiver<blew::L2capChannel>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
+    empty_frames_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
 ) {
     let mut swap_rx: Option<mpsc::Receiver<blew::L2capChannel>> = Some(swap_rx);
@@ -142,6 +145,7 @@ async fn run_pipe_supervisor(
                 channel,
                 incoming_tx.clone(),
                 registry_tx.clone(),
+                Arc::clone(&empty_frames_counter),
                 last_rx_at.clone(),
             )
         }
@@ -194,6 +198,7 @@ async fn run_pipe_supervisor(
                     channel,
                     incoming_tx.clone(),
                     registry_tx.clone(),
+                    Arc::clone(&empty_frames_counter),
                     last_rx_at.clone(),
                 );
                 let old = std::mem::replace(&mut active, new_active);
@@ -340,6 +345,7 @@ fn spawn_l2cap_worker(
     channel: blew::L2capChannel,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
+    empty_frames_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
 ) -> ActiveWorker {
     let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(32);
@@ -351,6 +357,7 @@ fn spawn_l2cap_worker(
         Arc::clone(&teardown_flag),
         incoming_tx,
         registry_tx,
+        empty_frames_counter,
         last_rx_at,
     ));
     ActiveWorker::L2cap {
@@ -561,6 +568,7 @@ async fn run_gatt_pipe(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_l2cap_pipe(
     device_id: blew::DeviceId,
     channel: blew::L2capChannel,
@@ -568,6 +576,7 @@ async fn run_l2cap_pipe(
     teardown_flag: Arc<AtomicBool>,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
+    empty_frames_counter: Arc<AtomicU64>,
     last_rx_at: LivenessClock,
 ) {
     let (reader, writer) = tokio::io::split(channel);
@@ -579,6 +588,7 @@ async fn run_l2cap_pipe(
         incoming_tx,
         last_rx_at,
         Arc::clone(&teardown_flag),
+        Arc::clone(&empty_frames_counter),
     );
 
     let mut io_died = false;
@@ -594,6 +604,21 @@ async fn run_l2cap_pipe(
                             len = datagram.len(),
                             "l2cap pipe got outbound"
                         );
+                        // Guard iroh's `socket.rs:575` div-by-zero panic on the
+                        // peer: if we forward a zero-length Transmit onto the
+                        // wire, the remote's poll_recv hands iroh `stride = 0`
+                        // and it panics. Ack the send so the waker unblocks
+                        // (iroh treats it as delivered), but skip the wire.
+                        if datagram.is_empty() {
+                            empty_frames_counter.fetch_add(1, Ordering::Relaxed);
+                            tracing::warn!(
+                                device = %device_id,
+                                tx_gen = send.tx_gen,
+                                "l2cap pipe dropping zero-length outbound datagram; not forwarding to peer"
+                            );
+                            send.waker.wake();
+                            continue;
+                        }
                         match l2cap_tx.send(datagram).await {
                             Ok(()) => {
                                 tracing::trace!(
@@ -679,6 +704,7 @@ mod tests {
             swap_rx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
             LivenessClock::new(),
         ));
 
@@ -724,6 +750,7 @@ mod tests {
             incoming_tx,
             registry_tx,
             swap_rx,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             LivenessClock::new(),
@@ -794,6 +821,71 @@ mod tests {
         assert!(
             got.is_err(),
             "quiesce must not emit any PeerCommand; got {got:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn l2cap_pipe_drops_zero_length_outbound_and_counts() {
+        let iface = Arc::new(MockBleInterface::new());
+        let (outbound_tx, outbound_rx) = mpsc::channel::<PendingSend>(4);
+        let (_inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(4);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let (registry_tx, _registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (_swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+
+        let (central_side, peripheral_side) = blew::L2capChannel::pair(8192);
+        let empty_frames = Arc::new(AtomicU64::new(0));
+
+        let _pipe = tokio::spawn(run_data_pipe(
+            iface as Arc<dyn BleInterface>,
+            blew::DeviceId::from("l2cap-empty-out"),
+            ConnectRole::Central,
+            ConnectPath::L2cap,
+            Some(central_side),
+            outbound_rx,
+            inbound_rx,
+            incoming_tx,
+            registry_tx,
+            swap_rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&empty_frames),
+            LivenessClock::new(),
+        ));
+
+        // Empty outbound must not be framed onto the wire; only the real one
+        // must reach the peer.
+        outbound_tx
+            .send(PendingSend {
+                tx_gen: 1,
+                datagram: Bytes::new(),
+                waker: noop_waker(),
+            })
+            .await
+            .unwrap();
+        outbound_tx
+            .send(PendingSend {
+                tx_gen: 2,
+                datagram: Bytes::from_static(b"post-empty"),
+                waker: noop_waker(),
+            })
+            .await
+            .unwrap();
+
+        let (mut peri_rd, _peri_wr) = tokio::io::split(peripheral_side);
+        let got = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::transport::l2cap::read_framed_datagram(&mut peri_rd),
+        )
+        .await
+        .expect("peer should see a framed datagram")
+        .expect("read_framed_datagram must succeed")
+        .expect("frame present");
+        assert_eq!(got, b"post-empty");
+        assert_eq!(
+            empty_frames.load(Ordering::Relaxed),
+            1,
+            "outbound empty must be counted exactly once"
         );
     }
 }

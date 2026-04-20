@@ -103,6 +103,7 @@ pub struct Driver<I: BleInterface> {
     incoming_tx: mpsc::Sender<IncomingPacket>,
     retransmit_counter: Arc<AtomicU64>,
     truncation_counter: Arc<AtomicU64>,
+    empty_frames_counter: Arc<AtomicU64>,
     store: Arc<dyn PeerStore>,
 }
 
@@ -113,6 +114,7 @@ impl<I: BleInterface> Driver<I> {
         incoming_tx: mpsc::Sender<IncomingPacket>,
         retransmit_counter: Arc<AtomicU64>,
         truncation_counter: Arc<AtomicU64>,
+        empty_frames_counter: Arc<AtomicU64>,
         store: Arc<dyn PeerStore>,
     ) -> Self {
         Self {
@@ -121,6 +123,7 @@ impl<I: BleInterface> Driver<I> {
             incoming_tx,
             retransmit_counter,
             truncation_counter,
+            empty_frames_counter,
             store,
         }
     }
@@ -263,6 +266,7 @@ impl<I: BleInterface> Driver<I> {
                 let inbox = self.inbox.clone();
                 let retransmit_counter = Arc::clone(&self.retransmit_counter);
                 let truncation_counter = Arc::clone(&self.truncation_counter);
+                let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
                 let pipe_last_rx_at = last_rx_at.clone();
                 tokio::spawn(async move {
@@ -279,6 +283,7 @@ impl<I: BleInterface> Driver<I> {
                         swap_rx,
                         retransmit_counter,
                         truncation_counter,
+                        empty_frames_counter,
                         pipe_last_rx_at,
                     )
                     .await;
@@ -325,6 +330,7 @@ impl<I: BleInterface> Driver<I> {
                 let inbox = self.inbox.clone();
                 let retransmit_counter = Arc::clone(&self.retransmit_counter);
                 let truncation_counter = Arc::clone(&self.truncation_counter);
+                let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
                 let pipe_last_rx_at = last_rx_at.clone();
                 tokio::spawn(async move {
@@ -341,6 +347,7 @@ impl<I: BleInterface> Driver<I> {
                         swap_rx,
                         retransmit_counter,
                         truncation_counter,
+                        empty_frames_counter,
                         pipe_last_rx_at,
                     )
                     .await;
@@ -754,6 +761,7 @@ mod tests {
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
         );
 
@@ -793,6 +801,7 @@ mod tests {
             iface,
             tx,
             incoming_tx,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
@@ -840,6 +849,7 @@ mod tests {
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
         );
 
@@ -872,6 +882,7 @@ mod tests {
             incoming_tx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
         );
 
@@ -901,6 +912,7 @@ mod tests {
             iface,
             tx,
             incoming_tx,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
@@ -938,6 +950,7 @@ mod tests {
             iface.clone(),
             tx,
             incoming_tx,
+            Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),

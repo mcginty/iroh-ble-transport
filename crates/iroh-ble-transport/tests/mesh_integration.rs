@@ -25,8 +25,12 @@ use iroh_ble_transport::transport::{
 };
 use tokio::sync::mpsc;
 
-fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>) {
-    (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)))
+fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
+    (
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    )
 }
 
 fn prefix_for(byte: u8) -> KeyPrefix {
@@ -65,7 +69,7 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
     let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(64);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let iface = fabric.add_node(device_id.clone(), inbox_tx.clone());
-    let (retransmits, truncations) = zero_counters();
+    let (retransmits, truncations, empty_frames) = zero_counters();
 
     let driver = Driver::new(
         iface,
@@ -73,6 +77,7 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
         incoming_tx,
         retransmits,
         truncations,
+        empty_frames,
         Arc::new(InMemoryPeerStore::new()),
     );
     let registry = Registry::new_for_test_with_policy(policy);
