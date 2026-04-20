@@ -50,11 +50,12 @@
   --event-warn-text:    rgba(253, 230, 138, 0.84);
   --event-err-text:     rgba(254, 202, 202, 0.9);
   --event-success-text: rgba(167, 243, 208, 0.9);
+  --warn-body-fg:       rgba(253, 230, 138, 0.92);
+  --warn-body-bg:       rgba(251, 191, 36, 0.08);
 
   /* ── Layout ── */
   --safe-top:     env(safe-area-inset-top, 0px);
   --safe-bottom:  env(safe-area-inset-bottom, 0px);
-  --kb-offset:    0px;
   --sidebar-width: 272px;
 
   /* ── Type ── */
@@ -124,6 +125,8 @@
     --event-warn-text:    rgba(168, 94, 13, 0.92);
     --event-err-text:     rgba(185, 28, 28, 0.94);
     --event-success-text: rgba(19, 122, 63, 0.92);
+    --warn-body-fg:       #141226;
+    --warn-body-bg:       rgba(168, 94, 13, 0.12);
   }
 
   /* Sender palette — deeper saturated hues that read on cream */
@@ -143,13 +146,9 @@
   .sidebar-reset:active  { background: rgba(153, 27, 27, 0.14); }
   .member-detail-remove:hover { color: #991b1b; border-color: rgba(153, 27, 27, 0.4); background: rgba(153, 27, 27, 0.06); }
 
-  /* Modal warn block flips from amber-on-dark to amber-ink-on-paper */
-  .modal-warn {
-    color: #7a4410;
-    background: rgba(168, 94, 13, 0.1);
-    border-left-color: var(--accent-warn);
-  }
-  .modal-warn strong { color: var(--accent-warn); }
+  /* --warn-body-fg/bg flip via :root override above; keep just the
+     semantic amber border for the flipped theme. */
+  .modal-warn { border-left-color: var(--accent-warn); }
 
   /* Danger button stays dark-red but gets lighter text */
   .danger-btn { background: #991b1b; border-color: #991b1b; color: #fff5f5; }
@@ -173,8 +172,13 @@
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 
 html, body {
+  /* position: fixed pins the document to the layout viewport so iOS can't
+     auto-scroll the page when a focused input would be behind the keyboard.
+     The keyboard-aware resize happens on .app via --app-height instead. */
+  position: fixed;
+  inset: 0;
+  width: 100%;
   height: 100%;
-  height: 100dvh;
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-body);
@@ -189,10 +193,9 @@ html, body {
 .app {
   display: flex;
   flex-direction: column;
-  height: 100dvh;
-  padding-top: var(--safe-top);
-  padding-bottom: calc(var(--safe-bottom) + var(--kb-offset));
-  transition: padding-bottom 0.18s var(--ease-in-out);
+  /* 100dvh baseline; the soft-keyboard listener in main.ts overrides
+     --app-height to visualViewport.height while the keyboard occludes. */
+  height: var(--app-height, 100dvh);
   background:
     radial-gradient(ellipse 80% 60% at 0% 0%, var(--app-gradient-a), transparent 55%),
     radial-gradient(ellipse 70% 50% at 100% 100%, var(--app-gradient-b), transparent 55%),
@@ -204,7 +207,7 @@ html, body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
+  padding: calc(10px + var(--safe-top)) 14px 10px;
   background: var(--surface);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
@@ -312,6 +315,11 @@ html, body {
   font-size: 17px;
   line-height: 1;
   display: inline-block;
+}
+.btn-glyph-svg {
+  fill: currentColor;
+  display: inline-block;
+  vertical-align: middle;
 }
 .btn-label {
   font-family: var(--font-mono);
@@ -831,7 +839,8 @@ textarea.invalid, input.invalid {
 .input-bar {
   background: var(--surface);
   border-top: 1px solid var(--border);
-  padding: 10px 12px;
+  /* The safe-bottom term lifts the controls above the home indicator. */
+  padding: 10px 12px calc(10px + var(--safe-bottom));
   flex-shrink: 0;
 }
 
@@ -992,25 +1001,42 @@ form {
     transition: transform 0.3s var(--ease-in-out);
     width: var(--sidebar-width);
     max-width: 85vw;
+    padding-top: var(--safe-top);
+    padding-bottom: var(--safe-bottom);
   }
   .members-sidebar.open { transform: translateX(0); }
   .sidebar-close { display: block; }
 
   /* Hide desktop-only button labels */
   .btn-label { display: none; }
-  .icon-btn { padding: 0; min-width: 34px; width: 34px; }
+  .icon-btn { padding: 0; min-width: 32px; width: 32px; height: 32px; }
 
-  /* Compress bandwidth indicator on mobile: single row showing ↑↓ only */
+  .app-header { padding: calc(8px + var(--safe-top)) 10px 8px; gap: 8px; }
+  .header-left { gap: 8px; flex: 1 1 auto; min-width: 0; }
+  .header-actions { gap: 4px; }
+  .logo { font-size: 20px; }
+  .id-bar { padding: 6px 10px; gap: 6px; }
+
+  /* Compress bandwidth indicator on mobile: stacked arrows, no units */
   .bandwidth-indicator {
-    flex-direction: row;
-    gap: 8px;
-    padding: 0 4px;
-    font-size: 10.5px;
+    flex-direction: column;
+    gap: 0;
+    padding: 0;
+    font-size: 10px;
+    line-height: 1.25;
+    margin-left: 4px;
   }
   .bw-row { display: inline-flex; align-items: center; }
   .bw-row:nth-child(3),
   .bw-row:nth-child(4) { display: none; }
-  .bw-unit:not(:last-child) { display: none; }
+  .bandwidth-indicator .bw-unit { display: none; }
+}
+
+/* ── Responsive: very narrow (iPhone SE-class) ── */
+@media (max-width: 374px) {
+  .bandwidth-indicator { display: none; }
+  .app-header { padding: calc(8px + var(--safe-top)) 8px 8px; }
+  .id-bar { padding: 6px 8px; font-size: 10px; }
 }
 
 /* ── Responsive: desktop ── */
@@ -1204,8 +1230,8 @@ form {
 }
 .modal-warn {
   font-size: 12px;
-  color: rgba(253,230,138,0.92);
-  background: rgba(251,191,36,0.08);
+  color: var(--warn-body-fg);
+  background: var(--warn-body-bg);
   border-left: 2px solid var(--accent-warn);
   padding: 8px 10px;
   margin-bottom: 14px;
@@ -1218,19 +1244,19 @@ form {
 .qr-container {
   display: flex;
   justify-content: center;
-  padding: 16px;
+  padding: 12px;
   background: #e6ecf2;
   border-radius: 4px;
-  margin-bottom: 12px;
 }
 
 .qr-container svg {
   width: 100%;
-  max-width: 240px;
+  max-width: 220px;
   height: auto;
 }
 
 .qr-id-label { text-align: center; }
+.modal-card .connect-inner .field-hint { text-align: center; }
 
 .qr-id-text {
   font-family: var(--font-mono);

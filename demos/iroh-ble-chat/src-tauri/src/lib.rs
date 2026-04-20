@@ -27,6 +27,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 mod image;
 #[path = "../../../support/key_utils.rs"]
 mod key_utils;
+#[cfg(target_os = "ios")]
+mod webview_helper;
 
 fn chat_topic_id() -> TopicId {
     let hash = blake3::hash(b"iroh-ble-chat-v1");
@@ -1740,6 +1742,14 @@ pub fn run() {
                 pending_images: Default::default(),
             }));
             app.manage(state);
+
+            // Apply iOS-only WKWebView tweaks (disable safe-area content-
+            // inset adjustment + disable outer UIScrollView). See
+            // webview_helper.rs for the rationale.
+            #[cfg(target_os = "ios")]
+            if let Some(main_window) = app.get_webview_window("main") {
+                webview_helper::configure_ios_webview(&main_window);
+            }
 
             let handle = app.handle().clone();
             let debug_layer = DebugLogLayer {

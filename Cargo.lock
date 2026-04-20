@@ -3005,6 +3005,7 @@ dependencies = [
  "iroh-ble-transport",
  "iroh-gossip",
  "n0-future",
+ "objc2",
  "postcard",
  "rand 0.9.4",
  "ravif",

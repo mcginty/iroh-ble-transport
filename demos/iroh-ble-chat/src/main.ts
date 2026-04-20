@@ -158,8 +158,7 @@ function senderColourClass(id: string): string {
 
 const myIdDisplay = document.getElementById("my-id-display")!;
 const nicknameDisplay = document.getElementById("nickname-display")!;
-const peerIdInput = document.getElementById("peer-id-input") as HTMLTextAreaElement;
-const connectBtn = document.getElementById("connect-btn") as HTMLButtonElement;
+const pastePeerBtn = document.getElementById("paste-peer-btn") as HTMLButtonElement;
 const msgInput = document.getElementById("msg-input") as HTMLInputElement;
 const sendBtn = document.getElementById("send-btn") as HTMLButtonElement;
 const msgForm = document.getElementById("msg-form") as HTMLFormElement;
@@ -184,9 +183,6 @@ const nicknameSaveBtn = document.getElementById("nickname-save-btn") as HTMLButt
 const debugCheckbox = document.getElementById("debug-checkbox") as HTMLInputElement;
 const attachBtn = document.getElementById("attach-btn") as HTMLButtonElement;
 const scanQrBtn = document.getElementById("scan-qr-btn") as HTMLButtonElement;
-const showQrBtn = document.getElementById("show-qr-btn") as HTMLButtonElement;
-const qrModal = document.getElementById("qr-modal")!;
-const qrModalClose = document.getElementById("qr-modal-close") as HTMLButtonElement;
 const qrContainer = document.getElementById("qr-container")!;
 const qrIdText = document.getElementById("qr-id-text")!;
 const confirmModal = document.getElementById("confirm-modal")!;
@@ -801,19 +797,27 @@ document.addEventListener("DOMContentLoaded", async () => {
 // Keyboard / visual viewport tracking
 // ---------------------------------------------------------------------------
 
-// Some mobile WebViews don't shrink `100dvh` when the soft keyboard opens.
-// Track the difference between layout viewport and visual viewport and expose
-// it as --kb-offset so the app container is pushed above the keyboard.
+// Drive the app container's height off the visual viewport *only while the
+// soft keyboard is occluding the view*. Combined with `position: fixed` on
+// <html>/<body>, this keeps the header visible and lets the messages area
+// shrink to whatever space remains above the keyboard. Below the threshold
+// we leave --app-height unset and fall back to CSS 100dvh.
+const KEYBOARD_MIN_OCCLUSION_PX = 120;
+
 (() => {
   const vv = window.visualViewport;
+  const root = document.documentElement;
   if (!vv) return;
 
-  const root = document.documentElement;
   const update = () => {
-    const offset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
-    root.style.setProperty("--kb-offset", `${offset}px`);
-    if (document.activeElement === msgInput && offset > 0) {
-      chatMessages.scrollTop = chatMessages.scrollHeight;
+    const occluded = window.innerHeight - vv.height - vv.offsetTop;
+    if (occluded > KEYBOARD_MIN_OCCLUSION_PX) {
+      root.style.setProperty("--app-height", `${vv.height}px`);
+      if (document.activeElement === msgInput) {
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      }
+    } else {
+      root.style.removeProperty("--app-height");
     }
   };
 
@@ -884,41 +888,30 @@ scanQrBtn.addEventListener("click", async () => {
 });
 
 // ---------------------------------------------------------------------------
-// QR Code modal
+// QR code rendering (shown inline in the Add Peer panel)
 // ---------------------------------------------------------------------------
 
-showQrBtn.addEventListener("click", async () => {
-  if (!myId) return;
+let qrRendered = false;
+
+async function renderMyQrCode() {
+  if (qrRendered || !myId) return;
 
   const deepLink = `iroh-ble-chat:///add-peer/${myId}`;
-
-  // Generate QR as SVG string
   try {
     const svgString = await QRCode.toString(deepLink, {
       type: "svg",
       margin: 1,
-      width: 240,
+      width: 220,
       color: { dark: "#000000", light: "#ffffff" },
     });
     qrContainer.innerHTML = svgString;
+    qrIdText.textContent = myId;
+    qrRendered = true;
   } catch (e) {
     console.error("QR generation failed", e);
     qrContainer.innerHTML = "<p>Failed to generate QR code</p>";
   }
-
-  qrIdText.textContent = myId;
-  qrModal.style.display = "";
-});
-
-qrModalClose.addEventListener("click", () => {
-  qrModal.style.display = "none";
-});
-
-qrModal.addEventListener("click", (e) => {
-  if (e.target === qrModal) {
-    qrModal.style.display = "none";
-  }
-});
+}
 
 // ---------------------------------------------------------------------------
 // Deep link confirmation dialog
@@ -1014,7 +1007,11 @@ function openConnectPanel() {
   connectPanel.style.display = "flex";
   connectToggleBtn.classList.add("active");
   nicknamePanel.classList.add("collapsed");
-  setTimeout(() => peerIdInput.focus(), 50);
+  if (peerIdHint) {
+    peerIdHint.textContent = DEFAULT_HINT;
+    peerIdHint.classList.remove("error");
+  }
+  renderMyQrCode();
 }
 
 function closeConnectPanel() {
@@ -1060,6 +1057,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 const peerIdHint = document.getElementById("peer-id-hint") as HTMLSpanElement | null;
+const DEFAULT_HINT = "Have them scan, or share your ID.";
 
 // iroh endpoint IDs serialize to base32 (lowercase a-z, 2-7). Length is typically 52 chars
 // for a 32-byte ed25519 key, but we accept a generous range to stay compatible with
@@ -1068,60 +1066,60 @@ const PEER_ID_SHAPE = /^[a-z2-7]{48,64}$/;
 
 function validatePeerIdShape(raw: string): { ok: boolean; message: string } {
   const s = raw.trim().toLowerCase();
-  if (!s) return { ok: false, message: "Paste a peer ID to add" };
-  if (s.length < 48) return { ok: false, message: `Too short (${s.length} chars) — expecting ~52` };
-  if (s.length > 64) return { ok: false, message: `Too long (${s.length} chars) — expecting ~52` };
+  if (!s) return { ok: false, message: "Clipboard is empty" };
+  if (s.length < 48) return { ok: false, message: `Clipboard value too short (${s.length} chars)` };
+  if (s.length > 64) return { ok: false, message: `Clipboard value too long (${s.length} chars)` };
   if (!PEER_ID_SHAPE.test(s)) {
-    return { ok: false, message: "Contains unexpected characters — base32 only (a–z, 2–7)" };
+    return { ok: false, message: "Clipboard isn't a base32 peer ID" };
   }
-  return { ok: true, message: "Expecting a base32 endpoint ID (52 chars)" };
+  return { ok: true, message: "" };
 }
 
 function setPeerIdHint(message: string, isError: boolean) {
   if (!peerIdHint) return;
   peerIdHint.textContent = message;
   peerIdHint.classList.toggle("error", isError);
-  peerIdInput.classList.toggle("invalid", isError);
 }
 
-peerIdInput.addEventListener("input", () => {
-  const v = peerIdInput.value.trim();
-  if (!v) {
-    setPeerIdHint("Expecting a base32 endpoint ID (52 chars)", false);
+function extractPeerId(raw: string): string {
+  const trimmed = raw.trim();
+  const viaDeepLink = parseDeepLink(trimmed);
+  return (viaDeepLink ?? trimmed).toLowerCase();
+}
+
+pastePeerBtn.addEventListener("click", async () => {
+  let clipboardText: string;
+  try {
+    clipboardText = await navigator.clipboard.readText();
+  } catch (e) {
+    console.error("Clipboard read failed", e);
+    setPeerIdHint("Couldn't read clipboard — check permissions", true);
     return;
   }
-  const { ok, message } = validatePeerIdShape(v);
-  setPeerIdHint(message, !ok);
-});
 
-connectBtn.addEventListener("click", async () => {
-  const peerId = peerIdInput.value.trim();
-  if (!peerId) return;
-
+  const peerId = extractPeerId(clipboardText);
   const { ok, message } = validatePeerIdShape(peerId);
   if (!ok) {
     setPeerIdHint(message, true);
-    peerIdInput.focus();
     return;
   }
 
-  connectBtn.textContent = "Adding…";
-  connectBtn.disabled = true;
+  pastePeerBtn.textContent = "Adding…";
+  pastePeerBtn.disabled = true;
 
   try {
     await invoke("add_peer", { idStr: peerId });
-    connectBtn.textContent = "Added ✓";
-    peerIdInput.value = "";
-    setPeerIdHint("Expecting a base32 endpoint ID (52 chars)", false);
+    pastePeerBtn.textContent = "Added ✓";
+    setPeerIdHint(DEFAULT_HINT, false);
     setTimeout(() => {
       closeConnectPanel();
-      connectBtn.textContent = "Add Peer";
-      connectBtn.disabled = false;
+      pastePeerBtn.textContent = "Add Peer From Clipboard";
+      pastePeerBtn.disabled = false;
     }, 1000);
   } catch (e: any) {
     console.error(e);
-    connectBtn.textContent = "Retry";
-    connectBtn.disabled = false;
+    pastePeerBtn.textContent = "Retry";
+    pastePeerBtn.disabled = false;
     setPeerIdHint(`Add failed: ${String(e).slice(0, 80)}`, true);
     appendEvent("error", `Failed to add peer: ${e}`);
   }
