@@ -32,10 +32,10 @@ pub type Token = u64;
 pub struct TransportRouting {
     inner: Mutex<RoutingInner>,
     next_token: AtomicU64,
-    /// Wakers parked by `BleSender::poll_send` while it waits for a
-    /// prefix-keyed token to map to a `DeviceId`. Drained and woken whenever a
-    /// new `KeyPrefix → DeviceId` mapping is recorded.
-    send_wakers: Mutex<Vec<Waker>>,
+    /// Wakers parked by `BleAddressLookup::resolve` while it waits for a
+    /// prefix to appear in `discovered`. Drained and woken whenever a new
+    /// `KeyPrefix → DeviceId` mapping is recorded.
+    discovery_wakers: Mutex<Vec<Waker>>,
 }
 
 #[derive(Debug, Default)]
@@ -173,9 +173,21 @@ impl TransportRouting {
             }
         };
         if !matches!(update, DiscoveryUpdate::Unchanged) {
-            self.wake_send_waiters();
+            self.wake_discovery_waiters();
         }
         update
+    }
+
+    /// Return the `DeviceId` currently mapped to `prefix`, if any. Used by
+    /// `BleAddressLookup::resolve` to decide whether to yield an address
+    /// item or wait for discovery.
+    pub fn device_for_prefix(&self, prefix: &KeyPrefix) -> Option<DeviceId> {
+        self.inner
+            .lock()
+            .expect("routing mutex poisoned")
+            .discovered
+            .get(prefix)
+            .cloned()
     }
 
     /// Replace the set of actively-pinned prefix→DeviceId bindings in one
@@ -187,19 +199,26 @@ impl TransportRouting {
         inner.pinned = active;
     }
 
-    /// Park a `BleSender::poll_send` waker. Used together with a re-check of
-    /// `device_for_token` in the standard register-then-check pattern so a
-    /// discovery update racing the registration is not missed.
-    pub fn register_send_waker(&self, waker: &Waker) {
-        let mut wakers = self.send_wakers.lock().expect("send waker mutex poisoned");
+    /// Park a `BleAddressLookup::resolve` stream waker. Used together with a
+    /// re-check of `device_for_prefix` in the standard register-then-check
+    /// pattern so a discovery update racing the registration is not missed.
+    pub fn register_discovery_waker(&self, waker: &Waker) {
+        let mut wakers = self
+            .discovery_wakers
+            .lock()
+            .expect("discovery waker mutex poisoned");
         if !wakers.iter().any(|w| w.will_wake(waker)) {
             wakers.push(waker.clone());
         }
     }
 
-    fn wake_send_waiters(&self) {
-        let wakers: Vec<Waker> =
-            std::mem::take(&mut *self.send_wakers.lock().expect("send waker mutex poisoned"));
+    fn wake_discovery_waiters(&self) {
+        let wakers: Vec<Waker> = std::mem::take(
+            &mut *self
+                .discovery_wakers
+                .lock()
+                .expect("discovery waker mutex poisoned"),
+        );
         for w in wakers {
             w.wake();
         }
@@ -476,10 +495,10 @@ mod tests {
     }
 
     #[test]
-    fn note_discovery_wakes_send_waiters_on_new_prefix() {
+    fn note_discovery_wakes_discovery_waiters_on_new_prefix() {
         let r = TransportRouting::new();
         let (counter, waker) = counting_waker();
-        r.register_send_waker(&waker);
+        r.register_discovery_waker(&waker);
         assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 0);
 
         let prefix: KeyPrefix = [11u8; KEY_PREFIX_LEN];
@@ -492,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn note_discovery_does_not_wake_on_unchanged_repeat() {
+    fn note_discovery_does_not_wake_discovery_on_unchanged_repeat() {
         let r = TransportRouting::new();
         let prefix: KeyPrefix = [12u8; KEY_PREFIX_LEN];
         let device = blew::DeviceId::from("steady");
@@ -502,23 +521,23 @@ mod tests {
         );
 
         let (counter, waker) = counting_waker();
-        r.register_send_waker(&waker);
+        r.register_discovery_waker(&waker);
 
         assert_eq!(r.note_discovery(prefix, device), DiscoveryUpdate::Unchanged);
         assert_eq!(
             counter.0.load(AtomicOrdering::SeqCst),
             0,
-            "Unchanged repeat must not wake send waiters"
+            "Unchanged repeat must not wake discovery waiters"
         );
     }
 
     #[test]
-    fn note_discovery_wakes_multiple_send_waiters() {
+    fn note_discovery_wakes_multiple_discovery_waiters() {
         let r = TransportRouting::new();
         let mut counters = Vec::new();
         for _ in 0..4 {
             let (counter, waker) = counting_waker();
-            r.register_send_waker(&waker);
+            r.register_discovery_waker(&waker);
             counters.push(counter);
         }
 
@@ -537,7 +556,7 @@ mod tests {
         r.note_discovery(prefix, blew::DeviceId::from("old"));
 
         let (counter, waker) = counting_waker();
-        r.register_send_waker(&waker);
+        r.register_discovery_waker(&waker);
 
         let update = r.note_discovery(prefix, blew::DeviceId::from("new"));
         assert!(matches!(update, DiscoveryUpdate::Replaced { .. }));
@@ -545,12 +564,12 @@ mod tests {
     }
 
     #[test]
-    fn register_send_waker_dedupes_identical_waker() {
+    fn register_discovery_waker_dedupes_identical_waker() {
         let r = TransportRouting::new();
         let (counter, waker) = counting_waker();
-        r.register_send_waker(&waker);
-        r.register_send_waker(&waker);
-        r.register_send_waker(&waker);
+        r.register_discovery_waker(&waker);
+        r.register_discovery_waker(&waker);
+        r.register_discovery_waker(&waker);
 
         r.note_discovery([15u8; KEY_PREFIX_LEN], blew::DeviceId::from("dedupe"));
         assert_eq!(
@@ -561,10 +580,10 @@ mod tests {
     }
 
     #[test]
-    fn send_wakers_are_drained_after_firing() {
+    fn discovery_wakers_are_drained_after_firing() {
         let r = TransportRouting::new();
         let (counter, waker) = counting_waker();
-        r.register_send_waker(&waker);
+        r.register_discovery_waker(&waker);
         r.note_discovery([16u8; KEY_PREFIX_LEN], blew::DeviceId::from("first"));
         assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 1);
 
