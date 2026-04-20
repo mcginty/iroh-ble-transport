@@ -921,6 +921,26 @@ form {
 }
 .secondary-btn:active { background: rgba(255,255,255,0.1); }
 
+.danger-btn {
+  background: #b91c1c;
+}
+.danger-btn:active { background: #7f1d1d; }
+
+.sidebar-reset {
+  margin-top: 8px;
+  background: none;
+  border: 1px solid rgba(252, 165, 165, 0.25);
+  color: #fca5a5;
+  font-family: inherit;
+  font-size: 12px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.sidebar-reset:hover { background: rgba(252, 165, 165, 0.08); border-color: rgba(252, 165, 165, 0.45); }
+.sidebar-reset:active { background: rgba(252, 165, 165, 0.15); }
+
 /* ── Responsive: desktop ── */
 @media (min-width: 768px) {
   .members-toggle { display: none; }

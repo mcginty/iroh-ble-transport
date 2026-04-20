@@ -133,6 +133,9 @@
                             <input type="checkbox" id="debug-checkbox" />
                             <span class="debug-label">Debug events</span>
                         </label>
+                        <button id="reset-app-btn" class="sidebar-reset" title="Reset app — delete key, peers, and nickname">
+                            Reset app
+                        </button>
                     </div>
                 </aside>
             </div>
@@ -183,6 +186,22 @@
                     <div id="qr-container" class="qr-container"></div>
                     <div class="qr-id-label">
                         <code id="qr-id-text" class="qr-id-text"></code>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Reset confirmation dialog -->
+            <div id="reset-modal" class="modal-overlay" style="display:none">
+                <div class="modal-card">
+                    <div class="modal-header">
+                        <span class="modal-title">Reset app?</span>
+                    </div>
+                    <p class="confirm-text">
+                        This will delete your <strong>identity key</strong>, <strong>known peers</strong>, and <strong>nickname</strong>, then restart the app as if freshly installed. Messages already received will also be cleared. This cannot be undone.
+                    </p>
+                    <div class="confirm-actions">
+                        <button id="reset-cancel-btn" class="secondary-btn">Cancel</button>
+                        <button id="reset-confirm-btn" class="primary-btn danger-btn">Reset</button>
                     </div>
                 </div>
             </div>

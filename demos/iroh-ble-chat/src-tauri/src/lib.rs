@@ -1631,6 +1631,34 @@ async fn set_debug(enabled: bool, state: State<'_, Arc<Mutex<AppState>>>) -> Res
     st.debug_enabled.store(enabled, Ordering::Relaxed);
     Ok(())
 }
+
+/// Wipe persistent state (secret key, known peers, nickname) and relaunch the
+/// app so the next start generates a fresh identity — the demo equivalent of
+/// "reinstall". Returns immediately so the UI can show a "reopen the app"
+/// message; the restart fires after a short delay. On iOS the restart is
+/// effectively an exit (Apple forbids self-relaunch), so the user sees the
+/// message and reopens manually.
+#[tauri::command]
+async fn reset_app(app: AppHandle, state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+    let cache_dir = {
+        let st = state.lock().await;
+        st.cache_dir.clone()
+    };
+    for file in ["private.key", "peers.txt", "nickname.txt"] {
+        let path = cache_dir.join(file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => info!(path = %path.display(), "reset: removed"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(path = %path.display(), "reset: remove failed: {e}"),
+        }
+    }
+    info!("reset_app: state cleared, restarting shortly");
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        app.restart();
+    });
+    Ok(())
+}
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let debug_enabled = Arc::new(AtomicBool::new(false));
@@ -1710,6 +1738,7 @@ pub fn run() {
             set_nickname,
             get_peers,
             set_debug,
+            reset_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

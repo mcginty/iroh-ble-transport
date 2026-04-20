@@ -189,6 +189,10 @@ const confirmModal = document.getElementById("confirm-modal")!;
 const confirmPeerId = document.getElementById("confirm-peer-id")!;
 const confirmAddBtn = document.getElementById("confirm-add-btn") as HTMLButtonElement;
 const confirmCancelBtn = document.getElementById("confirm-cancel-btn") as HTMLButtonElement;
+const resetAppBtn = document.getElementById("reset-app-btn") as HTMLButtonElement;
+const resetModal = document.getElementById("reset-modal")!;
+const resetConfirmBtn = document.getElementById("reset-confirm-btn") as HTMLButtonElement;
+const resetCancelBtn = document.getElementById("reset-cancel-btn") as HTMLButtonElement;
 
 // ---------------------------------------------------------------------------
 // Status
@@ -985,6 +989,7 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     closeConnectPanel();
     closeNicknamePanel();
+    if (resetModal.style.display !== "none") hideResetDialog();
   }
 });
 
@@ -1136,6 +1141,63 @@ listen("topic-joined", (_event: any) => {
 // ---------------------------------------------------------------------------
 // Debug toggle
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Reset app
+// ---------------------------------------------------------------------------
+
+function showResetDialog() {
+  resetModal.style.display = "";
+}
+
+function hideResetDialog() {
+  resetModal.style.display = "none";
+}
+
+resetAppBtn.addEventListener("click", () => {
+  closeDrawer();
+  showResetDialog();
+});
+
+resetCancelBtn.addEventListener("click", hideResetDialog);
+
+resetModal.addEventListener("click", (e) => {
+  if (e.target === resetModal) hideResetDialog();
+});
+
+function showResetComplete() {
+  hideResetDialog();
+  // Take over the chat view so the message is visible on iOS, where
+  // app.restart() just exits the process and the user must reopen manually.
+  chatMessages.innerHTML = `
+    <div class="welcome">
+      <div class="welcome-icon" aria-hidden="true">✓</div>
+      <p class="welcome-title">App reset</p>
+      <p>Identity, peers, and nickname cleared.<br>Reopen BlewChat to finish the reset.</p>
+    </div>
+  `;
+  // Disable inputs so the user can't try to chat during the brief window
+  // before the process exits.
+  msgInput.disabled = true;
+  sendBtn.disabled = true;
+  attachBtn.disabled = true;
+  setStatus("Resetting…", "starting");
+}
+
+resetConfirmBtn.addEventListener("click", async () => {
+  resetConfirmBtn.disabled = true;
+  resetConfirmBtn.textContent = "Resetting…";
+  try {
+    await invoke("reset_app");
+    showResetComplete();
+  } catch (e: any) {
+    console.error("reset_app failed", e);
+    appendEvent("error", `Reset failed: ${e}`);
+    resetConfirmBtn.disabled = false;
+    resetConfirmBtn.textContent = "Reset";
+    hideResetDialog();
+  }
+});
 
 debugCheckbox.addEventListener("change", async () => {
   try {
