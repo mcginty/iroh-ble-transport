@@ -101,6 +101,7 @@ targets:
       - sdk: UIKit.framework
       - sdk: WebKit.framework
       - sdk: CoreBluetooth.framework
+      - sdk: SystemConfiguration.framework
     preBuildScripts:
       - script: |
           if [ -f "$SRCROOT/.xcode.env" ]; then
