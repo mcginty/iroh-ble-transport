@@ -14,7 +14,7 @@ categories = ["network-programming"]
 testing = []
 
 [dependencies]
-blew = "0.2.0-alpha.4"
+blew = "0.2.3"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 tracing = "0.1"
@@ -38,4 +38,4 @@ tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 rand = "0.9"
-blew = { version = "0.2.0-alpha.4", features = ["testing"] }
+blew = { version = "0.2.3", features = ["testing"] }
