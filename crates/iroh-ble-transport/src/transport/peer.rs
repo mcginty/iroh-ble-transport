@@ -260,9 +260,6 @@ pub enum PeerCommand {
     AdapterStateChanged {
         powered: bool,
     },
-    RestoreFromAdapter {
-        devices: Vec<BleDevice>,
-    },
     SendDatagram {
         device_id: DeviceId,
         tx_gen: u64,

@@ -24,7 +24,9 @@ use uuid::{Uuid, uuid};
 
 use crate::error::{BleError, BleResult};
 use crate::transport::driver::{BlewDriver, Driver, IncomingPacket};
-use crate::transport::events::{run_central_events, run_l2cap_accept, run_peripheral_events};
+use crate::transport::events::{
+    run_central_events, run_l2cap_accept, run_peripheral_requests, run_peripheral_state_events,
+};
 use crate::transport::hook::VerifiedEndpointEvent;
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
@@ -314,9 +316,13 @@ impl BleTransport {
             Arc::clone(&routing),
             inbox_tx.clone(),
         ));
-        tokio::spawn(run_peripheral_events(
+        tokio::spawn(run_peripheral_state_events(
             Arc::clone(&peripheral),
             Arc::clone(&routing),
+            inbox_tx.clone(),
+        ));
+        tokio::spawn(run_peripheral_requests(
+            Arc::clone(&peripheral),
             inbox_tx.clone(),
             psm,
         ));

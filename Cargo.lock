@@ -500,9 +500,9 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.1.0"
+version = "0.2.0-alpha.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3803034f36efa4e0ab43136f0a8824bd123beff94065bf405263634df44e062"
+checksum = "0a746159ca2f31aa6bdbaca40f278cd2d3d0bb430b131f216c27b8688272decd"
 dependencies = [
  "bitflags 2.11.1",
  "bluer",
@@ -6487,9 +6487,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.1.0"
+version = "0.2.0-alpha.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1c2e51e13dcd112933894f8d73a967a677c8cd817157a25165e444af237ac2d"
+checksum = "735bcd6c2e53dbffd27334f250231cf6af439774444fec61f40549b75fb035ac"
 dependencies = [
  "blew",
  "jni 0.22.4",

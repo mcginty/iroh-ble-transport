@@ -725,14 +725,22 @@ async function initNode() {
     const welcome = chatMessages.querySelector(".welcome");
     if (welcome) welcome.remove();
 
+    const displayMsg =
+      errMsg === "ble_permissions_required"
+        ? "Bluetooth permissions are required to discover peers. Tap retry to show the permission prompt again."
+        : errMsg;
+
     const errDiv = document.createElement("div");
     errDiv.className = "welcome";
-    errDiv.innerHTML = `<div class="welcome-icon">⚠️</div><p>${escapeHtml(errMsg)}<br><br><a href="#" id="retry-start">Tap to retry</a></p>`;
+    errDiv.innerHTML = `<div class="welcome-icon">⚠️</div><p>${escapeHtml(displayMsg)}<br><br><a href="#" id="retry-start">Tap to retry</a></p>`;
     chatMessages.prepend(errDiv);
 
-    document.getElementById("retry-start")?.addEventListener("click", (ev) => {
+    document.getElementById("retry-start")?.addEventListener("click", async (ev) => {
       ev.preventDefault();
       errDiv.remove();
+      if (errMsg === "ble_permissions_required") {
+        await ensureBlePermissions();
+      }
       initNode();
     });
   }
@@ -769,10 +777,35 @@ function showWelcome(): Promise<void> {
   });
 }
 
+/// Poll `are_ble_permissions_granted` until true or the deadline passes.
+/// If permissions aren't granted by the deadline, returns false so the caller
+/// can let `start_node` fail and surface the normal retry UI.
+async function waitForBlePermissions(timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await invoke<boolean>("are_ble_permissions_granted")) {
+      return true;
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return invoke<boolean>("are_ble_permissions_granted");
+}
+
+/// Android-only in practice: on other platforms `are_ble_permissions_granted`
+/// always returns true. Triggers the OS dialog and blocks until the user
+/// responds (or times out). The welcome modal shown ahead of this acts as the
+/// in-app explanation.
+async function ensureBlePermissions(): Promise<void> {
+  if (await invoke<boolean>("are_ble_permissions_granted")) return;
+  await invoke("request_ble_permissions");
+  await waitForBlePermissions(30_000);
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   if (!hasSeenWelcome()) {
     await showWelcome();
   }
+  await ensureBlePermissions();
   initNode();
 });
 

@@ -12,7 +12,7 @@
 
 use iroh_ble_transport::{
     AdvertisingConfig, AttributePermissions, CharacteristicProperties, DeviceId,
-    GattCharacteristic, GattService, Peripheral, PeripheralEvent,
+    GattCharacteristic, GattService, Peripheral, PeripheralRequest, PeripheralStateEvent,
 };
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -43,15 +43,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let peripheral: Peripheral = Peripheral::new().await?;
-    let mut events = peripheral.events();
+    let mut state_events = peripheral.state_events();
+    let mut requests = peripheral
+        .take_requests()
+        .expect("fresh Peripheral: take_requests must succeed on first call");
 
     // CoreBluetooth initialises asynchronously.
     if !peripheral.is_powered().await? {
         println!("Waiting for Bluetooth adapter...");
-        while let Some(event) = events.next().await {
+        while let Some(event) = state_events.next().await {
             match event {
-                PeripheralEvent::AdapterStateChanged { powered: true } => break,
-                PeripheralEvent::AdapterStateChanged { powered: false } => {
+                PeripheralStateEvent::AdapterStateChanged { powered: true } => break,
+                PeripheralStateEvent::AdapterStateChanged { powered: false } => {
                     eprintln!("Bluetooth is powered off. Please enable Bluetooth and retry.");
                     return Ok(());
                 }
@@ -95,9 +98,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         tokio::select! {
-            event = events.next() => {
+            event = state_events.next() => {
                 match event {
-                    Some(event) => handle_event(event, &subscribers).await?,
+                    Some(event) => handle_state_event(event, &subscribers),
+                    None => break,
+                }
+            }
+
+            req = requests.next() => {
+                match req {
+                    Some(req) => handle_request(req),
                     None => break,
                 }
             }
@@ -131,16 +141,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_event(
-    event: PeripheralEvent,
-    subscribers: &Mutex<HashSet<DeviceId>>,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn handle_state_event(event: PeripheralStateEvent, subscribers: &Mutex<HashSet<DeviceId>>) {
     match event {
-        PeripheralEvent::AdapterStateChanged { powered } => {
+        PeripheralStateEvent::AdapterStateChanged { powered } => {
             println!("Adapter powered: {powered}");
         }
 
-        PeripheralEvent::SubscriptionChanged {
+        PeripheralStateEvent::SubscriptionChanged {
             client_id,
             char_uuid,
             subscribed,
@@ -160,8 +167,12 @@ async fn handle_event(
                 }
             }
         }
+    }
+}
 
-        PeripheralEvent::ReadRequest {
+fn handle_request(req: PeripheralRequest) {
+    match req {
+        PeripheralRequest::Read {
             client_id,
             char_uuid,
             offset,
@@ -172,7 +183,7 @@ async fn handle_event(
             responder.respond(b"hello from peripheral".to_vec());
         }
 
-        PeripheralEvent::WriteRequest {
+        PeripheralRequest::Write {
             client_id,
             char_uuid,
             value,
@@ -186,5 +197,4 @@ async fn handle_event(
             }
         }
     }
-    Ok(())
 }

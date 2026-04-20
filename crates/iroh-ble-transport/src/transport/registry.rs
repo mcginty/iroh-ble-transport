@@ -112,9 +112,6 @@ impl Registry {
             PeerCommand::AdapterStateChanged { powered } => {
                 self.handle_adapter_state_changed(&mut actions, now, powered);
             }
-            PeerCommand::RestoreFromAdapter { devices } => {
-                self.handle_restore_from_adapter(&mut actions, now, devices);
-            }
             PeerCommand::Tick(tick_now) => self.handle_tick(&mut actions, tick_now),
             PeerCommand::Forget { device_id } => {
                 self.handle_forget(&mut actions, now, device_id);
@@ -1043,30 +1040,6 @@ impl Registry {
             actions.push(PeerAction::RestartAdvertising);
             if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
                 actions.push(PeerAction::RestartL2capListener);
-            }
-        }
-    }
-
-    fn handle_restore_from_adapter(
-        &mut self,
-        actions: &mut Vec<PeerAction>,
-        now: std::time::Instant,
-        devices: Vec<blew::BleDevice>,
-    ) {
-        for device in devices {
-            if let Some(entry) = self.peers.get_mut(&device.id) {
-                if matches!(
-                    entry.phase,
-                    PeerPhase::Connected { .. } | PeerPhase::Handshaking { .. }
-                ) {
-                    continue;
-                }
-                entry.phase = PeerPhase::Restoring { since: now };
-            } else {
-                actions.push(PeerAction::EmitMetric(format!(
-                    "restore_unknown_device={}",
-                    device.id.as_str()
-                )));
             }
         }
     }
@@ -2569,154 +2542,6 @@ mod tests {
         let _ = reg.handle(PeerCommand::Tick(now));
         assert!(reg.peer(&fresh_id).is_some(), "fresh Dead peer survives GC");
         assert!(reg.peer(&old_id).is_none(), "old Dead peer is GC'd");
-    }
-
-    #[test]
-    fn restore_from_adapter_places_known_peers_in_restoring() {
-        let mut reg = Registry::new_for_test();
-        let device_id = blew::DeviceId::from("dev-16");
-        reg.peers.insert(device_id.clone(), {
-            let mut e = PeerEntry::new(device_id.clone());
-            e.phase = PeerPhase::Unknown;
-            e
-        });
-        let device = blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        };
-        let actions = reg.handle(PeerCommand::RestoreFromAdapter {
-            devices: vec![device],
-        });
-        assert!(actions.is_empty());
-        assert!(matches!(
-            reg.peer(&device_id).unwrap().phase,
-            PeerPhase::Restoring { .. }
-        ));
-    }
-
-    #[test]
-    fn restore_from_adapter_unknown_device_emits_metric() {
-        let mut reg = Registry::new_for_test();
-        let device = blew::BleDevice {
-            id: blew::DeviceId::from("dev-stranger"),
-            name: None,
-            rssi: None,
-            services: vec![],
-        };
-        let actions = reg.handle(PeerCommand::RestoreFromAdapter {
-            devices: vec![device],
-        });
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PeerAction::EmitMetric(s) if s.contains("restore_unknown_device")
-        )));
-    }
-
-    #[test]
-    fn restore_from_adapter_skips_connected_peers() {
-        let mut reg = Registry::new_for_test();
-        let device_id = blew::DeviceId::from("dev-20");
-        let channel = crate::transport::peer::ChannelHandle {
-            id: 42,
-            path: crate::transport::peer::ConnectPath::Gatt,
-        };
-        reg.peers.insert(device_id.clone(), {
-            let mut e = PeerEntry::new(device_id.clone());
-            e.phase = PeerPhase::Connected {
-                since: std::time::Instant::now(),
-                channel: channel.clone(),
-                tx_gen: 7,
-                upgrading: false,
-            };
-            e
-        });
-        let device = blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        };
-        let actions = reg.handle(PeerCommand::RestoreFromAdapter {
-            devices: vec![device],
-        });
-        assert!(actions.is_empty(), "Connected peer stays put, no actions");
-        match &reg.peer(&device_id).unwrap().phase {
-            PeerPhase::Connected { tx_gen: 7, .. } => {}
-            other => panic!("expected Connected unchanged, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn restore_from_adapter_skips_handshaking_peers() {
-        let mut reg = Registry::new_for_test();
-        let device_id = blew::DeviceId::from("dev-21");
-        reg.peers.insert(device_id.clone(), {
-            let mut e = PeerEntry::new(device_id.clone());
-            e.phase = PeerPhase::Handshaking {
-                since: std::time::Instant::now(),
-                channel: crate::transport::peer::ChannelHandle {
-                    id: 99,
-                    path: crate::transport::peer::ConnectPath::L2cap,
-                },
-            };
-            e
-        });
-        let device = blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        };
-        let actions = reg.handle(PeerCommand::RestoreFromAdapter {
-            devices: vec![device],
-        });
-        assert!(actions.is_empty());
-        assert!(matches!(
-            reg.peer(&device_id).unwrap().phase,
-            PeerPhase::Handshaking { .. }
-        ));
-    }
-
-    #[test]
-    fn restore_from_adapter_mixes_known_and_unknown() {
-        let mut reg = Registry::new_for_test();
-        let known_id = blew::DeviceId::from("dev-known");
-        reg.peers.insert(known_id.clone(), {
-            let mut e = PeerEntry::new(known_id.clone());
-            e.phase = PeerPhase::Unknown;
-            e
-        });
-        let actions = reg.handle(PeerCommand::RestoreFromAdapter {
-            devices: vec![
-                blew::BleDevice {
-                    id: known_id.clone(),
-                    name: None,
-                    rssi: None,
-                    services: vec![],
-                },
-                blew::BleDevice {
-                    id: blew::DeviceId::from("dev-unknown"),
-                    name: None,
-                    rssi: None,
-                    services: vec![],
-                },
-            ],
-        });
-        assert_eq!(
-            actions.len(),
-            1,
-            "exactly one metric for the unknown device"
-        );
-        assert!(matches!(
-            actions[0],
-            PeerAction::EmitMetric(ref s) if s.contains("restore_unknown_device=") && s.contains("dev-unknown")
-        ));
-        assert!(matches!(
-            reg.peer(&known_id).unwrap().phase,
-            PeerPhase::Restoring { .. }
-        ));
     }
 
     #[test]

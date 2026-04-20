@@ -216,16 +216,11 @@ async fn start_node(
         );
     }
 
-    // On Android, start_node can race with the permissions dialog.
-    {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !tauri_plugin_blew::are_ble_permissions_granted() {
-            if std::time::Instant::now() > deadline {
-                return Err("BLE permissions not granted. Please allow Bluetooth permissions and restart the app.".into());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-        info!("BLE permissions granted");
+    // Frontend calls `request_ble_permissions` before `start_node` on Android,
+    // so by the time we land here the user has already responded to the OS
+    // dialog. Bail out with a stable error string the frontend can special-case.
+    if !tauri_plugin_blew::are_ble_permissions_granted() {
+        return Err("ble_permissions_required".into());
     }
 
     let (verified_tx, verified_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1625,6 +1620,21 @@ async fn get_peers(state: State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<PeerSta
     Ok(peers)
 }
 
+/// Show the Android BLE runtime-permissions dialog. Fire-and-forget — the
+/// frontend polls `are_ble_permissions_granted` (via retrying `start_node`) to
+/// detect when the user has responded. No-op on non-Android platforms.
+#[tauri::command]
+fn request_ble_permissions() {
+    tauri_plugin_blew::request_ble_permissions();
+}
+
+/// Whether BLE runtime permissions are currently granted. Always `true` on
+/// non-Android platforms.
+#[tauri::command]
+fn are_ble_permissions_granted() -> bool {
+    tauri_plugin_blew::are_ble_permissions_granted()
+}
+
 #[tauri::command]
 async fn set_debug(enabled: bool, state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
     let st = state.lock().await;
@@ -1669,7 +1679,11 @@ pub fn run() {
 
     #[cfg(target_os = "android")]
     {
-        builder = builder.plugin(tauri_plugin_blew::init());
+        builder = builder.plugin(tauri_plugin_blew::init_with_config(
+            tauri_plugin_blew::BlewPluginConfig {
+                auto_request_permissions: false,
+            },
+        ));
     }
 
     #[cfg(mobile)]
@@ -1714,7 +1728,7 @@ pub fn run() {
             let env_filter =
                 tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
                     tracing_subscriber::EnvFilter::new(
-                        "iroh_ble_transport=trace,iroh_gossip=info,iroh_ble_chat=debug,iroh_ble_chat_lib=debug,blew=info,warn",
+                        "iroh_ble_transport=debug,iroh_gossip=info,iroh_ble_chat=debug,iroh_ble_chat_lib=debug,blew=info,warn",
                     )
                 });
             let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
@@ -1739,6 +1753,8 @@ pub fn run() {
             get_peers,
             set_debug,
             reset_app,
+            request_ble_permissions,
+            are_ble_permissions_granted,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

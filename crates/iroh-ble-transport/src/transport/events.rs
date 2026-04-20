@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use blew::central::CentralEvent;
-use blew::peripheral::PeripheralEvent;
+use blew::peripheral::{PeripheralRequest, PeripheralStateEvent};
 use blew::{Central, Peripheral};
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -121,7 +121,6 @@ pub async fn run_central_events(
             CentralEvent::AdapterStateChanged { powered } => {
                 PeerCommand::AdapterStateChanged { powered }
             }
-            CentralEvent::Restored { devices } => PeerCommand::RestoreFromAdapter { devices },
         };
         if inbox.send(cmd).await.is_err() {
             tracing::debug!("central event pump: inbox closed, shutting down");
@@ -130,44 +129,22 @@ pub async fn run_central_events(
     }
 }
 
-/// Drive the peripheral event stream, translating each event into a
-/// `PeerCommand` and forwarding it to `inbox`. Returns when the stream ends or
-/// `inbox` is closed.
-pub async fn run_peripheral_events(
+/// Drive the peripheral state-event stream (adapter power, subscription changes),
+/// translating each event into a `PeerCommand` and forwarding it to `inbox`.
+/// Returns when the stream ends or `inbox` is closed.
+pub async fn run_peripheral_state_events(
     peripheral: Arc<Peripheral>,
     routing: Arc<TransportRouting>,
     inbox: mpsc::Sender<PeerCommand>,
-    psm: Option<u16>,
 ) {
     use tokio_stream::StreamExt as _;
-    let mut events = peripheral.events();
+    let mut events = peripheral.state_events();
     while let Some(ev) = events.next().await {
         let cmd = match ev {
-            PeripheralEvent::AdapterStateChanged { powered } => {
+            PeripheralStateEvent::AdapterStateChanged { powered } => {
                 PeerCommand::AdapterStateChanged { powered }
             }
-            PeripheralEvent::WriteRequest {
-                client_id,
-                char_uuid: _,
-                value,
-                responder,
-                ..
-            } => {
-                if let Some(r) = responder {
-                    r.success();
-                }
-                tracing::trace!(
-                    device = %client_id,
-                    len = value.len(),
-                    "peripheral WriteRequest received (C2P)"
-                );
-                PeerCommand::InboundGattFragment {
-                    device_id: client_id,
-                    source: crate::transport::peer::FragmentSource::PeripheralReceivedC2p,
-                    bytes: Bytes::from(value),
-                }
-            }
-            PeripheralEvent::SubscriptionChanged {
+            PeripheralStateEvent::SubscriptionChanged {
                 client_id,
                 char_uuid,
                 subscribed,
@@ -192,7 +169,55 @@ pub async fn run_peripheral_events(
                     }
                 }
             }
-            PeripheralEvent::ReadRequest {
+        };
+        if inbox.send(cmd).await.is_err() {
+            tracing::debug!("peripheral state event pump: inbox closed, shutting down");
+            break;
+        }
+    }
+}
+
+/// Drive the peripheral request stream (GATT reads/writes), translating each
+/// request into a `PeerCommand` and forwarding it to `inbox` (or responding
+/// inline for read-only characteristics owned by the transport).
+///
+/// `Peripheral::take_requests` is single-consumer; callers must ensure this
+/// is invoked exactly once per `Peripheral`. The returned future completes
+/// when the stream ends or `inbox` is closed. If the requests stream has
+/// already been taken, logs an error and returns immediately.
+pub async fn run_peripheral_requests(
+    peripheral: Arc<Peripheral>,
+    inbox: mpsc::Sender<PeerCommand>,
+    psm: Option<u16>,
+) {
+    use tokio_stream::StreamExt as _;
+    let Some(mut requests) = peripheral.take_requests() else {
+        tracing::error!("peripheral requests stream already taken; no request pump will run");
+        return;
+    };
+    while let Some(req) = requests.next().await {
+        let cmd = match req {
+            PeripheralRequest::Write {
+                client_id,
+                value,
+                responder,
+                ..
+            } => {
+                if let Some(r) = responder {
+                    r.success();
+                }
+                tracing::trace!(
+                    device = %client_id,
+                    len = value.len(),
+                    "peripheral WriteRequest received (C2P)"
+                );
+                PeerCommand::InboundGattFragment {
+                    device_id: client_id,
+                    source: crate::transport::peer::FragmentSource::PeripheralReceivedC2p,
+                    bytes: Bytes::from(value),
+                }
+            }
+            PeripheralRequest::Read {
                 char_uuid,
                 responder,
                 ..
@@ -212,7 +237,7 @@ pub async fn run_peripheral_events(
             }
         };
         if inbox.send(cmd).await.is_err() {
-            tracing::debug!("peripheral event pump: inbox closed, shutting down");
+            tracing::debug!("peripheral request pump: inbox closed, shutting down");
             break;
         }
     }
