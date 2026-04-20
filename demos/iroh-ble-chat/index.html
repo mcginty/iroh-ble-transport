@@ -176,6 +176,35 @@
             </div>
         </div>
 
+            <!-- First-run welcome modal -->
+            <div id="welcome-modal" class="modal-overlay" style="display:none">
+                <div class="modal-card">
+                    <div class="modal-header">
+                        <span class="modal-title">Welcome to BlewChat</span>
+                    </div>
+                    <p class="confirm-text">
+                        <strong>Alpha software.</strong> BlewChat is an experimental
+                        demo for the <code>iroh-ble-transport</code> crate. Expect
+                        rough edges, dropped messages, and crashes.
+                    </p>
+                    <p class="confirm-text">
+                        <strong>Not secure.</strong> Chats are not end-to-end
+                        encrypted and the protocol has not been audited. Don't
+                        send anything you wouldn't post publicly.
+                    </p>
+                    <p class="confirm-text">
+                        Your OS will shortly ask for <strong>Bluetooth permission</strong>
+                        so the app can discover nearby peers. BlewChat doesn't work
+                        without it.
+                    </p>
+                    <div class="confirm-actions">
+                        <button id="welcome-continue-btn" class="primary-btn full-width">
+                            Got it
+                        </button>
+                    </div>
+                </div>
+            </div>
+
             <!-- QR code modal -->
             <div id="qr-modal" class="modal-overlay" style="display:none">
                 <div class="modal-card">

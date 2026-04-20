@@ -193,6 +193,8 @@ const resetAppBtn = document.getElementById("reset-app-btn") as HTMLButtonElemen
 const resetModal = document.getElementById("reset-modal")!;
 const resetConfirmBtn = document.getElementById("reset-confirm-btn") as HTMLButtonElement;
 const resetCancelBtn = document.getElementById("reset-cancel-btn") as HTMLButtonElement;
+const welcomeModal = document.getElementById("welcome-modal")!;
+const welcomeContinueBtn = document.getElementById("welcome-continue-btn") as HTMLButtonElement;
 
 // ---------------------------------------------------------------------------
 // Status
@@ -736,7 +738,43 @@ async function initNode() {
   }
 }
 
-document.addEventListener("DOMContentLoaded", () => initNode());
+const WELCOME_ACK_KEY = "blewchat.welcome.acked.v1";
+
+function hasSeenWelcome(): boolean {
+  try {
+    return localStorage.getItem(WELCOME_ACK_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markWelcomeSeen() {
+  try {
+    localStorage.setItem(WELCOME_ACK_KEY, "1");
+  } catch {
+    // Storage disabled — the modal will just reappear next launch.
+  }
+}
+
+function showWelcome(): Promise<void> {
+  return new Promise((resolve) => {
+    welcomeModal.style.display = "";
+    const onContinue = () => {
+      welcomeContinueBtn.removeEventListener("click", onContinue);
+      welcomeModal.style.display = "none";
+      markWelcomeSeen();
+      resolve();
+    };
+    welcomeContinueBtn.addEventListener("click", onContinue);
+  });
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  if (!hasSeenWelcome()) {
+    await showWelcome();
+  }
+  initNode();
+});
 
 // ---------------------------------------------------------------------------
 // Keyboard / visual viewport tracking
