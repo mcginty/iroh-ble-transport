@@ -1,6 +1,6 @@
 [package]
 name = "iroh-ble-chat"
-version = "0.1.0-alpha.10"
+version = "0.1.0"
 edition = "2021"
 rust-version.workspace = true
 publish = false
