@@ -45,10 +45,10 @@ retry curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --max-time 120 htt
 sh /tmp/mise-installer.sh
 export PATH="$HOME/.local/bin:$PATH"
 
-echo "==> Installing toolchain via mise"
+echo "==> Installing toolchain via mise (iOS subset only — skip android-sdk/java/ktlint)"
 export MISE_COLOR=false
 export MISE_HTTP_TIMEOUT=120
-retry mise install
+retry mise install rust node pnpm
 export PATH="$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$PATH"
 
 echo "==> Adding iOS target"
