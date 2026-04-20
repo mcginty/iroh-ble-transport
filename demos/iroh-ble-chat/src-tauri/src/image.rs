@@ -8,7 +8,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 
 const MAX_DIMENSION: u32 = 800;
-const AVIF_QUALITY: f32 = 35.0;
+const AVIF_QUALITY: f32 = 45.0;
 const AVIF_SPEED: u8 = 10;
 
 /// CPU-intensive -- call from `spawn_blocking`.
