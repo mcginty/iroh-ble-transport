@@ -3,8 +3,9 @@
 
 # `iroh-ble-transport`
 
-🔥 Warning 🔥 This library is in alpha state and is subject to change without
-backwards-compatibility until otherwise noted.
+🔥 **Warning:** 🔥 This library is experimental. A best effort will be made to resolve
+bugs and follow semantic versioning, but there are no guarantees. Do not rely on it
+until it has been sufficiently field-tested.
 
 `iroh-ble-transport` is a Rust crate providing BLE (Bluetooth Low Energy) as a
 custom transport for the [Iroh](https://github.com/n0-computer/iroh)
