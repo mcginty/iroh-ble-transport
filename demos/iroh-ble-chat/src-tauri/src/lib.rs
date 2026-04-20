@@ -1620,19 +1620,40 @@ async fn get_peers(state: State<'_, Arc<Mutex<AppState>>>) -> Result<Vec<PeerSta
     Ok(peers)
 }
 
-/// Show the Android BLE runtime-permissions dialog. Fire-and-forget — the
-/// frontend polls `are_ble_permissions_granted` (via retrying `start_node`) to
-/// detect when the user has responded. No-op on non-Android platforms.
+/// Ensure Android BLE runtime permissions are granted, showing the OS dialog
+/// if needed. Returns `true` once permissions are granted, `false` if the user
+/// denied or a timeout expires. Always `true` on non-Android platforms.
+///
+/// On Android this subscribes to `tauri_plugin_blew::permission_events()`
+/// before triggering the dialog so the first status change is observed
+/// reliably (the stream is backed by a `tokio::sync::broadcast`).
 #[tauri::command]
-fn request_ble_permissions() {
-    tauri_plugin_blew::request_ble_permissions();
-}
+async fn request_ble_permissions() -> bool {
+    #[cfg(target_os = "android")]
+    {
+        use tokio_stream::StreamExt as _;
 
-/// Whether BLE runtime permissions are currently granted. Always `true` on
-/// non-Android platforms.
-#[tauri::command]
-fn are_ble_permissions_granted() -> bool {
-    tauri_plugin_blew::are_ble_permissions_granted()
+        if tauri_plugin_blew::are_ble_permissions_granted() {
+            return true;
+        }
+        let mut events = tauri_plugin_blew::permission_events();
+        tauri_plugin_blew::request_ble_permissions();
+
+        let wait = async {
+            while let Some(status) = events.next().await {
+                return status.is_granted();
+            }
+            tauri_plugin_blew::are_ble_permissions_granted()
+        };
+        match tokio::time::timeout(std::time::Duration::from_secs(60), wait).await {
+            Ok(granted) => granted,
+            Err(_) => tauri_plugin_blew::are_ble_permissions_granted(),
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        true
+    }
 }
 
 #[tauri::command]
@@ -1754,7 +1775,6 @@ pub fn run() {
             set_debug,
             reset_app,
             request_ble_permissions,
-            are_ble_permissions_granted,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

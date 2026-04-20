@@ -500,9 +500,9 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.2.0-alpha.3"
+version = "0.2.0-alpha.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a746159ca2f31aa6bdbaca40f278cd2d3d0bb430b131f216c27b8688272decd"
+checksum = "38455d76ff8c253353fd45e0b8dd0f93cd0409c07d98d5eda905941770123b6a"
 dependencies = [
  "bitflags 2.11.1",
  "bluer",
@@ -6487,15 +6487,16 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.2.0-alpha.3"
+version = "0.2.0-alpha.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "735bcd6c2e53dbffd27334f250231cf6af439774444fec61f40549b75fb035ac"
+checksum = "fa29f356413d90aaea2f8eaf6caea9cb7b9805cb3a2060e161c67a58bd50261a"
 dependencies = [
  "blew",
  "jni 0.22.4",
  "ndk-context",
  "tauri",
  "tauri-plugin",
+ "tokio",
  "tracing",
 ]
 
