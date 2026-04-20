@@ -5,10 +5,14 @@ import { onOpenUrl } from "@tauri-apps/plugin-deep-link";
 import { scan, Format, checkPermissions, requestPermissions } from "@tauri-apps/plugin-barcode-scanner";
 
 // Self-hosted fonts (bundled into the app so they work offline).
-import "@fontsource/inter/400.css";
-import "@fontsource/inter/500.css";
-import "@fontsource/inter/600.css";
-import "@fontsource/inter/800.css";
+import "@fontsource/space-grotesk/400.css";
+import "@fontsource/space-grotesk/500.css";
+import "@fontsource/space-grotesk/600.css";
+import "@fontsource/space-grotesk/700.css";
+import "@fontsource/jetbrains-mono/400.css";
+import "@fontsource/jetbrains-mono/500.css";
+import "@fontsource/jetbrains-mono/600.css";
+import "@fontsource/jetbrains-mono/700.css";
 import "@fontsource/press-start-2p/400.css";
 
 // ---------------------------------------------------------------------------
@@ -1000,11 +1004,23 @@ onOpenUrl((urls: string[]) => {
 // Add peer panel
 // ---------------------------------------------------------------------------
 
+const connectModalClose = document.getElementById("connect-modal-close") as HTMLButtonElement | null;
+
+function isConnectPanelOpen() {
+  return connectPanel.style.display !== "none" && connectPanel.style.display !== "";
+}
+
+function openConnectPanel() {
+  connectPanel.style.display = "flex";
+  connectToggleBtn.classList.add("active");
+  nicknamePanel.classList.add("collapsed");
+  setTimeout(() => peerIdInput.focus(), 50);
+}
+
 function closeConnectPanel() {
-  if (connectPanel.classList.contains("collapsed")) return;
-  connectPanel.classList.add("collapsed");
+  if (!isConnectPanelOpen()) return;
+  connectPanel.style.display = "none";
   connectToggleBtn.classList.remove("active");
-  connectToggleBtn.textContent = "＋";
 }
 
 function closeNicknamePanel() {
@@ -1013,26 +1029,21 @@ function closeNicknamePanel() {
 }
 
 connectToggleBtn.addEventListener("click", () => {
-  const isCollapsed = connectPanel.classList.toggle("collapsed");
-  connectToggleBtn.classList.toggle("active", !isCollapsed);
-  connectToggleBtn.textContent = isCollapsed ? "＋" : "✕";
-  if (!isCollapsed) {
-    nicknamePanel.classList.add("collapsed");
-    setTimeout(() => peerIdInput.focus(), 350);
-  }
+  if (isConnectPanelOpen()) closeConnectPanel();
+  else openConnectPanel();
 });
 
-// Tap outside of the connect or nickname panels (and not on the toggle that
-// opened them) to dismiss. Pointerdown runs before focus changes, so tapping
-// the message input or another control also closes the panel cleanly.
+connectModalClose?.addEventListener("click", closeConnectPanel);
+
+// Click the modal backdrop (outside the card) to dismiss
+connectPanel.addEventListener("click", (e) => {
+  if (e.target === connectPanel) closeConnectPanel();
+});
+
+// Dismiss the nickname drawer when the user taps outside it
 document.addEventListener("pointerdown", (e) => {
   const target = e.target as Node | null;
   if (!target) return;
-  if (!connectPanel.classList.contains("collapsed")
-      && !connectPanel.contains(target)
-      && !connectToggleBtn.contains(target)) {
-    closeConnectPanel();
-  }
   if (!nicknamePanel.classList.contains("collapsed")
       && !nicknamePanel.contains(target)
       && !editNicknameBtn.contains(target)) {
@@ -1048,9 +1059,51 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+const peerIdHint = document.getElementById("peer-id-hint") as HTMLSpanElement | null;
+
+// iroh endpoint IDs serialize to base32 (lowercase a-z, 2-7). Length is typically 52 chars
+// for a 32-byte ed25519 key, but we accept a generous range to stay compatible with
+// alternate encodings the backend might parse.
+const PEER_ID_SHAPE = /^[a-z2-7]{48,64}$/;
+
+function validatePeerIdShape(raw: string): { ok: boolean; message: string } {
+  const s = raw.trim().toLowerCase();
+  if (!s) return { ok: false, message: "Paste a peer ID to add" };
+  if (s.length < 48) return { ok: false, message: `Too short (${s.length} chars) — expecting ~52` };
+  if (s.length > 64) return { ok: false, message: `Too long (${s.length} chars) — expecting ~52` };
+  if (!PEER_ID_SHAPE.test(s)) {
+    return { ok: false, message: "Contains unexpected characters — base32 only (a–z, 2–7)" };
+  }
+  return { ok: true, message: "Expecting a base32 endpoint ID (52 chars)" };
+}
+
+function setPeerIdHint(message: string, isError: boolean) {
+  if (!peerIdHint) return;
+  peerIdHint.textContent = message;
+  peerIdHint.classList.toggle("error", isError);
+  peerIdInput.classList.toggle("invalid", isError);
+}
+
+peerIdInput.addEventListener("input", () => {
+  const v = peerIdInput.value.trim();
+  if (!v) {
+    setPeerIdHint("Expecting a base32 endpoint ID (52 chars)", false);
+    return;
+  }
+  const { ok, message } = validatePeerIdShape(v);
+  setPeerIdHint(message, !ok);
+});
+
 connectBtn.addEventListener("click", async () => {
   const peerId = peerIdInput.value.trim();
   if (!peerId) return;
+
+  const { ok, message } = validatePeerIdShape(peerId);
+  if (!ok) {
+    setPeerIdHint(message, true);
+    peerIdInput.focus();
+    return;
+  }
 
   connectBtn.textContent = "Adding…";
   connectBtn.disabled = true;
@@ -1059,10 +1112,9 @@ connectBtn.addEventListener("click", async () => {
     await invoke("add_peer", { idStr: peerId });
     connectBtn.textContent = "Added ✓";
     peerIdInput.value = "";
+    setPeerIdHint("Expecting a base32 endpoint ID (52 chars)", false);
     setTimeout(() => {
-      connectPanel.classList.add("collapsed");
-      connectToggleBtn.classList.remove("active");
-      connectToggleBtn.textContent = "＋";
+      closeConnectPanel();
       connectBtn.textContent = "Add Peer";
       connectBtn.disabled = false;
     }, 1000);
@@ -1070,6 +1122,8 @@ connectBtn.addEventListener("click", async () => {
     console.error(e);
     connectBtn.textContent = "Retry";
     connectBtn.disabled = false;
+    setPeerIdHint(`Add failed: ${String(e).slice(0, 80)}`, true);
+    appendEvent("error", `Failed to add peer: ${e}`);
   }
 });
 
@@ -1080,9 +1134,7 @@ connectBtn.addEventListener("click", async () => {
 editNicknameBtn.addEventListener("click", () => {
   const isCollapsed = nicknamePanel.classList.toggle("collapsed");
   if (!isCollapsed) {
-    connectPanel.classList.add("collapsed");
-    connectToggleBtn.classList.remove("active");
-    connectToggleBtn.textContent = "＋";
+    closeConnectPanel();
     nicknameInput.value = myNickname;
     setTimeout(() => nicknameInput.focus(), 350);
   }
