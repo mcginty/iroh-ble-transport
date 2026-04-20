@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn image_start_round_trip() {
         let msg = ChatMsg::ImageStart {
-            from: iroh_base::SecretKey::generate(&mut rand::rngs::ThreadRng::default()).public(),
+            from: iroh_base::SecretKey::generate().public(),
             nickname: "alice".to_string(),
             image_id: 0xDEAD_BEEF_CAFE_1234,
             size: 65432,
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn image_start_fits_in_gossip_limit() {
         let msg = ChatMsg::ImageStart {
-            from: iroh_base::SecretKey::generate(&mut rand::rngs::ThreadRng::default()).public(),
+            from: iroh_base::SecretKey::generate().public(),
             nickname: "a".repeat(200), // 200-char nickname edge case
             image_id: u64::MAX,
             size: usize::MAX,

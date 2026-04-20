@@ -703,7 +703,7 @@ impl AddressLookup for BleAddressLookup {
         );
         let info = EndpointInfo {
             endpoint_id,
-            data: EndpointData::new([TransportAddr::Custom(token_custom_addr(token))]),
+            data: EndpointData::new(vec![TransportAddr::Custom(token_custom_addr(token))]),
         };
         let item: Result<Item, address_lookup::Error> = Ok(Item::new(info, "iroh-ble", None));
         Some(Box::pin(n0_future::stream::iter([item])))

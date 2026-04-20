@@ -22,11 +22,11 @@ tokio = { version = "1", features = ["sync", "rt", "time"] }
 tokio-stream = "0.1"
 bytes = "1"
 atomic-waker = "1"
-iroh = { version = "0.97.0", features = ["unstable-custom-transports"] }
-iroh-base = "0.97"
+iroh = { version = "0.98.0", features = ["unstable-custom-transports"] }
+iroh-base = "0.98"
 n0-watcher = "0.6"
 n0-future = "0.3"
-noq-udp = "0.9"
+noq-udp = "0.10"
 async-stream = "0.3"
 parking_lot = "0.12"
 async-trait = "0.1"

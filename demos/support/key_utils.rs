@@ -31,7 +31,7 @@ pub fn load_or_generate_key_in(dir: &std::path::Path) -> SecretKey {
             return key;
         }
     }
-    let key = SecretKey::generate(&mut rand::rng());
+    let key = SecretKey::generate();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
