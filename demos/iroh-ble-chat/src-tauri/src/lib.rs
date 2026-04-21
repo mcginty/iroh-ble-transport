@@ -1668,11 +1668,14 @@ async fn set_debug(enabled: bool, state: State<'_, Arc<Mutex<AppState>>>) -> Res
 /// Wipe persistent state (secret key, known peers, nickname) and relaunch the
 /// app so the next start generates a fresh identity — the demo equivalent of
 /// "reinstall". Returns immediately so the UI can show a "reopen the app"
-/// message; the restart fires after a short delay. On iOS the restart is
-/// effectively an exit (Apple forbids self-relaunch), so the user sees the
-/// message and reopens manually.
+/// message; the restart fires after a short delay. On iOS the process is left
+/// running because any programmatic exit is reported by the OS as a crash —
+/// the UI instructs the user to force-quit and reopen manually.
 #[tauri::command]
-async fn reset_app(app: AppHandle, state: State<'_, Arc<Mutex<AppState>>>) -> Result<(), String> {
+async fn reset_app(
+    #[cfg_attr(target_os = "ios", allow(unused_variables))] app: AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+) -> Result<(), String> {
     let cache_dir = {
         let st = state.lock().await;
         st.cache_dir.clone()
@@ -1685,11 +1688,18 @@ async fn reset_app(app: AppHandle, state: State<'_, Arc<Mutex<AppState>>>) -> Re
             Err(e) => tracing::warn!(path = %path.display(), "reset: remove failed: {e}"),
         }
     }
-    info!("reset_app: state cleared, restarting shortly");
-    tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        app.restart();
-    });
+    #[cfg(target_os = "ios")]
+    {
+        info!("reset_app: state cleared; iOS requires user to force-quit and reopen");
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        info!("reset_app: state cleared, restarting shortly");
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            app.restart();
+        });
+    }
     Ok(())
 }
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

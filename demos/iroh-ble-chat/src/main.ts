@@ -579,15 +579,23 @@ function appendEvent(level: EventLevel, message: string, target?: string) {
 // Messages
 // ---------------------------------------------------------------------------
 
+function shouldClump(prev: Element | null, fromId: string): boolean {
+  if (!prev || !prev.classList.contains("message")) return false;
+  return (prev as HTMLElement).dataset.fromId === fromId;
+}
+
 function appendMessage(msg: ChatMsgPayload) {
   const welcome = chatMessages.querySelector(".welcome");
   if (welcome) welcome.remove();
 
+  const clumped = shouldClump(chatMessages.lastElementChild, msg.from_id);
+
   const wrapper = document.createElement("div");
   const bubbleClass = msg.is_self ? "self" : "peer";
-  wrapper.className = `message ${bubbleClass}`;
+  wrapper.className = `message ${bubbleClass}${clumped ? " clumped" : ""}`;
+  wrapper.dataset.fromId = msg.from_id;
 
-  if (!msg.is_self) {
+  if (!clumped) {
     const nameEl = document.createElement("div");
     nameEl.className = `sender-name ${senderColourClass(msg.from_id)}`;
     nameEl.textContent = msg.nickname;
@@ -611,12 +619,15 @@ function getOrCreatePlaceholder(imageId: string, isSelf: boolean, nickname: stri
   const welcome = chatMessages.querySelector(".welcome");
   if (welcome) welcome.remove();
 
+  const clumped = fromId ? shouldClump(chatMessages.lastElementChild, fromId) : false;
+
   const wrapper = document.createElement("div");
   const bubbleClass = isSelf ? "self" : "peer";
-  wrapper.className = `message ${bubbleClass}`;
+  wrapper.className = `message ${bubbleClass}${clumped ? " clumped" : ""}`;
   wrapper.dataset.imageId = imageId;
+  if (fromId) wrapper.dataset.fromId = fromId;
 
-  if (!isSelf) {
+  if (nickname && !clumped) {
     const nameEl = document.createElement("div");
     nameEl.className = `sender-name ${senderColourClass(fromId)}`;
     nameEl.textContent = nickname;
@@ -650,18 +661,23 @@ function updateProgress(imageId: string, bytes: number, total: number, isSelf: b
 
 function appendImageMessage(payload: ChatImagePayload) {
   const placeholder = document.querySelector(`[data-image-id="${payload.image_id}"]`);
-  if (placeholder) {
-    placeholder.remove();
-  }
+  const anchor = placeholder?.nextElementSibling ?? null;
+  const prev = placeholder
+    ? placeholder.previousElementSibling
+    : chatMessages.lastElementChild;
+  if (placeholder) placeholder.remove();
 
   const welcome = chatMessages.querySelector(".welcome");
   if (welcome) welcome.remove();
 
+  const clumped = shouldClump(prev, payload.from_id);
+
   const wrapper = document.createElement("div");
   const bubbleClass = payload.is_self ? "self" : "peer";
-  wrapper.className = `message ${bubbleClass}`;
+  wrapper.className = `message ${bubbleClass}${clumped ? " clumped" : ""}`;
+  wrapper.dataset.fromId = payload.from_id;
 
-  if (!payload.is_self) {
+  if (!clumped) {
     const nameEl = document.createElement("div");
     nameEl.className = `sender-name ${senderColourClass(payload.from_id)}`;
     nameEl.textContent = payload.nickname;
@@ -673,7 +689,11 @@ function appendImageMessage(payload: ChatImagePayload) {
   img.alt = "Image";
   wrapper.appendChild(img);
 
-  chatMessages.appendChild(wrapper);
+  if (anchor && anchor.parentElement === chatMessages) {
+    chatMessages.insertBefore(wrapper, anchor);
+  } else {
+    chatMessages.appendChild(wrapper);
+  }
   chatMessages.scrollTop = chatMessages.scrollHeight;
 }
 
