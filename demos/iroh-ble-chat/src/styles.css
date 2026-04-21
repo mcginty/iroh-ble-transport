@@ -459,17 +459,6 @@ textarea:focus, input:focus {
   border-color: var(--primary);
   background: rgba(107,139,255,0.05);
   box-shadow: 0 0 0 2px var(--primary-dim);
-  /* iOS keyboard-scroll suppressor: WKWebView decides synchronously on
-     focus whether to scroll the page to bring the focused input into
-     view. If the input isn't visible at that instant, it won't scroll.
-     A 0.01s animation from opacity:0→1 makes the input invisible for
-     exactly one frame — imperceptible to the user but enough for the
-     engine's visibility check. Gist method 1, CSS variant. */
-  animation: ios-prevent-keyboard-scroll 0.01s linear;
-}
-@keyframes ios-prevent-keyboard-scroll {
-  from { opacity: 0; }
-  to   { opacity: 1; }
 }
 textarea.invalid, input.invalid {
   border-color: var(--accent-err);
