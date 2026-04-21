@@ -69,7 +69,7 @@ cp -r "$CHAT_DIR/dist" "$CHAT_DIR/src-tauri/gen/apple/assets"
 echo "==> Fetching cargo dependencies"
 cd "$CHAT_DIR/src-tauri"
 export IPHONEOS_DEPLOYMENT_TARGET=16.0
-retry cargo fetch --target aarch64-apple-ios
+retry cargo fetch
 
 echo "==> Building Rust static library for iOS"
 cargo build --release --target aarch64-apple-ios --lib --features tauri/custom-protocol --offline
