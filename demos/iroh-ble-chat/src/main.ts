@@ -809,9 +809,33 @@ const KEYBOARD_MIN_OCCLUSION_PX = 120;
   const root = document.documentElement;
   if (!vv) return;
 
+  // When the keyboard is up it already covers the home indicator, so the
+  // safe-bottom padding we add to the input bar just wastes pixels. Zero
+  // it while occluded; remove the override on close so it falls back to
+  // the :root env(safe-area-inset-bottom) declaration.
+  const setKeyboardOpen = (open: boolean) => {
+    if (open) {
+      root.style.setProperty("--safe-bottom", "0px");
+    } else {
+      root.style.removeProperty("--safe-bottom");
+    }
+  };
+
+  // iOS WKWebView's keyboard handler scrolls the whole page up to keep a
+  // focused input visible, even with the outer UIScrollView disabled and
+  // html/body `position: fixed`. Undo that programmatically — with our
+  // visualViewport-driven resize, the input is already above the keyboard,
+  // so no scroll is needed.
+  const snapScrollBack = () => {
+    if (window.scrollY !== 0 || window.scrollX !== 0) {
+      window.scrollTo(0, 0);
+    }
+  };
+
   const update = () => {
     const occluded = window.innerHeight - vv.height - vv.offsetTop;
-    if (occluded > KEYBOARD_MIN_OCCLUSION_PX) {
+    const open = occluded > KEYBOARD_MIN_OCCLUSION_PX;
+    if (open) {
       root.style.setProperty("--app-height", `${vv.height}px`);
       if (document.activeElement === msgInput) {
         chatMessages.scrollTop = chatMessages.scrollHeight;
@@ -819,10 +843,17 @@ const KEYBOARD_MIN_OCCLUSION_PX = 120;
     } else {
       root.style.removeProperty("--app-height");
     }
+    setKeyboardOpen(open);
+    snapScrollBack();
   };
 
   vv.addEventListener("resize", update);
   vv.addEventListener("scroll", update);
+  // Catch the moment of focus before the vv events fire — iOS decides
+  // whether to auto-scroll synchronously on focus.
+  document.addEventListener("focusin", () => {
+    requestAnimationFrame(snapScrollBack);
+  });
   update();
 })();
 
