@@ -332,6 +332,7 @@ impl BleTransport {
         tokio::spawn(run_central_events(
             Arc::clone(&central),
             Arc::clone(&routing),
+            Arc::clone(&routing_v2),
             inbox_tx.clone(),
         ));
         tokio::spawn(run_peripheral_state_events(

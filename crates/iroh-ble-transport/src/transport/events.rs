@@ -35,6 +35,7 @@ pub fn extract_prefix_from_services(services: &[Uuid]) -> Option<KeyPrefix> {
 pub async fn run_central_events(
     central: Arc<Central>,
     routing: Arc<TransportRouting>,
+    routing_v2: Arc<crate::transport::routing_v2::Routing>,
     inbox: mpsc::Sender<PeerCommand>,
 ) {
     use tokio_stream::StreamExt as _;
@@ -55,6 +56,10 @@ pub async fn run_central_events(
                             rssi,
                             "central DeviceDiscovered (iroh peer)"
                         );
+                        // Shadow routing_v2: keep scan_hint in sync with v1.
+                        // Step 3 of the redesign — preparation for step 4's
+                        // resolver rewrite, which consumes `scan_hint`.
+                        routing_v2.note_scan_hint(prefix, device.id.clone());
                     }
                     DiscoveryUpdate::Replaced { previous } => {
                         tracing::debug!(
@@ -65,6 +70,7 @@ pub async fn run_central_events(
                             "central DeviceDiscovered: prefix flipped to new DeviceId, evicting previous"
                         );
                         routing.forget_device(&previous);
+                        routing_v2.note_scan_hint(prefix, device.id.clone());
                         if inbox
                             .send(PeerCommand::Forget {
                                 device_id: previous,

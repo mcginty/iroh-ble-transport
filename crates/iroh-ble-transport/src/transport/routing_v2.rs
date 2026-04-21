@@ -20,6 +20,8 @@ use blew::DeviceId;
 use iroh_base::EndpointId;
 use parking_lot::Mutex;
 
+use crate::transport::peer::KeyPrefix;
+
 /// Opaque handle iroh sees (wrapped in a `CustomAddr`) for a BLE pipe.
 ///
 /// Monotonic, minted fresh every time a pipe is opened, never reused.
@@ -105,6 +107,13 @@ pub struct Routing {
 #[derive(Debug, Default)]
 struct RoutingInner {
     pipes: HashMap<StableConnId, Pipe>,
+    /// Scan-hint table: `KeyPrefix → DeviceId`. Populated whenever the
+    /// central-side event pump sees an advertising packet whose service
+    /// UUID matches the iroh-ble prefix shape. Answers "who might be
+    /// nearby under this public-key prefix" — a hint for dialing only;
+    /// never an authority for routing (see authority model in §9.1 of
+    /// the study doc).
+    scan_hint: HashMap<KeyPrefix, DeviceId>,
 }
 
 impl Routing {
@@ -167,6 +176,7 @@ impl Routing {
         let inner = self.inner.lock();
         RoutingSnapshot {
             pipes: inner.pipes.len(),
+            scan_hints: inner.scan_hint.len(),
         }
     }
 
@@ -176,6 +186,46 @@ impl Routing {
     pub fn pipes_for_debug(&self) -> Vec<Pipe> {
         self.inner.lock().pipes.values().cloned().collect()
     }
+
+    // ---------- scan_hint: KeyPrefix → DeviceId (dial-hint only) ----------
+
+    /// Record that `prefix` was last seen advertising from `device`.
+    /// Overwrites any prior mapping. Hint-only; never an authority for
+    /// routing — use pinned/routable state for that.
+    ///
+    /// Returns the `DeviceId` previously mapped to this prefix (if any),
+    /// so callers can forget stale routing state in `routing_v1`.
+    pub fn note_scan_hint(&self, prefix: KeyPrefix, device: DeviceId) -> Option<DeviceId> {
+        let mut inner = self.inner.lock();
+        let previous = inner.scan_hint.insert(prefix, device.clone());
+        if previous.as_ref() != Some(&device) {
+            tracing::trace!(
+                ?prefix,
+                device = %device,
+                previous = ?previous,
+                "routing_v2: scan_hint updated"
+            );
+        }
+        previous
+    }
+
+    /// Clear the scan hint for `prefix`. Idempotent. Used when scan
+    /// tells us a prefix went away (e.g., peer left range) or when v1
+    /// evicts a mapping via `forget_device`.
+    pub fn forget_scan_hint(&self, prefix: &KeyPrefix) {
+        let mut inner = self.inner.lock();
+        if inner.scan_hint.remove(prefix).is_some() {
+            tracing::trace!(?prefix, "routing_v2: scan_hint cleared");
+        }
+    }
+
+    /// Look up the DeviceId most recently seen advertising under this
+    /// prefix. Step 4 will consume this from the resolver to decide
+    /// whether a dial can be initiated.
+    #[must_use]
+    pub fn scan_hint_for_prefix(&self, prefix: &KeyPrefix) -> Option<DeviceId> {
+        self.inner.lock().scan_hint.get(prefix).cloned()
+    }
 }
 
 /// Counts-only view of the shadow routing state. Does not leak any
@@ -184,6 +234,7 @@ impl Routing {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoutingSnapshot {
     pub pipes: usize,
+    pub scan_hints: usize,
 }
 
 #[cfg(test)]
@@ -258,6 +309,67 @@ mod tests {
         let pipes = r.pipes_for_debug();
         assert_eq!(pipes.len(), 1);
         assert_eq!(pipes[0].id, id2);
+    }
+
+    #[test]
+    fn note_scan_hint_is_idempotent_and_returns_previous() {
+        let r = Routing::new();
+        let prefix: KeyPrefix = [10u8; 12];
+        let d1 = dev("mac-aa");
+        let d2 = dev("mac-bb");
+
+        assert_eq!(r.note_scan_hint(prefix, d1.clone()), None);
+        assert_eq!(r.scan_hint_for_prefix(&prefix).as_ref(), Some(&d1));
+        assert_eq!(r.snapshot().scan_hints, 1);
+
+        // Same device — no-op, returns the same device as "previous"
+        // so callers can detect the unchanged case if they need to.
+        assert_eq!(
+            r.note_scan_hint(prefix, d1.clone()),
+            Some(d1.clone()),
+            "re-noting the same device returns it as the previous mapping"
+        );
+        assert_eq!(r.snapshot().scan_hints, 1);
+
+        // Different device → replace, return old.
+        assert_eq!(r.note_scan_hint(prefix, d2.clone()), Some(d1));
+        assert_eq!(r.scan_hint_for_prefix(&prefix).as_ref(), Some(&d2));
+        assert_eq!(r.snapshot().scan_hints, 1);
+    }
+
+    #[test]
+    fn forget_scan_hint_is_idempotent() {
+        let r = Routing::new();
+        let prefix: KeyPrefix = [11u8; 12];
+        let d = dev("peer");
+        r.note_scan_hint(prefix, d);
+        assert_eq!(r.snapshot().scan_hints, 1);
+        r.forget_scan_hint(&prefix);
+        assert_eq!(r.snapshot().scan_hints, 0);
+        r.forget_scan_hint(&prefix); // no panic on missing
+        assert!(r.scan_hint_for_prefix(&prefix).is_none());
+    }
+
+    #[test]
+    fn scan_hint_is_independent_from_pipes() {
+        // Dial hints and live pipes live in orthogonal state. Recording
+        // a hint must not create a pipe entry, and opening a pipe must
+        // not create a hint. Keeps the authority model clean (§9.1 of
+        // the study doc): scan_hint is pre-authentication, pipes are
+        // post-dial.
+        let r = Routing::new();
+        let prefix: KeyPrefix = [12u8; 12];
+        let d = dev("peer-c");
+
+        r.note_scan_hint(prefix, d.clone());
+        assert_eq!(r.snapshot().pipes, 0);
+
+        let id = r.register_pipe(dev("mac-of-peer-c"), Direction::Outbound);
+        // scan_hint count unaffected by pipe registration.
+        assert_eq!(r.snapshot().scan_hints, 1);
+        r.evict_pipe(id);
+        // And pipe eviction doesn't affect scan_hint.
+        assert_eq!(r.snapshot().scan_hints, 1);
     }
 
     #[test]
