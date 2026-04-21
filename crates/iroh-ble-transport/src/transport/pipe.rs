@@ -4,6 +4,27 @@
 //! drops the GATT worker's forwarding senders (so it flushes and exits), and
 //! schedules a delayed abort after `L2CAP_HANDOVER_TIMEOUT` to bound the
 //! drain tail.
+//!
+//! ## Handover asymmetry (hardware-test bug fix)
+//!
+//! The two sides of a pair do NOT swap to L2CAP simultaneously. The
+//! peripheral accepts the incoming L2CAP the moment blew sees the
+//! channel; the central switches only after `open_l2cap_channel`
+//! returns. That gap is typically <500 ms but observed at ~270 ms with
+//! Phone/Desktop pairings in the first hardware test. If QUIC's TLS
+//! handshake is still in flight during this window, the central
+//! transmits `ClientFinished` over its (still-GATT) pipe while the
+//! peripheral has already swapped. The peripheral's supervisor would
+//! drop those GATT fragments and TLS never completes on the
+//! server side, surfacing as `Accepting incoming connection ended with
+//! error: timed out` after iroh's 15 s accept deadline.
+//!
+//! Fix: `ActiveWorker::L2cap` carries an optional `GattDrain` for
+//! `GATT_DRAIN_DEADLINE` after swap. During the drain, inbound GATT
+//! fragments still feed the old worker's `ReliableChannel` so they
+//! reassemble into datagrams and land on `incoming_tx` (the same sink
+//! as L2CAP data). Outbound always goes via the new L2CAP worker. The
+//! drain self-retires on deadline or on supervisor exit.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -49,6 +70,41 @@ use crate::transport::reliable::ReliableChannel;
 /// resolver calls `ReliableChannel::set_chunk_size` to bump this up.
 const INITIAL_CHUNK_SIZE: usize = (MIN_SANE_MTU as usize) - ATT_OVERHEAD;
 
+/// How long to keep the old GATT worker's receive path alive after a
+/// swap to L2CAP. Covers the window where the peer is still writing
+/// over GATT because its own L2CAP swap hasn't completed yet —
+/// typically sub-second, but hardware-observed up to ~300 ms with a
+/// conservative margin for slower radios and busy schedulers. Bounded
+/// so a stuck drain can't hold the pipe open forever.
+const GATT_DRAIN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Residual state for the old GATT worker during a peripheral-side
+/// L2CAP handover. Keeps the GATT worker's inbound reassembly path
+/// alive (not its outbound path — outbound goes to the new L2CAP
+/// worker) so in-flight QUIC/TLS fragments from a peer whose own
+/// swap hasn't completed still deliver cleanly. See the module
+/// docstring for the full failure mode.
+struct GattDrain {
+    /// Kept alive but unused during the drain. The GATT worker's
+    /// select loop exits on `outbound_rx.recv() == None`, so the
+    /// channel must stay open until the drain is retired; only then
+    /// do we drop it to release the worker cleanly.
+    _outbound_fwd_tx: mpsc::Sender<PendingSend>,
+    /// Forward inbound GATT fragments here during the drain window.
+    inbound_fwd_tx: mpsc::Sender<Bytes>,
+    /// Signals the GATT worker to tear down on drain retirement.
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// Lets the GATT worker's send loop notice teardown between ACK
+    /// waits without needing the shutdown oneshot to arrive mid-wait.
+    teardown_flag: Arc<AtomicBool>,
+    /// JoinHandle for the GATT supervisor/worker task. Awaited bounded
+    /// at retirement so the shutdown cascade doesn't leak.
+    handle: JoinHandle<()>,
+    /// Hard cap on drain lifetime regardless of activity. Retired when
+    /// `Instant::now() >= deadline`.
+    deadline: tokio::time::Instant,
+}
+
 enum ActiveWorker {
     Gatt {
         outbound_fwd_tx: mpsc::Sender<PendingSend>,
@@ -61,6 +117,9 @@ enum ActiveWorker {
         outbound_fwd_tx: mpsc::Sender<PendingSend>,
         teardown_flag: Arc<AtomicBool>,
         handle: JoinHandle<()>,
+        /// Optional drain of the old GATT worker during handover. See
+        /// `GattDrain`. `None` after the drain retires.
+        gatt_drain: Option<GattDrain>,
     },
 }
 
@@ -170,18 +229,51 @@ async fn run_pipe_supervisor(
             }
             maybe_bytes = inbound_rx.recv() => {
                 let Some(bytes) = maybe_bytes else { break; };
-                match &active {
+                match &mut active {
                     ActiveWorker::Gatt { inbound_fwd_tx, .. } => {
                         if inbound_fwd_tx.send(bytes).await.is_err() {
                             break;
                         }
                     }
-                    // Post-swap: L2CAP reads from its channel directly, and the
-                    // old GATT worker's inbound_fwd_tx was dropped with the old
-                    // ActiveWorker. Late GATT fragments are unrecoverable and
-                    // the drain tail can only flush already-queued outbound
-                    // ACKs, not new inbound work.
-                    ActiveWorker::L2cap { .. } => {}
+                    // Post-swap: L2CAP reads from its own channel directly,
+                    // but the peer may still be writing over GATT while its
+                    // own swap completes. Route these late fragments to the
+                    // drain's GATT worker so its ReliableChannel can
+                    // reassemble them into QUIC datagrams — otherwise TLS
+                    // handshake packets that land in this window are lost
+                    // and the server-side accept times out after 15 s.
+                    ActiveWorker::L2cap { gatt_drain: Some(drain), .. } => {
+                        if drain.inbound_fwd_tx.try_send(bytes).is_err() {
+                            // Drain's GATT worker exited early (channel
+                            // full or closed). Fragment is dropped; the
+                            // peer's ReliableChannel will retransmit.
+                            tracing::debug!(
+                                device = %device_id,
+                                "l2cap drain: dropping fragment, gatt worker gone or saturated"
+                            );
+                        }
+                    }
+                    ActiveWorker::L2cap { gatt_drain: None, .. } => {
+                        // Drain already retired; fragments past this point
+                        // cannot be reassembled (no ReliableChannel to
+                        // reassemble into). If they matter, the peer's
+                        // QUIC layer will retransmit via L2CAP.
+                        tracing::debug!(
+                            device = %device_id,
+                            "post-drain: dropping late GATT fragment (drain retired)"
+                        );
+                    }
+                }
+            }
+            () = wait_drain_deadline(&active) => {
+                if let ActiveWorker::L2cap { gatt_drain, .. } = &mut active
+                    && let Some(drain) = gatt_drain.take()
+                {
+                    tracing::debug!(
+                        device = %device_id,
+                        "l2cap drain: deadline reached, retiring gatt worker"
+                    );
+                    retire_gatt_drain(drain, device_id.clone(), L2CAP_HANDOVER_TIMEOUT);
                 }
             }
             maybe_chan = recv_swap(&mut swap_rx) => {
@@ -208,13 +300,19 @@ async fn run_pipe_supervisor(
                     last_rx_at.clone(),
                 );
                 let old = std::mem::replace(&mut active, new_active);
-                tracing::debug!(
-                    device = %device_id,
-                    old_path = "Gatt",
-                    new_path = "L2cap",
-                    "retiring old pipe after L2CAP handover"
-                );
-                spawn_drain_old_worker(old, device_id.clone(), L2CAP_HANDOVER_TIMEOUT);
+                let drain = gatt_drain_from_old(old);
+                if let (Some(drain), ActiveWorker::L2cap { gatt_drain, .. }) =
+                    (drain, &mut active)
+                {
+                    tracing::debug!(
+                        device = %device_id,
+                        old_path = "Gatt",
+                        new_path = "L2cap",
+                        drain_ms = GATT_DRAIN_DEADLINE.as_millis(),
+                        "swapped to L2CAP; keeping GATT worker alive for drain window"
+                    );
+                    *gatt_drain = Some(drain);
+                }
             }
         }
     }
@@ -237,8 +335,12 @@ async fn run_pipe_supervisor(
         ActiveWorker::L2cap {
             teardown_flag,
             handle,
+            gatt_drain,
             ..
         } => {
+            if let Some(drain) = gatt_drain {
+                retire_gatt_drain(drain, device_id.clone(), L2CAP_HANDOVER_TIMEOUT);
+            }
             teardown_flag.store(true, Ordering::Relaxed);
             handle
         }
@@ -253,6 +355,93 @@ async fn run_pipe_supervisor(
             "pipe supervisor: worker did not exit within handover timeout; aborted during teardown"
         );
     }
+}
+
+/// Resolves when the L2cap drain's deadline elapses. If the active
+/// worker is `Gatt` or the drain is already `None`, pends forever so
+/// the supervisor's `select!` arm is effectively disabled.
+async fn wait_drain_deadline(active: &ActiveWorker) {
+    match active {
+        ActiveWorker::L2cap {
+            gatt_drain: Some(drain),
+            ..
+        } => tokio::time::sleep_until(drain.deadline).await,
+        _ => std::future::pending().await,
+    }
+}
+
+/// Convert an old `ActiveWorker::Gatt` into a `GattDrain`. Keeps the
+/// outbound forward sender alive so the GATT worker's select loop
+/// does not exit on a closed outbound channel — the supervisor
+/// simply stops pushing new sends through it. Inbound reassembly and
+/// ACK plumbing stay live for the drain window so late fragments
+/// from a peer whose own L2CAP swap hasn't landed still deliver.
+/// Returns `None` if the input was already an L2cap worker
+/// (defensive; the swap path only fires from Gatt).
+fn gatt_drain_from_old(old: ActiveWorker) -> Option<GattDrain> {
+    match old {
+        ActiveWorker::Gatt {
+            outbound_fwd_tx,
+            inbound_fwd_tx,
+            shutdown_tx,
+            teardown_flag,
+            handle,
+        } => Some(GattDrain {
+            _outbound_fwd_tx: outbound_fwd_tx,
+            inbound_fwd_tx,
+            shutdown_tx: Some(shutdown_tx),
+            teardown_flag,
+            handle,
+            deadline: tokio::time::Instant::now() + GATT_DRAIN_DEADLINE,
+        }),
+        ActiveWorker::L2cap { .. } => None,
+    }
+}
+
+/// Tear down a GATT drain: signal shutdown, set teardown flag, and
+/// wait bounded for the worker to join. On deadline, abort.
+fn retire_gatt_drain(drain: GattDrain, device_id: blew::DeviceId, timeout: Duration) {
+    tokio::spawn(async move {
+        let GattDrain {
+            _outbound_fwd_tx,
+            inbound_fwd_tx,
+            mut shutdown_tx,
+            teardown_flag,
+            mut handle,
+            ..
+        } = drain;
+        // Drop both forward senders so the GATT worker's select loop
+        // observes outbound and inbound EOF; it breaks out and tears
+        // down. `_outbound_fwd_tx` was held only for this moment.
+        drop(_outbound_fwd_tx);
+        drop(inbound_fwd_tx);
+        teardown_flag.store(true, Ordering::Relaxed);
+        if let Some(s) = shutdown_tx.take() {
+            let _ = s.send(());
+        }
+        match tokio::time::timeout(timeout, &mut handle).await {
+            Ok(Ok(())) => {
+                tracing::debug!(
+                    device = %device_id,
+                    "gatt drain retired cleanly"
+                );
+            }
+            Ok(Err(join_err)) => {
+                tracing::debug!(
+                    device = %device_id,
+                    ?join_err,
+                    "gatt drain worker join error"
+                );
+            }
+            Err(_elapsed) => {
+                handle.abort();
+                tracing::debug!(
+                    device = %device_id,
+                    "gatt drain did not retire within timeout; aborted"
+                );
+            }
+        }
+    });
 }
 
 /// Poll the optional swap receiver. If `None`, never resolves — lets the
@@ -375,63 +564,8 @@ fn spawn_l2cap_worker(
         outbound_fwd_tx,
         teardown_flag,
         handle,
+        gatt_drain: None,
     }
-}
-
-fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout: Duration) {
-    tokio::spawn(async move {
-        // Dropping the forwarding senders closes the worker's input channels;
-        // the GATT worker's select loop then breaks, marks the ReliableChannel
-        // dead, and joins its send sub-task before returning. On timeout we
-        // abort the task — dropping the JoinHandle alone would only detach it,
-        // letting a wedged worker leak.
-        let mut handle = match old {
-            ActiveWorker::Gatt {
-                shutdown_tx,
-                teardown_flag,
-                handle,
-                ..
-            } => {
-                teardown_flag.store(true, Ordering::Relaxed);
-                let _ = shutdown_tx.send(());
-                handle
-            }
-            ActiveWorker::L2cap {
-                teardown_flag,
-                handle,
-                ..
-            } => {
-                teardown_flag.store(true, Ordering::Relaxed);
-                handle
-            }
-        };
-        match tokio::time::timeout(timeout, &mut handle).await {
-            Ok(Ok(())) => {
-                tracing::debug!(
-                    device = %device_id,
-                    "old pipe worker drained cleanly during teardown"
-                );
-            }
-            Ok(Err(join_err)) => {
-                tracing::debug!(
-                    device = %device_id,
-                    ?join_err,
-                    "old pipe worker join error during teardown"
-                );
-            }
-            Err(_elapsed) => {
-                handle.abort();
-                // The abort is the recovery path — we don't leak the worker
-                // and the new pipe is already serving traffic. Happens when
-                // the old GATT worker still has in-flight ACK-waits at swap
-                // time; not actionable, so debug rather than warn.
-                tracing::debug!(
-                    device = %device_id,
-                    "old pipe worker did not drain within handover timeout; aborted during teardown"
-                );
-            }
-        }
-    });
 }
 
 #[allow(clippy::too_many_arguments)]

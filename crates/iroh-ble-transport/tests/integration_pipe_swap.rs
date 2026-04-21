@@ -147,6 +147,112 @@ async fn swap_to_l2cap_does_not_deadlock_and_routes_subsequent_sends() {
     let _ = tokio::time::timeout(Duration::from_secs(3), pipe_handle).await;
 }
 
+/// Build a single-fragment ReliableChannel frame: `[seq|FIRST|LAST][ack=0][payload][canary]`.
+/// The canary is the `0x5A` sentinel the receiver validates and strips.
+fn make_reliable_fragment(seq: u8, payload: &[u8]) -> Bytes {
+    let mut out = Vec::with_capacity(2 + payload.len() + 1);
+    // FIRST | LAST | seq&0x0F — single-fragment datagram.
+    out.push(0x30 | (seq & 0x0F));
+    // ACK byte zeroed — no piggybacked ACK.
+    out.push(0x00);
+    out.extend_from_slice(payload);
+    // Canary sentinel.
+    out.push(0x5A);
+    Bytes::from(out)
+}
+
+/// Regression test for the "Accepting incoming connection ended with
+/// error: timed out" failure mode from the first hardware test.
+///
+/// The peripheral-side L2CAP swap can race ahead of the central-side
+/// swap by a few hundred ms. During that window, the central writes
+/// QUIC handshake bytes (e.g. ClientFinished) over its still-GATT
+/// pipe. Before this fix, the peripheral's pipe supervisor silently
+/// dropped those GATT fragments because the active worker was
+/// already L2CAP — TLS never completed and iroh's accept timed out.
+///
+/// The fix keeps the old GATT worker's inbound reassembly alive for
+/// `GATT_DRAIN_DEADLINE` (3s) after swap. This test feeds a valid
+/// reliable fragment BEFORE the swap and another AFTER the swap,
+/// verifying that BOTH reassemble into datagrams on `incoming_tx`.
+/// A regression here surfaces as the post-swap datagram going
+/// missing.
+#[tokio::test(flavor = "multi_thread")]
+async fn post_swap_gatt_fragments_still_reassemble_during_drain_window() {
+    let iface = Arc::new(MockBleInterface::new());
+    let (outbound_tx, outbound_rx) = mpsc::channel::<PendingSend>(4);
+    let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(8);
+    let (incoming_tx, mut incoming_rx) = mpsc::channel::<IncomingPacket>(8);
+    let (registry_tx, _registry_rx) = mpsc::channel::<PeerCommand>(4);
+    let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
+
+    let device_id = blew::DeviceId::from("drain-test");
+    let pipe_handle = tokio::spawn(run_data_pipe(
+        iface.clone() as Arc<dyn BleInterface>,
+        device_id.clone(),
+        iroh_ble_transport::transport::routing_v2::StableConnId::for_test(3),
+        // Peripheral role is where the original bug bit — mirror it here.
+        ConnectRole::Peripheral,
+        ConnectPath::Gatt,
+        None,
+        outbound_rx,
+        inbound_rx,
+        incoming_tx,
+        registry_tx,
+        swap_rx,
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+        LivenessClock::new(),
+    ));
+
+    // Pre-swap: deliver fragment seq=0 via inbound_rx. The GATT worker's
+    // ReliableChannel should reassemble and forward as a datagram on
+    // incoming_tx.
+    inbound_tx
+        .send(make_reliable_fragment(0, b"pre-swap"))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+        .await
+        .expect("pre-swap datagram timed out")
+        .expect("incoming_rx closed");
+    assert_eq!(first.data.as_ref(), b"pre-swap");
+
+    // Swap to L2CAP. The new L2CAP worker starts; the old GATT worker
+    // stays alive in drain mode.
+    let (central_side, _peripheral_side) = blew::L2capChannel::pair(8192);
+    swap_tx.send(central_side).await.unwrap();
+
+    // Small sleep so the swap message is processed before we push the
+    // post-swap fragment. Without this there's a rare race where the
+    // fragment arrives before the supervisor processes swap_rx.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Post-swap: deliver fragment seq=1 via inbound_rx. Before the fix,
+    // the supervisor would route this into the L2cap arm and drop it.
+    // With the drain alive, it reaches the old GATT worker's
+    // ReliableChannel and reassembles.
+    inbound_tx
+        .send(make_reliable_fragment(1, b"post-swap-drain"))
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(2), incoming_rx.recv())
+        .await
+        .expect(
+            "post-swap datagram timed out — GATT drain is not reassembling late fragments; \
+             if this fires, the L2CAP handover race is back",
+        )
+        .expect("incoming_rx closed");
+    assert_eq!(second.data.as_ref(), b"post-swap-drain");
+
+    // Tear down.
+    drop(outbound_tx);
+    drop(swap_tx);
+    drop(inbound_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(3), pipe_handle).await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn supervisor_shuts_down_cleanly_on_outbound_close() {
     let iface = Arc::new(MockBleInterface::new());
