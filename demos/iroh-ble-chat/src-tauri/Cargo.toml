@@ -58,3 +58,17 @@ tauri-plugin-barcode-scanner = "2"
 
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSDictionary",
+    "NSNotification",
+    "NSObject",
+    "NSString",
+    "NSValue",
+    "NSGeometry",
+] }
+objc2-ui-kit = { version = "0.3", features = [
+    "UIResponder",
+    "UIView",
+] }
+objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
+block2 = "0.6"

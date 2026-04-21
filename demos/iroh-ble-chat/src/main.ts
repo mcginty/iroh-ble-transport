@@ -833,44 +833,11 @@ const KEYBOARD_MIN_OCCLUSION_PX = 120;
       root.style.removeProperty("--app-height");
     }
     setSafeBottom(open);
-    // iOS WKWebView's keyboard handler sometimes scrolls the whole page
-    // up to reveal a focused input. Our vv resize already put the input
-    // above the keyboard, so any scroll is unwanted: snap it back.
-    if (window.scrollX !== 0 || window.scrollY !== 0) {
-      window.scrollTo(0, 0);
-    }
   };
 
   vv.addEventListener("resize", update);
   vv.addEventListener("scroll", update);
   update();
-
-  // iOS decides whether to auto-scroll to reveal a focused input
-  // synchronously during focus. Setting opacity to 0 *inside the focus
-  // handler itself* (synchronously, before the handler returns) makes
-  // WebKit's visibility check fail, so it skips the scroll. A microtask
-  // later we restore opacity — the blink is one paint frame at most and
-  // imperceptible to the user. Gist method 1, via JS rather than CSS so
-  // the style mutation is synchronous. We run in the capture phase to
-  // get ahead of anything else that might read focus.
-  document.addEventListener("focus", (e) => {
-    const el = e.target as HTMLElement | null;
-    if (!el || (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")) return;
-    el.style.opacity = "0";
-    setTimeout(() => {
-      el.style.opacity = "";
-    });
-  }, true);
-
-  // Belt-and-suspenders: if WebKit still manages to scroll, snap back on
-  // the very next frame.
-  document.addEventListener("focusin", () => {
-    requestAnimationFrame(() => {
-      if (window.scrollX !== 0 || window.scrollY !== 0) {
-        window.scrollTo(0, 0);
-      }
-    });
-  });
 })();
 
 msgInput.addEventListener("focus", () => {
