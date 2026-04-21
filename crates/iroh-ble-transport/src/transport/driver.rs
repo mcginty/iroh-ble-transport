@@ -316,6 +316,12 @@ impl<I: BleInterface> Driver<I> {
                 let routing_v1 = Arc::clone(&self.routing_v1);
                 let direction = direction_for_role(role);
                 let stable_id = routing_v2.register_pipe(device_id.clone(), direction);
+                // Step 4a: enter the pending pool. target_endpoint=None
+                // here; step 4c's resolver rewrite will pre-register
+                // outbound pendings with Some(target) when the resolver
+                // triggers a dial. For now every pipe starts with no
+                // known target.
+                routing_v2.register_pending(stable_id, None);
                 // Install the StableConnId as a device-keyed token so
                 // poll_send can resolve the CustomAddr that poll_recv
                 // will stamp on inbound packets from this pipe.
@@ -340,6 +346,12 @@ impl<I: BleInterface> Driver<I> {
                         pipe_last_rx_at,
                     )
                     .await;
+                    // Order matters: drop the pool entry before the
+                    // pipe itself so the pool never references a
+                    // non-existent pipe, and uninstall the v1 token
+                    // last so inbound packets that raced the exit
+                    // still have a valid resolution during teardown.
+                    routing_v2.evict_pipe_state(stable_id);
                     routing_v2.evict_pipe(stable_id);
                     routing_v1.uninstall_stable_conn_token(token_for_uninstall);
                 });
@@ -395,6 +407,10 @@ impl<I: BleInterface> Driver<I> {
                 let routing_v1 = Arc::clone(&self.routing_v1);
                 let direction = direction_for_role(role);
                 let stable_id = routing_v2.register_pipe(device_id.clone(), direction);
+                // Same pool accounting as StartDataPipe — reverting to
+                // GATT starts a fresh pending entry (the old pipe's
+                // pending/routable was evicted on its exit).
+                routing_v2.register_pending(stable_id, None);
                 routing_v1.install_stable_conn_token(stable_id.as_u64(), device_id.clone());
                 let token_for_uninstall = stable_id.as_u64();
                 tokio::spawn(async move {
@@ -416,6 +432,7 @@ impl<I: BleInterface> Driver<I> {
                         pipe_last_rx_at,
                     )
                     .await;
+                    routing_v2.evict_pipe_state(stable_id);
                     routing_v2.evict_pipe(stable_id);
                     routing_v1.uninstall_stable_conn_token(token_for_uninstall);
                 });
@@ -978,6 +995,86 @@ mod tests {
         })
         .await
         .expect("v1 routing must uninstall the token when the pipe worker exits");
+    }
+
+    #[tokio::test]
+    async fn start_data_pipe_registers_pending_and_evicts_on_close() {
+        // Step 4a contract: StartDataPipe adds the new pipe to the
+        // pending pool with target_endpoint=None; pipe close evicts
+        // from whichever pool (pending or routable) held it. Without
+        // this, step 4b's promotion rule would see no pending entry
+        // to promote, and step 4c's resolver wouldn't find the pipe.
+        use crate::transport::peer::{ConnectPath, ConnectRole};
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::clone(&routing_v2),
+            Arc::new(crate::transport::routing::TransportRouting::new()),
+        );
+
+        assert_eq!(routing_v2.snapshot().pending, 0);
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: blew::DeviceId::from("pending-peer"),
+                tx_gen: 1,
+                role: ConnectRole::Central,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+
+        assert_eq!(
+            routing_v2.snapshot().pending,
+            1,
+            "StartDataPipe must register the pipe as pending"
+        );
+        let pipes = routing_v2.pipes_for_debug();
+        assert_eq!(pipes.len(), 1);
+        let pipe_id = pipes[0].id;
+
+        // Drive the pipe to exit and watch both pipes + pending drain.
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (outbound_tx, inbound_tx) = match cmd {
+            PeerCommand::DataPipeReady {
+                outbound_tx,
+                inbound_tx,
+                ..
+            } => (outbound_tx, inbound_tx),
+            other => panic!("expected DataPipeReady, got {other:?}"),
+        };
+        drop(outbound_tx);
+        drop(inbound_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snap = routing_v2.snapshot();
+                if snap.pending == 0 && snap.pipes == 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pipe close must evict both pending and pipe entries");
+
+        // The pipe id is non-reusable regardless — invariant from step
+        // 1 — and the routable pool stays empty too (no hook fired).
+        assert_eq!(routing_v2.snapshot().routable, 0);
+        let _ = pipe_id; // just a reference for future debugging
     }
 
     #[tokio::test]

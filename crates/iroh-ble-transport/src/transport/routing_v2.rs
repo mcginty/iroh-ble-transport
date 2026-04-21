@@ -96,6 +96,33 @@ pub struct Pipe {
     pub created_at: Instant,
 }
 
+/// A pipe that exists but whose iroh-TLS identity hasn't been verified
+/// yet. Promotes to `Routable` (and leaves the pending pool) when
+/// `after_handshake` runs the promotion rule and accepts — see step 4b.
+#[derive(Debug, Clone)]
+pub struct Pending {
+    pub pipe: StableConnId,
+    /// `Some(endpoint_id)` when we know what the outbound dial is
+    /// targeting (set by the resolver in step 4c). `None` for inbound
+    /// accepts — we only learn their target at `after_handshake`.
+    pub target_endpoint: Option<EndpointId>,
+    pub created_at: Instant,
+}
+
+/// A pipe whose iroh-TLS handshake has completed, binding it to an
+/// authenticated `EndpointId`. The `routable` pool is the only
+/// structure that drives routing decisions — see the authority model
+/// in §9.1 of the study doc.
+#[derive(Debug, Clone)]
+pub struct Routable {
+    pub pipe: StableConnId,
+    pub endpoint_id: EndpointId,
+    /// Observer-independent "who dialed" — materialized at promotion
+    /// time from `(self_endpoint, remote_endpoint, direction)`.
+    pub dialer: Dialer,
+    pub verified_at: Instant,
+}
+
 /// Shadow routing table. Step 1: tracks pipes only. Future steps add
 /// `pending`, `routable`, `scan_hint`, resolver wakers, token payloads.
 #[derive(Debug, Default)]
@@ -114,6 +141,14 @@ struct RoutingInner {
     /// never an authority for routing (see authority model in §9.1 of
     /// the study doc).
     scan_hint: HashMap<KeyPrefix, DeviceId>,
+    /// Pipes that exist but haven't been authenticated yet. Mutually
+    /// exclusive with `routable` — a pipe is in exactly one pool at
+    /// any moment (or neither, briefly, during promotion transitions).
+    pending: HashMap<StableConnId, Pending>,
+    /// Pipes bound to an authenticated `EndpointId`. At most one
+    /// entry per peer (invariant enforced by the promotion rule in
+    /// step 4b).
+    routable: HashMap<EndpointId, Routable>,
 }
 
 impl Routing {
@@ -177,6 +212,8 @@ impl Routing {
         RoutingSnapshot {
             pipes: inner.pipes.len(),
             scan_hints: inner.scan_hint.len(),
+            pending: inner.pending.len(),
+            routable: inner.routable.len(),
         }
     }
 
@@ -226,6 +263,113 @@ impl Routing {
     pub fn scan_hint_for_prefix(&self, prefix: &KeyPrefix) -> Option<DeviceId> {
         self.inner.lock().scan_hint.get(prefix).cloned()
     }
+
+    // ---------- pending / routable pool bookkeeping (step 4a) ----------
+
+    /// Register a newly-opened pipe as pending. Called by the driver
+    /// right after `register_pipe`. `target_endpoint` is `Some(id)` for
+    /// outbound pipes that came from a resolver dial (step 4c wires
+    /// this) and `None` for inbound accepts.
+    pub fn register_pending(&self, pipe: StableConnId, target_endpoint: Option<EndpointId>) {
+        let mut inner = self.inner.lock();
+        inner.pending.insert(
+            pipe,
+            Pending {
+                pipe,
+                target_endpoint,
+                created_at: Instant::now(),
+            },
+        );
+        tracing::trace!(%pipe, ?target_endpoint, "routing_v2: pending registered");
+    }
+
+    /// Remove a pending entry. Called when a pipe closes before
+    /// promotion (or when the promotion rule explicitly rejects it).
+    /// Idempotent.
+    pub fn evict_pending(&self, pipe: StableConnId) -> Option<Pending> {
+        self.inner.lock().pending.remove(&pipe)
+    }
+
+    /// Insert (or replace) a routable entry for `endpoint_id`. Step 4b
+    /// calls this from the promotion rule after `decide()` returns
+    /// `Accept`/`AcceptEvictingAll`. Direct test-only callers should
+    /// drive the promote API instead.
+    pub fn insert_routable(
+        &self,
+        endpoint_id: EndpointId,
+        pipe: StableConnId,
+        dialer: Dialer,
+    ) -> Option<Routable> {
+        let mut inner = self.inner.lock();
+        inner.pending.remove(&pipe);
+        inner.routable.insert(
+            endpoint_id,
+            Routable {
+                pipe,
+                endpoint_id,
+                dialer,
+                verified_at: Instant::now(),
+            },
+        )
+    }
+
+    /// Remove the routable entry for an endpoint, if any. Returns the
+    /// removed entry so the caller can cascade-evict the pipe.
+    pub fn evict_routable(&self, endpoint_id: &EndpointId) -> Option<Routable> {
+        self.inner.lock().routable.remove(endpoint_id)
+    }
+
+    /// Evict whichever pool (if any) holds `pipe`. Called from the
+    /// driver's pipe-close path — the pipe is about to disappear, so
+    /// clean up both pools uniformly. Returns `true` if an entry was
+    /// removed.
+    pub fn evict_pipe_state(&self, pipe: StableConnId) -> bool {
+        let mut inner = self.inner.lock();
+        let pending_removed = inner.pending.remove(&pipe).is_some();
+        // Routable is keyed on EndpointId; reverse-lookup by pipe.
+        let routable_endpoint = inner
+            .routable
+            .iter()
+            .find(|(_, r)| r.pipe == pipe)
+            .map(|(k, _)| *k);
+        let routable_removed = if let Some(ep) = routable_endpoint {
+            inner.routable.remove(&ep).is_some()
+        } else {
+            false
+        };
+        pending_removed || routable_removed
+    }
+
+    /// Look up the pipe currently authoritatively routable for an
+    /// endpoint. Step 4c's resolver consults this first.
+    #[must_use]
+    pub fn routable_pipe_for(&self, endpoint_id: &EndpointId) -> Option<StableConnId> {
+        self.inner.lock().routable.get(endpoint_id).map(|r| r.pipe)
+    }
+
+    /// Look up a pending pipe whose target matches this endpoint. Step
+    /// 4c consults this as a secondary source when the resolver can't
+    /// find a routable entry.
+    #[must_use]
+    pub fn pending_pipe_for(&self, endpoint_id: &EndpointId) -> Option<StableConnId> {
+        self.inner
+            .lock()
+            .pending
+            .values()
+            .find(|p| p.target_endpoint.as_ref() == Some(endpoint_id))
+            .map(|p| p.pipe)
+    }
+
+    /// Debug helpers for tests.
+    #[cfg(test)]
+    pub(crate) fn pending_len(&self) -> usize {
+        self.inner.lock().pending.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn routable_len(&self) -> usize {
+        self.inner.lock().routable.len()
+    }
 }
 
 /// Counts-only view of the shadow routing state. Does not leak any
@@ -235,6 +379,8 @@ impl Routing {
 pub struct RoutingSnapshot {
     pub pipes: usize,
     pub scan_hints: usize,
+    pub pending: usize,
+    pub routable: usize,
 }
 
 #[cfg(test)]
@@ -370,6 +516,130 @@ mod tests {
         r.evict_pipe(id);
         // And pipe eviction doesn't affect scan_hint.
         assert_eq!(r.snapshot().scan_hints, 1);
+    }
+
+    fn test_endpoint(seed: u8) -> EndpointId {
+        iroh_base::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    // ---------- pending / routable pool bookkeeping (step 4a) ----------
+
+    #[test]
+    fn register_pending_records_entry() {
+        let r = Routing::new();
+        let id = r.register_pipe(dev("p"), Direction::Outbound);
+        assert_eq!(r.pending_len(), 0);
+        r.register_pending(id, None);
+        assert_eq!(r.pending_len(), 1);
+        assert_eq!(r.snapshot().pending, 1);
+    }
+
+    #[test]
+    fn register_pending_with_target_is_findable_by_endpoint() {
+        let r = Routing::new();
+        let id = r.register_pipe(dev("p"), Direction::Outbound);
+        let ep = test_endpoint(1);
+        r.register_pending(id, Some(ep));
+        assert_eq!(r.pending_pipe_for(&ep), Some(id));
+        // Unknown endpoint doesn't match.
+        assert_eq!(r.pending_pipe_for(&test_endpoint(2)), None);
+    }
+
+    #[test]
+    fn evict_pending_removes_entry() {
+        let r = Routing::new();
+        let id = r.register_pipe(dev("p"), Direction::Outbound);
+        r.register_pending(id, None);
+        assert!(r.evict_pending(id).is_some());
+        assert_eq!(r.pending_len(), 0);
+        assert!(r.evict_pending(id).is_none(), "idempotent");
+    }
+
+    #[test]
+    fn insert_routable_removes_pending_and_keys_by_endpoint() {
+        let r = Routing::new();
+        let id = r.register_pipe(dev("p"), Direction::Outbound);
+        let ep = test_endpoint(3);
+        r.register_pending(id, Some(ep));
+        assert_eq!(r.pending_len(), 1);
+
+        let prev = r.insert_routable(ep, id, Dialer::Low);
+        assert!(prev.is_none(), "no prior routable");
+        assert_eq!(r.pending_len(), 0, "promotion removes the pending entry");
+        assert_eq!(r.routable_len(), 1);
+        assert_eq!(r.routable_pipe_for(&ep), Some(id));
+    }
+
+    #[test]
+    fn insert_routable_returns_previous_entry_on_replace() {
+        let r = Routing::new();
+        let ep = test_endpoint(4);
+        let old = r.register_pipe(dev("old"), Direction::Outbound);
+        let new = r.register_pipe(dev("new"), Direction::Outbound);
+
+        r.insert_routable(ep, old, Dialer::Low);
+        let prev = r.insert_routable(ep, new, Dialer::High);
+        assert!(prev.is_some());
+        assert_eq!(prev.unwrap().pipe, old);
+        assert_eq!(r.routable_pipe_for(&ep), Some(new));
+        assert_eq!(r.routable_len(), 1, "routable uniqueness invariant");
+    }
+
+    #[test]
+    fn evict_pipe_state_removes_from_whichever_pool() {
+        let r = Routing::new();
+        let ep = test_endpoint(5);
+
+        // Pipe A: routable.
+        let a = r.register_pipe(dev("a"), Direction::Outbound);
+        r.insert_routable(ep, a, Dialer::Low);
+        assert!(r.evict_pipe_state(a), "routable removed");
+        assert_eq!(r.routable_len(), 0);
+
+        // Pipe B: pending.
+        let b = r.register_pipe(dev("b"), Direction::Outbound);
+        r.register_pending(b, None);
+        assert!(r.evict_pipe_state(b), "pending removed");
+        assert_eq!(r.pending_len(), 0);
+
+        // Pipe C: in neither pool.
+        let c = r.register_pipe(dev("c"), Direction::Outbound);
+        assert!(
+            !r.evict_pipe_state(c),
+            "no pool entry — evict_pipe_state returns false, no panic"
+        );
+    }
+
+    #[test]
+    fn routable_pipe_for_returns_none_for_unknown_endpoint() {
+        let r = Routing::new();
+        assert!(r.routable_pipe_for(&test_endpoint(9)).is_none());
+    }
+
+    #[test]
+    fn pools_are_independent_of_pipes_map() {
+        // The pipes map tracks "a pipe exists right now." The pending
+        // and routable pools track "how is this pipe classified for
+        // routing purposes." Authority-model invariant: these are
+        // orthogonal dimensions.
+        let r = Routing::new();
+        let id = r.register_pipe(dev("x"), Direction::Outbound);
+        assert_eq!(r.snapshot().pipes, 1);
+        assert_eq!(r.snapshot().pending, 0);
+        assert_eq!(r.snapshot().routable, 0);
+
+        r.register_pending(id, None);
+        assert_eq!(r.snapshot().pipes, 1);
+        assert_eq!(r.snapshot().pending, 1);
+
+        r.evict_pipe(id);
+        // Evicting the pipe does NOT automatically clean up the pool
+        // entry; the driver is responsible for calling evict_pipe_state
+        // first. This asymmetry is deliberate: it keeps the routing
+        // layer unopinionated about lifecycle ordering, and the driver
+        // has the complete picture.
+        assert_eq!(r.snapshot().pipes, 0);
+        assert_eq!(r.snapshot().pending, 1);
     }
 
     #[test]
