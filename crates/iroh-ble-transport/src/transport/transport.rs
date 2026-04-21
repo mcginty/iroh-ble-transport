@@ -444,6 +444,18 @@ impl BleTransport {
         self.routing.device_for_endpoint(endpoint_id)
     }
 
+    /// Returns `true` if the local scan has recently surfaced this
+    /// peer's key prefix. Step 8 of the redesign: callers gate
+    /// `join_peers`-style reconnect nudges on this so we don't pin
+    /// cached peers that aren't currently in range. Surfaces only
+    /// what `routing_v2`'s scan_hint holds; no authority claim beyond
+    /// "advertisement seen at some point this session."
+    #[must_use]
+    pub fn has_scan_hint_for_endpoint(&self, endpoint_id: &EndpointId) -> bool {
+        let prefix = crate::transport::routing::prefix_from_endpoint(endpoint_id);
+        self.routing_v2.scan_hint_for_prefix(&prefix).is_some()
+    }
+
     /// Public-facing peer snapshot. Filters out `Unknown` (pre-state internal
     /// construction) and `Dead` (tombstones kept around for `DEAD_GC_TTL`
     /// dedup) so the returned list only contains peers that are actionable

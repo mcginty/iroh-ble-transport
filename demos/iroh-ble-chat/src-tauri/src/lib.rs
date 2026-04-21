@@ -800,7 +800,17 @@ async fn reconnect_tick(state: Arc<Mutex<AppState>>) {
         let Some(sender) = st.gossip_sender.clone() else {
             continue;
         };
-        let targets = collect_join_targets(st.own_id(), &st.peers, load_known_peers(&st.cache_dir));
+        let ble_transport = st.ble_transport.clone();
+        let targets = collect_join_targets(
+            st.own_id(),
+            &st.peers,
+            load_known_peers(&st.cache_dir),
+            |peer_id| {
+                ble_transport
+                    .as_ref()
+                    .is_some_and(|bt| bt.has_scan_hint_for_endpoint(peer_id))
+            },
+        );
         drop(st);
 
         if targets.is_empty() {
@@ -870,10 +880,11 @@ fn should_nudge_join_periodic(gossip: Option<GossipStatus>) -> bool {
     !matches!(gossip, Some(GossipStatus::Direct))
 }
 
-fn collect_join_targets(
+fn collect_join_targets<F: Fn(&EndpointId) -> bool>(
     own_id: EndpointId,
     peers: &HashMap<EndpointId, PeerState>,
     known_peers: Vec<EndpointId>,
+    is_in_scan: F,
 ) -> Vec<EndpointId> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
@@ -886,7 +897,19 @@ fn collect_join_targets(
         if !seen.insert(peer_id) {
             continue;
         }
-        if should_nudge_join_periodic(peers.get(&peer_id).and_then(|peer| peer.gossip)) {
+        let peer = peers.get(&peer_id);
+        // Step 8: a peer that's only in the cached known_peers list
+        // (never observed this session) is eligible for gossip
+        // bootstrap *only* if scan has just surfaced its prefix.
+        // Otherwise gossip's internal dial retries keep spewing
+        // "Internal consistency error" for 60 s per peer that simply
+        // isn't nearby. Peers we've already observed this session
+        // stay in the targets list regardless of scan visibility so
+        // reconnect_tick still recovers flapping links.
+        if peer.is_none() && !is_in_scan(&peer_id) {
+            continue;
+        }
+        if should_nudge_join_periodic(peer.and_then(|peer| peer.gossip)) {
             targets.push(peer_id);
         }
     }
@@ -993,13 +1016,68 @@ mod tests {
 
         peers.insert(unknown_id, new_peer_entry(unknown_id));
 
+        // Every peer is in `peers`, so the scan filter is irrelevant
+        // here — verifies the existing dedup + Direct-filter behavior.
         let targets = collect_join_targets(
             own_id,
             &peers,
             vec![own_id, direct_id, in_topic_id, unknown_id, in_topic_id],
+            |_| false,
         );
 
         assert_eq!(targets, vec![in_topic_id, unknown_id]);
+    }
+
+    #[test]
+    fn collect_join_targets_filters_cached_only_peers_by_scan_visibility() {
+        // A peer that's in the cached known_peers list but hasn't been
+        // observed this session (not in the `peers` map) is gated on
+        // the scan filter: included when scan sees its prefix, skipped
+        // otherwise. This is the step-8 F5 mitigation — gossip shouldn't
+        // pound on dial retries for cached peers who aren't nearby.
+        let own_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let nearby_cached = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
+        let absent_cached = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+
+        let peers = HashMap::new(); // nothing observed this session
+        let known = vec![nearby_cached, absent_cached];
+
+        let targets = collect_join_targets(own_id, &peers, known.clone(), |peer_id| {
+            *peer_id == nearby_cached
+        });
+        assert_eq!(
+            targets,
+            vec![nearby_cached],
+            "cached peer visible in scan is included; absent peer is filtered out"
+        );
+
+        // When the scan filter says nothing is visible, no cached peer
+        // makes it through — this is the cold-start invariant: empty
+        // targets instead of a storm of failing dials.
+        let empty = collect_join_targets(own_id, &peers, known, |_| false);
+        assert!(
+            empty.is_empty(),
+            "no scan visibility → no cached peers bootstrapped"
+        );
+    }
+
+    #[test]
+    fn collect_join_targets_ignores_scan_filter_for_session_peers() {
+        // Peers we've already observed in this session (i.e., in the
+        // `peers` map) stay eligible for reconnect regardless of
+        // current scan visibility. Otherwise a transient scan gap
+        // would starve reconnect_tick during an ACL flap.
+        let own_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let observed = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+
+        let mut peers = HashMap::new();
+        let mut state = new_peer_entry(observed);
+        state.gossip = Some(GossipStatus::Stale);
+        peers.insert(observed, state);
+
+        // Scan filter returns false (peer momentarily invisible).
+        let targets = collect_join_targets(own_id, &peers, vec![observed], |_| false);
+        assert_eq!(targets, vec![observed]);
     }
 
     #[test]
@@ -1373,7 +1451,12 @@ async fn send_message(
     let own_id = st.own_id();
     let nickname = st.nickname.clone();
     let known_peers = load_known_peers(&st.cache_dir);
-    let join_targets = collect_join_targets(own_id, &st.peers, known_peers.clone());
+    let ble_transport = st.ble_transport.clone();
+    let join_targets = collect_join_targets(own_id, &st.peers, known_peers.clone(), |peer_id| {
+        ble_transport
+            .as_ref()
+            .is_some_and(|bt| bt.has_scan_hint_for_endpoint(peer_id))
+    });
     let join_target_summary = summarize_join_targets(&st.peers, &join_targets);
     let direct_peers = st
         .peers
