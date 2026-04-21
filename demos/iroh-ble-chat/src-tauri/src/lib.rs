@@ -775,6 +775,10 @@ async fn bandwidth_tick(app: AppHandle, transport: Arc<BleTransport>) {
         let truncation_delta = now.truncations.saturating_sub(prev.truncations);
         let tx_kbps = (tx_delta as f64 * 8.0 / 1000.0) / elapsed;
         let rx_kbps = (rx_delta as f64 * 8.0 / 1000.0) / elapsed;
+        // routing_v2 counts: surfaces pending/routable/reservations
+        // for the debug panel during hardware testing. Small enough
+        // to ship with every bandwidth tick; counts are read-through.
+        let snap = transport.routing_v2_snapshot();
         let _ = app.emit(
             "bandwidth",
             serde_json::json!({
@@ -782,6 +786,11 @@ async fn bandwidth_tick(app: AppHandle, transport: Arc<BleTransport>) {
                 "rx_kbps": rx_kbps,
                 "retransmits": retransmit_delta,
                 "truncations": truncation_delta,
+                "v2_pipes": snap.pipes,
+                "v2_scan_hints": snap.scan_hints,
+                "v2_pending": snap.pending,
+                "v2_routable": snap.routable,
+                "v2_reservations": snap.reservations,
             }),
         );
         prev = now;

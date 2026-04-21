@@ -116,7 +116,11 @@ impl EndpointHooks for BleDedupHook {
                     };
                 }
                 PromoteOutcome::Accepted { evicted } => {
-                    tracing::debug!(
+                    // Info: one per peer per handshake — this is the
+                    // moment a peer becomes authoritatively routable
+                    // in v2. Lifecycle-sized cadence, very useful for
+                    // cross-referencing with symmetric-dial rejects.
+                    tracing::info!(
                         %remote_endpoint,
                         %stable_id,
                         evicted_count = evicted.len(),

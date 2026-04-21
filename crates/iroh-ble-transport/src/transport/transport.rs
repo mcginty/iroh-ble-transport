@@ -840,7 +840,11 @@ fn yield_stable(
 ) -> Poll<Option<Result<Item, address_lookup::Error>>> {
     this.emitted = true;
     let token = stable_id.as_u64();
-    tracing::info!(
+    // Debug level: fires on every `Endpoint::connect` / `gossip.join_peers`
+    // resolve, which is per-peer, per-reconnect-tick. Not lifecycle
+    // enough to warrant info. The downstream "bound pipe to resolver
+    // reservation" log in driver.rs carries the actual outcome.
+    tracing::debug!(
         endpoint_id = %this.endpoint_id,
         %stable_id,
         source,

@@ -256,6 +256,7 @@ impl Routing {
             scan_hints: inner.scan_hint.len(),
             pending: inner.pending.len(),
             routable: inner.routable.len(),
+            reservations: inner.reservations.len(),
         }
     }
 
@@ -816,13 +817,15 @@ pub struct RoutableSnapshot {
 
 /// Counts-only view of the shadow routing state. Does not leak any
 /// identifiers; callers that need identifiers take the explicit
-/// `pipes_for_debug` path.
+/// `pipes_for_debug` path. Includes `reservations` so the chat app's
+/// debug panel can show outstanding resolver promises to iroh.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoutingSnapshot {
     pub pipes: usize,
     pub scan_hints: usize,
     pub pending: usize,
     pub routable: usize,
+    pub reservations: usize,
 }
 
 #[cfg(test)]

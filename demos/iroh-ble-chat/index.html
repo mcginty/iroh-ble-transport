@@ -114,6 +114,13 @@
                             <div id="ble-peers-list" class="ble-peers-list">
                                 <!-- Populated by JS -->
                             </div>
+                            <div id="routing-v2-counts" class="routing-v2-counts" title="routing_v2 state snapshot — pipes / pending / routable / reservations / scan_hints">
+                                <span class="rv2-label">pipes</span><span id="rv2-pipes" class="rv2-val">0</span>
+                                <span class="rv2-label">pend</span><span id="rv2-pending" class="rv2-val">0</span>
+                                <span class="rv2-label">route</span><span id="rv2-routable" class="rv2-val">0</span>
+                                <span class="rv2-label">resv</span><span id="rv2-reservations" class="rv2-val">0</span>
+                                <span class="rv2-label">scan</span><span id="rv2-scan-hints" class="rv2-val">0</span>
+                            </div>
                         </div>
                         <label class="debug-toggle sidebar-debug" title="Show BLE/gossip debug events">
                             <input type="checkbox" id="debug-checkbox" />

@@ -329,7 +329,11 @@ impl<I: BleInterface> Driver<I> {
                                 device_id.clone(),
                                 direction,
                             );
-                            tracing::debug!(
+                            // Info: confirms the resolver→dial→pipe
+                            // round-trip completed successfully for
+                            // an outbound peer. One per successful
+                            // outbound dial — good testing signal.
+                            tracing::info!(
                                 device = %device_id,
                                 stable_id = %reservation.stable_id,
                                 endpoint = %reservation.endpoint_id,

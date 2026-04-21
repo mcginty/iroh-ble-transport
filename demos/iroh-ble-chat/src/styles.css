@@ -847,6 +847,29 @@ input.invalid {
     flex-direction: column;
     gap: 3px;
 }
+.routing-v2-counts {
+    margin-top: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border);
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 4px 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--text-muted);
+    text-align: center;
+}
+.routing-v2-counts .rv2-label {
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    opacity: 0.7;
+}
+.routing-v2-counts .rv2-val {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text);
+}
 .ble-peer-row {
     display: flex;
     justify-content: space-between;
