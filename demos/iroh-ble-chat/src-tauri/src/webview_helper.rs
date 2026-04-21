@@ -124,8 +124,7 @@ unsafe fn install_scroll_lock(scroll_view: *mut AnyObject) {
         return;
     };
     let lock = ScrollLock::new(mtm);
-    let delegate_ref: &ProtocolObject<dyn UIScrollViewDelegate> =
-        ProtocolObject::from_ref(&*lock);
+    let delegate_ref: &ProtocolObject<dyn UIScrollViewDelegate> = ProtocolObject::from_ref(&*lock);
     unsafe {
         let _: () = msg_send![scroll_view, setDelegate: delegate_ref];
     }
