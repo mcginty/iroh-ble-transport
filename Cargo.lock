@@ -3031,7 +3031,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-ble-chat-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "bytes",
