@@ -281,6 +281,50 @@ impl Registry {
             }
         }
 
+        // Orphan sweep: once we have a Connected entry for this prefix, any
+        // other live-but-not-Connected entry for the same prefix is stale and
+        // cannot usefully be dialed. The typical source on macOS is that the
+        // peer shows up under two DeviceIds for the same physical connection
+        // (CBPeripheral UUID from scan vs CBCentral UUID from GATT-server
+        // callbacks), and the scan-side entry sits forever in
+        // Discovered/Connecting while the peripheral side holds the real
+        // pipe. Drain those so they stop attracting dial attempts and stop
+        // cluttering snapshots/UI.
+        let has_connected_for_prefix = self
+            .peers
+            .values()
+            .any(|e| e.prefix == Some(prefix) && matches!(e.phase, PeerPhase::Connected { .. }));
+        if has_connected_for_prefix {
+            let orphans: Vec<DeviceId> = self
+                .peers
+                .iter()
+                .filter_map(|(did, e)| {
+                    let matches_prefix = e.prefix == Some(prefix);
+                    let is_orphan = matches!(
+                        e.phase,
+                        PeerPhase::Unknown
+                            | PeerPhase::Discovered { .. }
+                            | PeerPhase::PendingDial { .. }
+                            | PeerPhase::Connecting { .. }
+                            | PeerPhase::Handshaking { .. }
+                            | PeerPhase::Reconnecting { .. }
+                            | PeerPhase::Restoring { .. }
+                    );
+                    (matches_prefix && is_orphan).then(|| did.clone())
+                })
+                .collect();
+            for did in orphans {
+                if let Some(entry) = self.peers.get_mut(&did) {
+                    let drain_acks = Self::drain_to_draining(
+                        entry,
+                        now,
+                        crate::transport::peer::DisconnectReason::DedupLoser,
+                    );
+                    actions.extend(drain_acks);
+                }
+            }
+        }
+
         if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
             let my_endpoint = self.my_endpoint;
             let connected_for_prefix = self
@@ -4776,6 +4820,115 @@ mod tests {
         assert!(
             reg.peers[&dev].verified_endpoint.is_none(),
             "entry for different prefix must not be stamped"
+        );
+    }
+
+    #[test]
+    fn verified_endpoint_sweeps_orphan_same_prefix_entries() {
+        use crate::transport::peer::{
+            ChannelHandle, ConnectPath, ConnectRole, DisconnectReason, PeerPhase,
+        };
+        use crate::transport::routing::prefix_from_endpoint;
+
+        // Mirrors the macOS split-brain the user hit: one PeerEntry is the
+        // peripheral-side (Connected, owns the live pipe), a second PeerEntry
+        // is the scan-side (stuck in Connecting because iroh tried to dial
+        // through it before the routing fix landed). VerifiedEndpoint proves
+        // both entries represent the same peer — the scan-side orphan must
+        // drain so it stops attracting dial attempts and stops appearing in
+        // snapshots.
+        let mut reg = Registry::new_for_test();
+        let endpoint = iroh_base::SecretKey::from_bytes(&[42u8; 32]).public();
+        let prefix = prefix_from_endpoint(&endpoint);
+
+        let peri_dev = DeviceId::from("peripheral-side");
+        reg.peers
+            .insert(peri_dev.clone(), PeerEntry::new(peri_dev.clone()));
+        {
+            let e = reg.peers.get_mut(&peri_dev).unwrap();
+            e.prefix = Some(prefix);
+            e.role = ConnectRole::Peripheral;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::L2cap,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+        }
+
+        let scan_dev = DeviceId::from("scan-side-orphan");
+        reg.peers
+            .insert(scan_dev.clone(), PeerEntry::new(scan_dev.clone()));
+        {
+            let e = reg.peers.get_mut(&scan_dev).unwrap();
+            e.prefix = Some(prefix);
+            e.role = ConnectRole::Central;
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+        }
+
+        let _ = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: endpoint,
+            token: None,
+        });
+
+        assert!(
+            matches!(reg.peers[&peri_dev].phase, PeerPhase::Connected { .. }),
+            "peripheral-side winner must stay Connected; got {:?}",
+            reg.peers[&peri_dev].phase,
+        );
+        assert!(
+            matches!(
+                reg.peers[&scan_dev].phase,
+                PeerPhase::Draining {
+                    reason: DisconnectReason::DedupLoser,
+                    ..
+                }
+            ),
+            "scan-side orphan must be drained; got {:?}",
+            reg.peers[&scan_dev].phase,
+        );
+    }
+
+    #[test]
+    fn verified_endpoint_does_not_sweep_when_no_connected_entry_exists() {
+        // Without a Connected same-prefix entry, a Discovered/Connecting entry
+        // is still a legitimate dial target — the sweep must not run.
+        use crate::transport::peer::{ConnectPath, ConnectRole, PeerPhase};
+        use crate::transport::routing::prefix_from_endpoint;
+
+        let mut reg = Registry::new_for_test();
+        let endpoint = iroh_base::SecretKey::from_bytes(&[43u8; 32]).public();
+        let prefix = prefix_from_endpoint(&endpoint);
+
+        let dev = DeviceId::from("only-candidate");
+        reg.peers.insert(dev.clone(), PeerEntry::new(dev.clone()));
+        {
+            let e = reg.peers.get_mut(&dev).unwrap();
+            e.prefix = Some(prefix);
+            e.role = ConnectRole::Central;
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+        }
+
+        let _ = reg.handle(PeerCommand::VerifiedEndpoint {
+            endpoint_id: endpoint,
+            token: None,
+        });
+
+        assert!(
+            matches!(reg.peers[&dev].phase, PeerPhase::Connecting { .. }),
+            "lone connecting entry must not be drained; got {:?}",
+            reg.peers[&dev].phase,
         );
     }
 
