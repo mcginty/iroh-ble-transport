@@ -373,6 +373,16 @@ impl BleTransport {
         self.routing_v2.snapshot()
     }
 
+    /// Shared handle to the shadow routing table, for plumbing into
+    /// the `BleDedupHook` (which runs the promotion rule at TLS
+    /// handshake completion). Cloning the returned `Arc` is cheap.
+    /// Exposed only because the hook must hold a reference and the
+    /// hook's construction site can't access private transport fields.
+    #[must_use]
+    pub fn routing_v2_handle(&self) -> Arc<crate::transport::routing_v2::Routing> {
+        Arc::clone(&self.routing_v2)
+    }
+
     /// Debug-only: list the pipes currently tracked by the shadow
     /// routing table. Integration tests use this to verify mint/evict
     /// balance; not intended for production use.

@@ -275,7 +275,11 @@ async fn start_node(
         .build();
 
     let ep = Endpoint::builder(presets::N0DisableRelay)
-        .hooks(BleDedupHook::new(verified_tx))
+        .hooks(BleDedupHook::new(
+            st.secret_key.public(),
+            ble_transport.routing_v2_handle(),
+            verified_tx,
+        ))
         .add_custom_transport(Arc::clone(&transport))
         .address_lookup(lookup)
         .transport_config(transport_cfg)

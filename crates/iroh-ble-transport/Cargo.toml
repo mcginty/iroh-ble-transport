@@ -27,6 +27,11 @@ iroh-base = "0.98"
 n0-watcher = "0.6"
 n0-future = "0.3"
 noq-udp = "0.10"
+# Used for `VarInt`, which iroh 0.98 takes in `AfterHandshakeOutcome::Reject`
+# but does not re-export from its public API. iroh's internal `quic` module
+# re-exports it from noq-proto, so depending on noq-proto directly is the
+# supported shape.
+noq-proto = "0.17"
 async-stream = "0.3"
 parking_lot = "0.12"
 async-trait = "0.1"

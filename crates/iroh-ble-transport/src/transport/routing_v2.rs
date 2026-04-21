@@ -36,6 +36,15 @@ impl StableConnId {
         self.0
     }
 
+    /// Reconstruct from a raw u64 — used when the hook parses an
+    /// iroh-side `CustomAddr` back into a handle. Callers must have
+    /// originally obtained the u64 via `as_u64()` on a minted id; no
+    /// check is performed that the id corresponds to a live pipe.
+    #[must_use]
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
     /// Test-only constructor. Production code only obtains `StableConnId`s
     /// via `Routing::register_pipe`, which guarantees monotonicity.
     #[cfg(any(test, feature = "testing"))]
@@ -370,6 +379,184 @@ impl Routing {
     pub(crate) fn routable_len(&self) -> usize {
         self.inner.lock().routable.len()
     }
+
+    // ---------- promotion rule (step 4b) ----------
+
+    /// Run the promotion rule (see `decide()`) for a pending pipe whose
+    /// iroh TLS handshake just completed. Mutates `pending`/`routable`
+    /// atomically, returns the decision + the list of other
+    /// `StableConnId`s the caller must tear down (losers).
+    ///
+    /// `self_endpoint` is our local node's endpoint id (fixed at
+    /// `BleTransport` construction). `remote_endpoint` is the just-
+    /// authenticated peer. The pipe's `Direction` is read from the
+    /// pipes map to derive the observer-symmetric `Dialer` both sides
+    /// of a pair will compute identically.
+    pub fn promote(
+        &self,
+        pipe_id: StableConnId,
+        self_endpoint: &EndpointId,
+        remote_endpoint: EndpointId,
+    ) -> PromoteOutcome {
+        let mut inner = self.inner.lock();
+
+        // If the pipe vanished before promotion (rare race between
+        // handshake completion and pipe teardown), there's nothing to
+        // promote. Treat as Reject so the caller closes the iroh
+        // connection — a handshake over a dead pipe can't route anyway.
+        let Some(pipe) = inner.pipes.get(&pipe_id).cloned() else {
+            tracing::warn!(
+                %pipe_id,
+                "routing_v2::promote: pipe vanished before promotion; rejecting"
+            );
+            return PromoteOutcome::Rejected;
+        };
+
+        let new_dialer = Dialer::compute(self_endpoint, &remote_endpoint, pipe.direction);
+
+        // Collect contenders for this endpoint:
+        //   - the existing routable entry (if any, and not us).
+        //   - other pendings targeting this endpoint (outbound that
+        //     named this target) — excludes inbound pendings whose
+        //     target is unknown.
+        let mut contenders: Vec<Contender> = Vec::new();
+        if let Some(existing) = inner.routable.get(&remote_endpoint)
+            && existing.pipe != pipe_id
+        {
+            contenders.push(Contender {
+                pipe: existing.pipe,
+                dialer: existing.dialer,
+                is_healthy: inner.pipes.contains_key(&existing.pipe),
+            });
+        }
+        for (pid, p) in &inner.pending {
+            if *pid == pipe_id {
+                continue;
+            }
+            if p.target_endpoint.as_ref() != Some(&remote_endpoint) {
+                continue;
+            }
+            let Some(other_pipe) = inner.pipes.get(pid) else {
+                continue;
+            };
+            let other_dialer =
+                Dialer::compute(self_endpoint, &remote_endpoint, other_pipe.direction);
+            contenders.push(Contender {
+                pipe: *pid,
+                dialer: other_dialer,
+                is_healthy: true, // a live pending pipe is healthy by definition
+            });
+        }
+
+        let decision = decide(new_dialer, &contenders);
+
+        let (evicted, promoted) = match decision {
+            Decision::Accept | Decision::AcceptEvictingAll => {
+                let evicted: Vec<StableConnId> = contenders.iter().map(|c| c.pipe).collect();
+                for pid in &evicted {
+                    inner.pending.remove(pid);
+                    // Best-effort routable eviction — the contender
+                    // might have been a routable entry.
+                    if let Some((ep, _)) = inner.routable.iter().find(|(_, r)| r.pipe == *pid) {
+                        let ep = *ep;
+                        inner.routable.remove(&ep);
+                    }
+                }
+                // Remove the incumbent routable for this endpoint (if
+                // different from anything evicted above) to make room
+                // for the new one.
+                inner.routable.remove(&remote_endpoint);
+                // Move the promoting pipe from pending to routable.
+                inner.pending.remove(&pipe_id);
+                inner.routable.insert(
+                    remote_endpoint,
+                    Routable {
+                        pipe: pipe_id,
+                        endpoint_id: remote_endpoint,
+                        dialer: new_dialer,
+                        verified_at: Instant::now(),
+                    },
+                );
+                (evicted, true)
+            }
+            Decision::Reject => (Vec::new(), false),
+        };
+
+        tracing::debug!(
+            %pipe_id,
+            %remote_endpoint,
+            ?new_dialer,
+            ?decision,
+            evicted_count = evicted.len(),
+            "routing_v2::promote"
+        );
+
+        if promoted {
+            PromoteOutcome::Accepted { evicted }
+        } else {
+            PromoteOutcome::Rejected
+        }
+    }
+}
+
+// ---------- decide() rule (step 4b, pure function) ----------
+
+/// A contender for the routable slot of some `EndpointId`. Used only
+/// inside the promotion rule — never exposed outside `routing_v2`.
+#[derive(Debug, Clone, Copy)]
+struct Contender {
+    pipe: StableConnId,
+    dialer: Dialer,
+    is_healthy: bool,
+}
+
+/// Internal decision shape. Public users see [`PromoteOutcome`], which
+/// flattens Accept / AcceptEvictingAll into a single Accepted variant
+/// with the eviction list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Accept,
+    AcceptEvictingAll,
+    Reject,
+}
+
+/// Observer-symmetric resolution of a handshake collision. See §9.5 of
+/// the study doc for the derivation and the four scenarios (single
+/// dial, symmetric dial, F2 reconnect, pathological retry thrash).
+///
+/// - No contender → `Accept` (single dial, fresh inbound).
+/// - Different positional category (one lower-dialed, one higher-dialed)
+///   → higher-dialed wins unconditionally (`AcceptEvictingAll` or
+///   `Reject` depending on which side the new pipe is on). Resolves
+///   symmetric-dial collisions without relying on gossip's
+///   timing-based adopt-newest.
+/// - Same positional category (both lower-dialed or both higher-dialed,
+///   i.e. re-dial / F2 recovery) → health arbitrates: existing wins
+///   unless it's unhealthy; otherwise the new replaces.
+fn decide(new_dialer: Dialer, contenders: &[Contender]) -> Decision {
+    if contenders.is_empty() {
+        return Decision::Accept;
+    }
+    let any_existing_is_high = contenders.iter().any(|c| c.dialer == Dialer::High);
+    match (new_dialer, any_existing_is_high) {
+        (Dialer::High, false) => Decision::AcceptEvictingAll,
+        (Dialer::Low, true) => Decision::Reject,
+        _ => {
+            if contenders.iter().any(|c| c.is_healthy) {
+                Decision::Reject
+            } else {
+                Decision::AcceptEvictingAll
+            }
+        }
+    }
+}
+
+/// Outcome of a promotion attempt. `Accepted` carries the list of
+/// `StableConnId`s the caller must tear down (losing pipes).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromoteOutcome {
+    Accepted { evicted: Vec<StableConnId> },
+    Rejected,
 }
 
 /// Counts-only view of the shadow routing state. Does not leak any
@@ -640,6 +827,234 @@ mod tests {
         // has the complete picture.
         assert_eq!(r.snapshot().pipes, 0);
         assert_eq!(r.snapshot().pending, 1);
+    }
+
+    // ---------- decide() rule (step 4b) ----------
+
+    fn contender(dialer: Dialer, is_healthy: bool) -> Contender {
+        Contender {
+            pipe: StableConnId::for_test(999),
+            dialer,
+            is_healthy,
+        }
+    }
+
+    #[test]
+    fn decide_accepts_when_no_contenders() {
+        assert_eq!(decide(Dialer::Low, &[]), Decision::Accept);
+        assert_eq!(decide(Dialer::High, &[]), Decision::Accept);
+    }
+
+    #[test]
+    fn decide_symmetric_collision_higher_dialed_wins() {
+        // Classic two-sides-dialed-simultaneously. Both peers run this
+        // function; both reach the same conclusion because `Dialer` is
+        // observer-symmetric.
+        let low_contender = [contender(Dialer::Low, true)];
+        assert_eq!(
+            decide(Dialer::High, &low_contender),
+            Decision::AcceptEvictingAll,
+            "higher-dialed new pipe evicts lower-dialed contender"
+        );
+
+        let high_contender = [contender(Dialer::High, true)];
+        assert_eq!(
+            decide(Dialer::Low, &high_contender),
+            Decision::Reject,
+            "lower-dialed new pipe loses to higher-dialed contender"
+        );
+    }
+
+    #[test]
+    fn decide_same_category_existing_wins_when_healthy() {
+        // Re-dial path: same direction, existing is healthy → reject
+        // the new redundant connection.
+        for dialer in [Dialer::Low, Dialer::High] {
+            let existing = [contender(dialer, true)];
+            assert_eq!(
+                decide(dialer, &existing),
+                Decision::Reject,
+                "healthy same-category existing wins ({dialer:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn decide_same_category_unhealthy_existing_loses() {
+        // F2 recovery: stale routable with dead pipe, new arrival takes
+        // over.
+        for dialer in [Dialer::Low, Dialer::High] {
+            let stale = [contender(dialer, false)];
+            assert_eq!(
+                decide(dialer, &stale),
+                Decision::AcceptEvictingAll,
+                "unhealthy same-category existing loses ({dialer:?})"
+            );
+        }
+    }
+
+    // ---------- promote() integration (step 4b) ----------
+
+    #[test]
+    fn promote_single_dial_accepts() {
+        // No contenders → Accept. Endpoint ordering irrelevant (no
+        // contenders) but pinned anyway for stability.
+        let me = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer = iroh_base::SecretKey::from_bytes(&[0xFEu8; 32]).public();
+        let r = Routing::new();
+        let id = r.register_pipe(dev("peer-mac"), Direction::Outbound);
+        r.register_pending(id, Some(peer));
+
+        let outcome = r.promote(id, &me, peer);
+        assert!(matches!(outcome, PromoteOutcome::Accepted { evicted } if evicted.is_empty()));
+        assert_eq!(r.pending_len(), 0);
+        assert_eq!(r.routable_len(), 1);
+        assert_eq!(r.routable_pipe_for(&peer), Some(id));
+    }
+
+    #[test]
+    fn promote_symmetric_dial_converges_on_higher_dialed() {
+        // Both sides dialed. Local = low endpoint. One pipe is
+        // outbound (we dialed = Low dialer), the other inbound (they
+        // dialed = High dialer). Run promote in both orders; the High
+        // always wins.
+        let me = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer = iroh_base::SecretKey::from_bytes(&[0xFEu8; 32]).public();
+        assert!(me.as_bytes() < peer.as_bytes(), "test invariant: me < peer");
+
+        // Case A: outbound pipe's handshake completes first.
+        {
+            let r = Routing::new();
+            let outbound = r.register_pipe(dev("peer-mac-a"), Direction::Outbound);
+            let inbound = r.register_pipe(dev("peer-cbcentral-a"), Direction::Inbound);
+            r.register_pending(outbound, Some(peer));
+            r.register_pending(inbound, None);
+
+            let first = r.promote(outbound, &me, peer);
+            // outbound→we dialed, we are low → Dialer::Low. existing
+            // pending (inbound = they dialed, they are high →
+            // Dialer::High) but no target_endpoint yet, so it's NOT a
+            // contender in this call. Accept uncontested.
+            assert!(matches!(first, PromoteOutcome::Accepted { evicted } if evicted.is_empty()));
+            assert_eq!(r.routable_pipe_for(&peer), Some(outbound));
+
+            // Now inbound's hook fires. inbound Dialer::High,
+            // existing routable Dialer::Low → AcceptEvictingAll.
+            let second = r.promote(inbound, &me, peer);
+            match second {
+                PromoteOutcome::Accepted { evicted } => {
+                    assert_eq!(evicted, vec![outbound]);
+                }
+                _ => panic!("inbound must win"),
+            }
+            assert_eq!(r.routable_pipe_for(&peer), Some(inbound));
+        }
+
+        // Case B: inbound pipe's handshake completes first.
+        {
+            let r = Routing::new();
+            let outbound = r.register_pipe(dev("peer-mac-b"), Direction::Outbound);
+            let inbound = r.register_pipe(dev("peer-cbcentral-b"), Direction::Inbound);
+            r.register_pending(outbound, Some(peer));
+            r.register_pending(inbound, None);
+
+            // inbound (Dialer::High for us) promotes first. existing
+            // pending is outbound (Dialer::Low), targeting peer — so
+            // it IS a contender.
+            let first = r.promote(inbound, &me, peer);
+            match first {
+                PromoteOutcome::Accepted { evicted } => {
+                    assert_eq!(evicted, vec![outbound]);
+                }
+                _ => panic!("inbound (higher-dialed) should win"),
+            }
+            assert_eq!(r.routable_pipe_for(&peer), Some(inbound));
+
+            // outbound's hook would fire next, but its pending entry
+            // was just evicted. Promoting it finds the pipe gone or
+            // pending gone — we still re-run the rule against the
+            // existing routable (which is inbound, High-dialed).
+            // outbound is Low, existing is High → Reject.
+            let second = r.promote(outbound, &me, peer);
+            assert!(matches!(second, PromoteOutcome::Rejected));
+            assert_eq!(r.routable_pipe_for(&peer), Some(inbound));
+        }
+    }
+
+    #[test]
+    fn promote_reconnect_replaces_unhealthy_existing() {
+        // F2 scenario: stale routable whose pipe is gone, new pipe to
+        // the same peer in the same direction → new replaces.
+        //
+        // Pin me<peer so both pipes get Dialer::Low (Outbound from
+        // the low side), putting the test in the "same-category,
+        // arbitrate on health" branch.
+        let me = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer = iroh_base::SecretKey::from_bytes(&[0xFEu8; 32]).public();
+        assert!(me.as_bytes() < peer.as_bytes(), "test invariant: me < peer");
+
+        let r = Routing::new();
+        let stale = r.register_pipe(dev("old-mac"), Direction::Outbound);
+        r.insert_routable(peer, stale, Dialer::Low);
+        r.evict_pipe(stale); // BLE link died; pipe gone but routable stale
+        assert!(r.routable_pipe_for(&peer).is_some());
+
+        let fresh = r.register_pipe(dev("new-mac"), Direction::Outbound);
+        r.register_pending(fresh, Some(peer));
+        let outcome = r.promote(fresh, &me, peer);
+
+        match outcome {
+            PromoteOutcome::Accepted { evicted } => {
+                assert!(
+                    evicted.contains(&stale),
+                    "stale routable must be in the evicted list"
+                );
+            }
+            _ => panic!("unhealthy existing should lose"),
+        }
+        assert_eq!(r.routable_pipe_for(&peer), Some(fresh));
+    }
+
+    #[test]
+    fn promote_same_direction_healthy_existing_wins() {
+        // Redundant re-dial: new pipe, same direction, existing pipe
+        // still healthy → reject the new one.
+        //
+        // Must pin the endpoint ordering explicitly — seed bytes alone
+        // don't imply a byte-wise ordering of the derived public keys.
+        let me = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer = iroh_base::SecretKey::from_bytes(&[0xFEu8; 32]).public();
+        assert!(me.as_bytes() < peer.as_bytes(), "test invariant: me < peer");
+        // Both outbound → both Dialer::Low (lower endpoint dialed).
+
+        let r = Routing::new();
+        let existing = r.register_pipe(dev("a"), Direction::Outbound);
+        r.insert_routable(peer, existing, Dialer::Low);
+
+        let redundant = r.register_pipe(dev("b"), Direction::Outbound);
+        r.register_pending(redundant, Some(peer));
+        let outcome = r.promote(redundant, &me, peer);
+
+        assert!(matches!(outcome, PromoteOutcome::Rejected));
+        assert_eq!(r.routable_pipe_for(&peer), Some(existing));
+        assert_eq!(
+            r.pending_len(),
+            1,
+            "rejected pending stays — caller tears it down separately"
+        );
+    }
+
+    #[test]
+    fn promote_rejects_when_pipe_gone() {
+        // Race: pipe is torn down before promote runs.
+        let r = Routing::new();
+        let me = test_endpoint(11);
+        let peer = test_endpoint(12);
+        let ghost = StableConnId::for_test(4242);
+        r.register_pending(ghost, Some(peer));
+        // No pipe was registered for this id.
+        let outcome = r.promote(ghost, &me, peer);
+        assert!(matches!(outcome, PromoteOutcome::Rejected));
     }
 
     #[test]
