@@ -139,22 +139,13 @@ impl TransportRouting {
     }
 
     /// Resolve a token back to the `DeviceId` that should receive outbound
-    /// traffic. For prefix-keyed tokens this prefers the `pinned` mapping
-    /// (the DeviceId of the currently live Connected pipe for this prefix)
-    /// and falls back to `discovered` (the most recent scan hint). On
-    /// platforms where a peer can present multiple concurrent DeviceIds for
-    /// the same key prefix — notably macOS, where a peer has distinct
-    /// CBPeripheral (scan) and CBCentral (GATT-server) UUIDs — the two maps
-    /// can disagree. The pinned side owns the live pipe and must be the
-    /// routing target; the discovered side is a dial hint.
+    /// traffic. For prefix-keyed tokens this follows `discovered[prefix]`
+    /// live, so a peer's MAC rotation transparently redirects traffic without
+    /// any iroh-level re-resolution.
     pub fn device_for_token(&self, token: Token) -> Option<DeviceId> {
         let inner = self.inner.lock().expect("routing mutex poisoned");
         match inner.token_origin.get(&token)? {
-            TokenOrigin::Prefix(prefix) => inner
-                .pinned
-                .get(prefix)
-                .or_else(|| inner.discovered.get(prefix))
-                .cloned(),
+            TokenOrigin::Prefix(prefix) => inner.discovered.get(prefix).cloned(),
             TokenOrigin::Device(device) => Some(device.clone()),
         }
     }
@@ -187,15 +178,15 @@ impl TransportRouting {
         update
     }
 
-    /// Return the `DeviceId` currently associated with `prefix`, if any.
-    /// Prefers the pinned (live Connected) DeviceId over the scan-discovered
-    /// one — see `device_for_token` for the reasoning.
+    /// Return the `DeviceId` currently mapped to `prefix`, if any. Used by
+    /// `BleAddressLookup::resolve` to decide whether to yield an address
+    /// item or wait for discovery.
     pub fn device_for_prefix(&self, prefix: &KeyPrefix) -> Option<DeviceId> {
-        let inner = self.inner.lock().expect("routing mutex poisoned");
-        inner
-            .pinned
+        self.inner
+            .lock()
+            .expect("routing mutex poisoned")
+            .discovered
             .get(prefix)
-            .or_else(|| inner.discovered.get(prefix))
             .cloned()
     }
 
@@ -235,11 +226,11 @@ impl TransportRouting {
 
     pub fn device_for_endpoint(&self, endpoint_id: &EndpointId) -> Option<DeviceId> {
         let prefix = prefix_from_endpoint(endpoint_id);
-        let inner = self.inner.lock().expect("routing mutex poisoned");
-        inner
-            .pinned
+        self.inner
+            .lock()
+            .expect("routing mutex poisoned")
+            .discovered
             .get(&prefix)
-            .or_else(|| inner.discovered.get(&prefix))
             .cloned()
     }
 
@@ -375,68 +366,6 @@ mod tests {
             r.note_discovery(prefix, d),
             DiscoveryUpdate::Unchanged,
             "re-advertising the same pinned DeviceId should be Unchanged"
-        );
-    }
-
-    #[test]
-    fn device_for_token_prefers_pinned_over_discovered_on_split_brain() {
-        // macOS scenario: scan sees the peer as CBPeripheral UUID `scan_id`,
-        // while the same peer dials our GATT server as CBCentral UUID
-        // `peri_id`. Both live for the same prefix. The registry pins the
-        // DeviceId that owns the live pipe — here the peripheral side — so
-        // outbound must target `peri_id` even though the scan discovery
-        // recorded `scan_id`.
-        let r = TransportRouting::new();
-        let prefix: KeyPrefix = [33u8; KEY_PREFIX_LEN];
-        let scan_id = blew::DeviceId::from("scan-cbperipheral");
-        let peri_id = blew::DeviceId::from("gatt-cbcentral");
-
-        r.note_discovery(prefix, scan_id.clone());
-        let token = r.mint_token_for_prefix(prefix);
-        assert_eq!(r.device_for_token(token).as_ref(), Some(&scan_id));
-
-        // Peripheral-side entry becomes Connected; registry publishes the pin.
-        r.publish_active_prefixes(HashMap::from([(prefix, peri_id.clone())]));
-
-        assert_eq!(
-            r.device_for_token(token).as_ref(),
-            Some(&peri_id),
-            "pinned live DeviceId must win over the scan-side discovery hint"
-        );
-        assert_eq!(
-            r.device_for_prefix(&prefix).as_ref(),
-            Some(&peri_id),
-            "device_for_prefix must also prefer the pinned side"
-        );
-    }
-
-    #[test]
-    fn device_for_token_falls_back_to_discovered_when_not_pinned() {
-        // Nothing pinned yet: routing must still return the scan-side hint so
-        // outbound sends can drive the first connect attempt.
-        let r = TransportRouting::new();
-        let prefix: KeyPrefix = [34u8; KEY_PREFIX_LEN];
-        let scan_id = blew::DeviceId::from("scan-only");
-        r.note_discovery(prefix, scan_id.clone());
-        let token = r.mint_token_for_prefix(prefix);
-        assert_eq!(r.device_for_token(token).as_ref(), Some(&scan_id));
-    }
-
-    #[test]
-    fn device_for_endpoint_prefers_pinned_over_discovered() {
-        let r = TransportRouting::new();
-        let secret = iroh_base::SecretKey::from_bytes(&[9u8; 32]);
-        let eid = secret.public();
-        let prefix: KeyPrefix = eid.as_bytes()[..KEY_PREFIX_LEN].try_into().unwrap();
-        let scan_id = blew::DeviceId::from("scan-side");
-        let peri_id = blew::DeviceId::from("peripheral-side");
-        r.note_discovery(prefix, scan_id.clone());
-        assert_eq!(r.device_for_endpoint(&eid).as_ref(), Some(&scan_id));
-        r.publish_active_prefixes(HashMap::from([(prefix, peri_id.clone())]));
-        assert_eq!(
-            r.device_for_endpoint(&eid).as_ref(),
-            Some(&peri_id),
-            "endpoint→device must follow the live pin"
         );
     }
 

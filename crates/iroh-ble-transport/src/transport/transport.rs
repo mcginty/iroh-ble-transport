@@ -578,21 +578,6 @@ impl CustomEndpoint for BleEndpoint {
     }
 }
 
-/// Phases where iroh's live Connection cannot successfully use this peer's
-/// BLE path. A `poll_send` against such a peer is fast-failed so iroh closes
-/// the stale Connection quickly rather than waiting for `max_idle_timeout`.
-/// Phases where the pipe may still come up (Unknown/Discovered/PendingDial/
-/// Connecting/Handshaking) are intentionally *not* in this set — those feed
-/// into the registry's `StartAndEnqueue`/`Buffer` decisions so iroh's
-/// in-flight handshake can still complete once the pipe is ready.
-pub(crate) fn phase_is_dead_path(kind: crate::transport::registry::PhaseKind) -> bool {
-    use crate::transport::registry::PhaseKind;
-    matches!(
-        kind,
-        PhaseKind::Draining | PhaseKind::Dead | PhaseKind::Reconnecting | PhaseKind::Restoring
-    )
-}
-
 pub struct BleSender {
     inbox: mpsc::Sender<PeerCommand>,
     snapshots: Arc<ArcSwap<SnapshotMaps>>,
@@ -639,30 +624,6 @@ impl CustomSender for BleSender {
         let snap = self.snapshots.load();
         let state = snap.peer_states.get(&device_id);
         let tx_gen = state.map_or(0, |s| s.tx_gen);
-        // If the peer's pipe is gone (`Draining`/`Dead`) or waiting on a
-        // future BLE path (`Reconnecting`/`Restoring`), tell iroh the path
-        // is dead synchronously instead of stuffing the send into the
-        // registry inbox (where the `Reject` would only fire a no-op
-        // `AckSend`). Without this, iroh's live Connection keeps issuing
-        // keep-alives — each returning `Ready(Ok)` by virtue of the inbox
-        // accepting them — until `max_idle_timeout` fires ~15s later. That
-        // 10+s window is exactly where gossip-layer messages get
-        // silently dropped because `NeighborDown` hasn't fired yet and the
-        // peer's fresh incoming connection hasn't been adopted. Returning
-        // `ConnectionReset` here causes iroh to close the stale Connection
-        // in ~one keep-alive tick (≤5 s), gossip fires `NeighborDown`, and
-        // the already-established incoming connection is adopted.
-        if state.map(|s| s.phase_kind).is_some_and(phase_is_dead_path) {
-            tracing::debug!(
-                device = %device_id,
-                kind = ?state.map(|s| s.phase_kind),
-                "BleSender::poll_send fast-failing — BLE path no longer viable"
-            );
-            return Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                "BLE peer path is no longer viable",
-            )));
-        }
         let len = transmit.contents.len();
         tracing::trace!(device = %device_id, len, "BleSender::poll_send");
         let cmd = PeerCommand::SendDatagram {
@@ -1130,37 +1091,5 @@ mod tests {
         assert_eq!(c2.0.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(c3.0.load(AtomicOrdering::SeqCst), 1);
         assert!(wakers.lock().is_empty(), "drain must clear the list");
-    }
-
-    // ---------- poll_send fast-fail classification ----------
-
-    #[test]
-    fn phase_is_dead_path_covers_only_unrecoverable_phases() {
-        use crate::transport::registry::PhaseKind;
-
-        // Phases where the current BLE path is definitively gone — iroh's
-        // live Connection must not keep issuing keep-alives here.
-        for kind in [
-            PhaseKind::Draining,
-            PhaseKind::Dead,
-            PhaseKind::Reconnecting,
-            PhaseKind::Restoring,
-        ] {
-            assert!(phase_is_dead_path(kind), "{kind:?} must fast-fail");
-        }
-        // Phases where the pipe may still come up — must not fast-fail,
-        // because iroh's in-flight handshake needs the Connection to stay
-        // open until the pipe is ready and the registry drains pending
-        // sends into it.
-        for kind in [
-            PhaseKind::Unknown,
-            PhaseKind::Discovered,
-            PhaseKind::PendingDial,
-            PhaseKind::Connecting,
-            PhaseKind::Handshaking,
-            PhaseKind::Connected,
-        ] {
-            assert!(!phase_is_dead_path(kind), "{kind:?} must not fast-fail");
-        }
     }
 }
