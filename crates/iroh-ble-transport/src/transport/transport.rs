@@ -177,6 +177,11 @@ pub struct BleTransport {
     handle: RegistryHandle,
     incoming_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingPacket>>>,
     routing: Arc<TransportRouting>,
+    /// Shadow routing table (step 1 of the connection-system redesign).
+    /// Observes every pipe open/close; not yet consulted for routing.
+    /// Exposed via `routing_v2_snapshot()` so integration tests and
+    /// telemetry can confirm mint/evict pairs balance correctly.
+    routing_v2: Arc<crate::transport::routing_v2::Routing>,
     tx_bytes: Arc<AtomicU64>,
     rx_bytes: Arc<AtomicU64>,
     retransmits: Arc<AtomicU64>,
@@ -263,6 +268,7 @@ impl BleTransport {
             services,
             advertising_config,
         ));
+        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
         let driver = Driver::new(
             iface,
             inbox_tx.clone(),
@@ -271,6 +277,7 @@ impl BleTransport {
             Arc::clone(&truncations),
             Arc::clone(&empty_frames),
             Arc::clone(&config.store),
+            Arc::clone(&routing_v2),
         );
 
         let mut psm = None;
@@ -345,6 +352,7 @@ impl BleTransport {
             },
             incoming_rx: tokio::sync::Mutex::new(Some(incoming_rx)),
             routing,
+            routing_v2,
             tx_bytes,
             rx_bytes,
             retransmits,
@@ -353,6 +361,22 @@ impl BleTransport {
             inbox_capacity_wakers,
             store: config.store,
         })
+    }
+
+    /// Snapshot of the shadow routing table (step 1 of the redesign —
+    /// pipe count only). Counts-only view; callers that need detail use
+    /// `routing_v2_pipes_for_debug`.
+    #[must_use]
+    pub fn routing_v2_snapshot(&self) -> crate::transport::routing_v2::RoutingSnapshot {
+        self.routing_v2.snapshot()
+    }
+
+    /// Debug-only: list the pipes currently tracked by the shadow
+    /// routing table. Integration tests use this to verify mint/evict
+    /// balance; not intended for production use.
+    #[must_use]
+    pub fn routing_v2_pipes_for_debug(&self) -> Vec<crate::transport::routing_v2::Pipe> {
+        self.routing_v2.pipes_for_debug()
     }
 
     #[must_use]

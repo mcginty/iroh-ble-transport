@@ -79,6 +79,7 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
     );
     let registry = Registry::new_for_test_with_policy(policy);
     let snap = snapshots.clone();

@@ -23,6 +23,19 @@ pub struct IncomingPacket {
 /// slow-path before we give up and fall back to GATT.
 const READ_PSM_BACKOFFS_MS: [u64; 3] = [0, 150, 400];
 
+/// Translate the registry's role (`Central` = we dialed, `Peripheral` =
+/// they dialed) into the shadow routing's observer-local `Direction`.
+fn direction_for_role(
+    role: crate::transport::peer::ConnectRole,
+) -> crate::transport::routing_v2::Direction {
+    use crate::transport::peer::ConnectRole;
+    use crate::transport::routing_v2::Direction;
+    match role {
+        ConnectRole::Central => Direction::Outbound,
+        ConnectRole::Peripheral => Direction::Inbound,
+    }
+}
+
 /// Retry `read_psm` using the given backoff schedule.
 ///
 /// Returns `Ok(psm)` on first success, `Err("no psm advertised")` if the
@@ -105,9 +118,15 @@ pub struct Driver<I: BleInterface> {
     truncation_counter: Arc<AtomicU64>,
     empty_frames_counter: Arc<AtomicU64>,
     store: Arc<dyn PeerStore>,
+    /// Shadow routing table. Step 1 of the redesign — mints a
+    /// `StableConnId` on every pipe open and evicts on pipe close. Not
+    /// yet consulted for any routing decision. See
+    /// `crate::transport::routing_v2` and the study doc.
+    routing_v2: Arc<crate::transport::routing_v2::Routing>,
 }
 
 impl<I: BleInterface> Driver<I> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         iface: Arc<I>,
         inbox: mpsc::Sender<PeerCommand>,
@@ -116,6 +135,7 @@ impl<I: BleInterface> Driver<I> {
         truncation_counter: Arc<AtomicU64>,
         empty_frames_counter: Arc<AtomicU64>,
         store: Arc<dyn PeerStore>,
+        routing_v2: Arc<crate::transport::routing_v2::Routing>,
     ) -> Self {
         Self {
             iface,
@@ -125,6 +145,7 @@ impl<I: BleInterface> Driver<I> {
             truncation_counter,
             empty_frames_counter,
             store,
+            routing_v2,
         }
     }
 
@@ -269,6 +290,13 @@ impl<I: BleInterface> Driver<I> {
                 let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
                 let pipe_last_rx_at = last_rx_at.clone();
+                // Shadow registration: mint a StableConnId the moment the
+                // pipe task is spawned; evict the moment it exits. No
+                // behavior change — this is pure telemetry until later
+                // steps hook up pending/routable.
+                let routing_v2 = Arc::clone(&self.routing_v2);
+                let direction = direction_for_role(role);
+                let stable_id = routing_v2.register_pipe(device_id.clone(), direction);
                 tokio::spawn(async move {
                     run_data_pipe(
                         iface,
@@ -287,6 +315,7 @@ impl<I: BleInterface> Driver<I> {
                         pipe_last_rx_at,
                     )
                     .await;
+                    routing_v2.evict_pipe(stable_id);
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
@@ -333,6 +362,12 @@ impl<I: BleInterface> Driver<I> {
                 let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
                 let pipe_last_rx_at = last_rx_at.clone();
+                // Shadow registration: same accounting as StartDataPipe —
+                // reverting to GATT is a fresh pipe lifecycle from the
+                // shadow's perspective.
+                let routing_v2 = Arc::clone(&self.routing_v2);
+                let direction = direction_for_role(role);
+                let stable_id = routing_v2.register_pipe(device_id.clone(), direction);
                 tokio::spawn(async move {
                     run_data_pipe(
                         iface,
@@ -351,6 +386,7 @@ impl<I: BleInterface> Driver<I> {
                         pipe_last_rx_at,
                     )
                     .await;
+                    routing_v2.evict_pipe(stable_id);
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
@@ -763,6 +799,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::new(crate::transport::routing_v2::Routing::new()),
         );
 
         driver
@@ -805,6 +842,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::new(crate::transport::routing_v2::Routing::new()),
         );
 
         driver
@@ -833,6 +871,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shadow_routing_mints_and_evicts_around_pipe_lifetime() {
+        // Step 1 invariant: every StartDataPipe produces exactly one
+        // shadow-routing pipe registration, and pipe teardown evicts it.
+        // This is the end-to-end version of the routing_v2 unit tests —
+        // drives the registration via the real Driver code path so that
+        // future refactors of the spawn site can't silently drop the
+        // mint/evict symmetry.
+        use crate::transport::peer::{ConnectPath, ConnectRole};
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::clone(&routing_v2),
+        );
+
+        assert_eq!(routing_v2.snapshot().pipes, 0);
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: blew::DeviceId::from("shadow-peer"),
+                tx_gen: 1,
+                role: ConnectRole::Central,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+
+        // Mint is synchronous inside execute(), so the count should be 1
+        // before the DataPipeReady command arrives.
+        assert_eq!(
+            routing_v2.snapshot().pipes,
+            1,
+            "StartDataPipe must register exactly one shadow pipe"
+        );
+
+        // Capture the DataPipeReady so we can drop its senders to end the
+        // pipe worker.
+        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let (outbound_tx, inbound_tx) = match cmd {
+            PeerCommand::DataPipeReady {
+                outbound_tx,
+                inbound_tx,
+                ..
+            } => (outbound_tx, inbound_tx),
+            other => panic!("expected DataPipeReady, got {other:?}"),
+        };
+
+        // Pipe worker exits when both outbound and inbound channels close.
+        // Dropping the senders here closes them; supervisor then exits its
+        // select loop and run_data_pipe returns, firing evict_pipe.
+        drop(outbound_tx);
+        drop(inbound_tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if routing_v2.snapshot().pipes == 0 {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shadow pipe must be evicted once worker exits");
+    }
+
+    #[tokio::test]
+    async fn shadow_routing_tracks_direction_from_role() {
+        use crate::transport::peer::{ConnectPath, ConnectRole};
+        use crate::transport::routing_v2::Direction;
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::clone(&routing_v2),
+        );
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: blew::DeviceId::from("central-peer"),
+                tx_gen: 1,
+                role: ConnectRole::Central,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: blew::DeviceId::from("peripheral-peer"),
+                tx_gen: 1,
+                role: ConnectRole::Peripheral,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+
+        let mut pipes = routing_v2.pipes_for_debug();
+        pipes.sort_by_key(|p| p.device_id.to_string());
+        assert_eq!(pipes.len(), 2);
+        // "central-peer" < "peripheral-peer" lexicographically.
+        assert_eq!(pipes[0].device_id, blew::DeviceId::from("central-peer"));
+        assert_eq!(
+            pipes[0].direction,
+            Direction::Outbound,
+            "Central role → Outbound"
+        );
+        assert_eq!(pipes[1].device_id, blew::DeviceId::from("peripheral-peer"));
+        assert_eq!(
+            pipes[1].direction,
+            Direction::Inbound,
+            "Peripheral role → Inbound"
+        );
+
+        // Drain both DataPipeReady commands so rx is clean for other tests.
+        for _ in 0..2 {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
+        }
+    }
+
+    #[tokio::test]
     async fn upgrade_to_l2cap_reads_psm_and_emits_open_l2cap_succeeded() {
         let iface = Arc::new(MockBleInterface::new());
         let device_id = blew::DeviceId::from("upgrade");
@@ -851,6 +1029,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::new(crate::transport::routing_v2::Routing::new()),
         );
 
         driver
@@ -884,6 +1063,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::new(crate::transport::routing_v2::Routing::new()),
         );
 
         let (swap_tx, mut swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
@@ -916,6 +1096,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::new(crate::transport::routing_v2::Routing::new()),
         );
 
         driver
@@ -954,6 +1135,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::new(crate::transport::routing_v2::Routing::new()),
         );
         let device_id = blew::DeviceId::from("x");
         driver

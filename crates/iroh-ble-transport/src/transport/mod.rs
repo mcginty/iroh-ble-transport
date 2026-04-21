@@ -12,6 +12,7 @@ pub mod pipe;
 pub mod registry;
 pub mod reliable;
 pub mod routing;
+pub mod routing_v2;
 pub mod store;
 #[allow(clippy::module_inception)]
 pub mod transport;
