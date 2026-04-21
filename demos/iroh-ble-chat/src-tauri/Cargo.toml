@@ -69,6 +69,7 @@ objc2-foundation = { version = "0.3", features = [
 objc2-ui-kit = { version = "0.3", features = [
     "UIResponder",
     "UIView",
+    "UIScrollView",
 ] }
 objc2-core-foundation = { version = "0.3", features = ["CFCGTypes"] }
 block2 = "0.6"

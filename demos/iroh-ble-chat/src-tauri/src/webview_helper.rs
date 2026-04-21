@@ -1,25 +1,32 @@
 //! iOS-only WKWebView setup.
 //!
-//! We do two things natively that pure CSS/JS can't reach:
+//! Three UIKit tweaks that pure CSS/JS can't reach:
 //!
-//! 1. Set `UIScrollView.contentInsetAdjustmentBehavior = .never` so
+//! 1. `UIScrollView.contentInsetAdjustmentBehavior = .never` so
 //!    `window.innerHeight` equals the full screen and `env(safe-area-
-//!    inset-*)` reflects the real notch / home-indicator insets. (The
-//!    webview otherwise clamps the layout viewport to the safe area,
-//!    leaving strips of canvas colour outside it.)
+//!    inset-*)` reflects the real notch / home-indicator insets.
 //!
-//! 2. Observe `UIKeyboardWillShow` / `UIKeyboardWillHide` and forward
-//!    the keyboard height to the frontend as Tauri events. On iOS the
-//!    visualViewport does NOT shrink when the soft keyboard opens —
-//!    verified empirically: `visualViewport.height == innerHeight`
-//!    even with the keyboard up — so we have no purely-JS signal to
-//!    drive a resize of `.app`. An earlier attempt to resize the
-//!    WKWebView's UIView frame via `setFrame:` changed the physical
-//!    size but WebKit never recomputed the layout viewport, so the
-//!    page still thought it was 812 tall and the user had to scroll
-//!    to see the input bar. Emitting an event lets the frontend
-//!    update a CSS custom property directly, which is what the
-//!    Android path already does via visualViewport.
+//! 2. A permanent `UIScrollViewDelegate` that snaps `contentOffset`
+//!    back to `(0, 0)` on every `scrollViewDidScroll` callback. iOS
+//!    auto-scrolls the WKWebView's scrollView whenever a focused input
+//!    would be hidden by the keyboard — this animation runs *after*
+//!    `UIKeyboardWillShowNotification`, so a one-shot reset in the
+//!    notification observer gets clobbered. The delegate catches
+//!    every scroll event and pins the scrollView at origin. Our
+//!    document is `position: fixed; overflow: hidden` and the messages
+//!    area scrolls via CSS `overflow-y: auto`, so there's nothing the
+//!    outer scrollView legitimately needs to do.
+//!
+//! 3. `UIKeyboardWillShow` / `UIKeyboardWillHide` observers that
+//!    forward the keyboard height to the frontend as Tauri events.
+//!    On iOS the visualViewport does NOT shrink when the soft keyboard
+//!    opens — verified empirically: `visualViewport.height ==
+//!    innerHeight` even with the keyboard up — so we have no purely-JS
+//!    signal. An earlier attempt to resize the webview's UIView frame
+//!    via `setFrame:` changed the physical size but WebKit never
+//!    recomputed the layout viewport, so the page still thought it was
+//!    812 tall. Emitting an event lets the frontend set a CSS custom
+//!    property directly, which is what the Android path already does.
 //!
 //! Reference: <https://github.com/orgs/tauri-apps/discussions/9368>.
 
@@ -29,15 +36,16 @@ use std::cell::RefCell;
 use std::ptr::NonNull;
 
 use block2::RcBlock;
-use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
+use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
 use objc2_core_foundation::{CGPoint, CGRect};
 use objc2_foundation::{
-    NSNotification, NSNotificationCenter, NSObjectProtocol, NSString, NSValue,
+    NSNotification, NSNotificationCenter, NSObject, NSObjectProtocol, NSString, NSValue,
 };
 use objc2_ui_kit::{
     UIKeyboardFrameEndUserInfoKey, UIKeyboardWillHideNotification, UIKeyboardWillShowNotification,
+    UIScrollView, UIScrollViewDelegate,
 };
 use serde::Serialize;
 use tauri::{Emitter, WebviewWindow};
@@ -45,8 +53,37 @@ use tauri::{Emitter, WebviewWindow};
 /// `UIScrollViewContentInsetAdjustmentNever` raw value from UIKit.
 const CONTENT_INSET_ADJUSTMENT_NEVER: isize = 2;
 
+define_class! {
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "IrohBleChatScrollLock"]
+    #[ivars = ()]
+    struct ScrollLock;
+
+    unsafe impl NSObjectProtocol for ScrollLock {}
+
+    unsafe impl UIScrollViewDelegate for ScrollLock {
+        #[unsafe(method(scrollViewDidScroll:))]
+        fn scroll_view_did_scroll(&self, sv: &UIScrollView) {
+            let offset = sv.contentOffset();
+            if offset.x != 0.0 || offset.y != 0.0 {
+                sv.setContentOffset(CGPoint { x: 0.0, y: 0.0 });
+            }
+        }
+    }
+}
+
+impl ScrollLock {
+    fn new(mtm: MainThreadMarker) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 thread_local! {
-    // Keep the observer tokens alive for the process lifetime.
+    // Delegates are held weakly by UIScrollView; retain ours for the
+    // app's lifetime so the weak ref stays valid.
+    static SCROLL_LOCK: RefCell<Option<Retained<ScrollLock>>> = const { RefCell::new(None) };
     // NSNotificationCenter's `addObserverForName:object:queue:usingBlock:`
     // returns an opaque token; dropping it de-registers the observer.
     static OBSERVERS: RefCell<Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>> =
@@ -76,20 +113,32 @@ pub fn configure_ios_webview(webview_window: &WebviewWindow) {
             setContentInsetAdjustmentBehavior: CONTENT_INSET_ADJUSTMENT_NEVER
         ];
 
-        // usize is Send — necessary because the observer blocks are stored
-        // in a thread_local and might outlive this setup closure.
-        install_keyboard_observers(window_clone, scroll_view as usize);
+        install_scroll_lock(scroll_view);
+        install_keyboard_observers(window_clone);
     });
 }
 
-fn install_keyboard_observers(webview_window: WebviewWindow, scroll_view_addr: usize) {
+/// Install the permanent ScrollLock delegate on the WKWebView's scrollView.
+unsafe fn install_scroll_lock(scroll_view: *mut AnyObject) {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let lock = ScrollLock::new(mtm);
+    let delegate_ref: &ProtocolObject<dyn UIScrollViewDelegate> =
+        ProtocolObject::from_ref(&*lock);
+    unsafe {
+        let _: () = msg_send![scroll_view, setDelegate: delegate_ref];
+    }
+    SCROLL_LOCK.with(|cell| *cell.borrow_mut() = Some(lock));
+}
+
+fn install_keyboard_observers(webview_window: WebviewWindow) {
     // SAFETY: all UIKit message sends + NSNotificationCenter calls happen
     // on the main thread, which is where Tauri invokes setup hooks and
     // where UIKeyboard* notifications are posted.
     unsafe {
         let center = NSNotificationCenter::defaultCenter();
 
-        // ── willShow ────────────────────────────────────────────────────
         let window_show = webview_window.clone();
         let show_block = RcBlock::new(move |notif: NonNull<NSNotification>| {
             let notif = notif.as_ref();
@@ -102,13 +151,6 @@ fn install_keyboard_observers(webview_window: WebviewWindow, scroll_view_addr: u
                     height: kb_frame.size.height,
                 },
             );
-            // iOS auto-scrolls the WKWebView's scrollView up to reveal the
-            // focused input at its original DOM position before firing
-            // this notification. With .app about to shrink above the
-            // keyboard (driven by the event we just emitted), that scroll
-            // leaves the page visibly offset upward until the user drags
-            // it back. Reset the contentOffset so the page sits at origin.
-            reset_scroll_origin(scroll_view_addr);
         });
         let show_token = center.addObserverForName_object_queue_usingBlock(
             Some(UIKeyboardWillShowNotification),
@@ -117,11 +159,9 @@ fn install_keyboard_observers(webview_window: WebviewWindow, scroll_view_addr: u
             &show_block,
         );
 
-        // ── willHide ────────────────────────────────────────────────────
         let window_hide = webview_window;
         let hide_block = RcBlock::new(move |_notif: NonNull<NSNotification>| {
             let _ = window_hide.emit("keyboard-hide", ());
-            reset_scroll_origin(scroll_view_addr);
         });
         let hide_token = center.addObserverForName_object_queue_usingBlock(
             Some(UIKeyboardWillHideNotification),
@@ -135,20 +175,6 @@ fn install_keyboard_observers(webview_window: WebviewWindow, scroll_view_addr: u
             v.push(show_token);
             v.push(hide_token);
         });
-    }
-}
-
-/// Snap the WKWebView's scrollView back to `(0, 0)`.
-fn reset_scroll_origin(scroll_view_addr: usize) {
-    let scroll_view = scroll_view_addr as *mut AnyObject;
-    if scroll_view.is_null() {
-        return;
-    }
-    let zero = CGPoint { x: 0.0, y: 0.0 };
-    // SAFETY: the scroll view is retained by its parent WKWebView for the
-    // app's lifetime and all access happens on the main thread.
-    unsafe {
-        let _: () = msg_send![scroll_view, setContentOffset: zero];
     }
 }
 
