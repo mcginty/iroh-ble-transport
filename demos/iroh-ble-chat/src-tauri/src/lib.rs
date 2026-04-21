@@ -87,24 +87,29 @@ fn ble_phase_str(phase: BlePeerPhase) -> &'static str {
 
 impl PeerState {
     fn ui_status(&self) -> &'static str {
-        match self.ble_phase {
-            Some(BlePeerPhase::Connected) => "connected",
-            Some(BlePeerPhase::Handshaking) => "handshaking",
-            Some(BlePeerPhase::Connecting) => "connecting",
-            Some(BlePeerPhase::Reconnecting | BlePeerPhase::Restoring) => "reconnecting",
-            Some(BlePeerPhase::PendingDial) => "pending_dial",
-            Some(BlePeerPhase::Discovered | BlePeerPhase::Unknown) => {
-                if matches!(self.gossip, Some(GossipStatus::Direct)) {
-                    "connected"
-                } else if matches!(self.gossip, Some(GossipStatus::InTopic)) {
-                    "in_topic"
-                } else {
-                    "nearby"
-                }
-            }
-            Some(BlePeerPhase::Draining) => "draining",
-            Some(BlePeerPhase::Dead) => "dead",
-            None => match self.gossip {
+        // "connected" must mean "messages will be delivered". BLE Connected
+        // alone is not enough — right after a peer restart there is a
+        // window where the BLE L2CAP pipe is healthy but iroh-gossip hasn't
+        // re-adopted the peer as a direct neighbor (the old QUIC connection
+        // is still aging out its idle-timeout, and gossip messages from
+        // send_message broadcast to zero neighbors and disappear). Treat
+        // BLE-up but gossip-not-yet-Direct as "handshaking" so the UI
+        // reflects that sends aren't yet reaching the peer.
+        match (self.ble_phase, self.gossip) {
+            (Some(BlePeerPhase::Connected), Some(GossipStatus::Direct)) => "connected",
+            (Some(BlePeerPhase::Connected), _) => "handshaking",
+            (Some(BlePeerPhase::Handshaking), _) => "handshaking",
+            (Some(BlePeerPhase::Connecting), _) => "connecting",
+            (Some(BlePeerPhase::Reconnecting | BlePeerPhase::Restoring), _) => "reconnecting",
+            (Some(BlePeerPhase::PendingDial), _) => "pending_dial",
+            (Some(BlePeerPhase::Discovered | BlePeerPhase::Unknown), gossip) => match gossip {
+                Some(GossipStatus::Direct) => "connected",
+                Some(GossipStatus::InTopic) => "in_topic",
+                _ => "nearby",
+            },
+            (Some(BlePeerPhase::Draining), _) => "draining",
+            (Some(BlePeerPhase::Dead), _) => "dead",
+            (None, gossip) => match gossip {
                 Some(GossipStatus::Direct) => "connected",
                 Some(GossipStatus::InTopic) => "in_topic",
                 Some(GossipStatus::Stale) => "stale",
@@ -260,12 +265,19 @@ async fn start_node(
     let lookup = ble_transport.address_lookup();
     let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble_transport.clone();
 
-    // BLE-tuned QUIC idle timeout. The default (30s) leaves a large window
-    // between BLE-level disconnect detection (~6s via ReliableChannel's
-    // LINK_DEAD_DEADLINE) and iroh finally marking the connection dead, which
-    // manifests as the UI showing a peer as connected long after the BLE link
-    // is gone. 15s is short enough to cut that gap noticeably while still
-    // tolerating the multi-second pauses real BLE links exhibit.
+    // BLE-tuned QUIC idle timeout. The default (30s) is too lax because
+    // BLE-level disconnect detection is ~6s (LINK_DEAD_DEADLINE), leaving
+    // iroh holding a dead Connection for a long window during which
+    // gossip sends broadcast to zero direct neighbors and vanish. But we
+    // cannot go below `keep_alive_interval * 3` (`BlePreset::keep_alive_interval = 5s`)
+    // without racing idle-timeout against keep-alive, and on a *fresh*
+    // peer the QUIC TLS handshake runs over the slow GATT path (L2CAP
+    // upgrade only fires after `VerifiedEndpoint`), which can take 3-5s
+    // with ARQ retransmits — a short idle timeout kills the handshake
+    // mid-flight and surfaces as `accepting failed: authentication
+    // failed` on the peer. 15s is the compromise: comfortably above the
+    // handshake time and keep-alive window, tight enough to not leave
+    // the UI showing "Connected" for >15s after BLE actually died.
     let transport_cfg = QuicTransportConfig::builder()
         .max_idle_timeout(Some(
             std::time::Duration::from_secs(15)
@@ -938,6 +950,32 @@ mod tests {
     }
 
     #[test]
+    fn ui_status_ble_connected_without_direct_gossip_is_handshaking() {
+        // The "fake connected" case: BLE-L2CAP is up but the peer just
+        // restarted and gossip hasn't re-adopted the connection yet.
+        // Previously this reported "connected" even though send_message
+        // was broadcasting to zero neighbors. Must be "handshaking" now.
+        let mut peer = test_peer();
+        peer.ble_phase = Some(BlePeerPhase::Connected);
+
+        peer.gossip = None;
+        assert_eq!(peer.ui_status(), "handshaking");
+
+        peer.gossip = Some(GossipStatus::InTopic);
+        assert_eq!(peer.ui_status(), "handshaking");
+
+        peer.gossip = Some(GossipStatus::Stale);
+        assert_eq!(peer.ui_status(), "handshaking");
+
+        peer.gossip = Some(GossipStatus::Direct);
+        assert_eq!(
+            peer.ui_status(),
+            "connected",
+            "both BLE-Connected and gossip-Direct required for \"connected\""
+        );
+    }
+
+    #[test]
     fn collect_join_targets_includes_non_direct_peers_once() {
         let own_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let direct_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
@@ -1101,21 +1139,32 @@ async fn transport_state_tick(
 
                 // BLE just noticed a peer we've been told about. Kick
                 // `join_peers` immediately instead of waiting for the 10s
-                // `reconnect_tick`: the typical case is iroh-gossip's first
-                // dial timed out before slow BLE scanning surfaced the
-                // advert, and otherwise the peer sits in Discovered until
-                // the next tick boundary.
-                let is_new_sighting = peer.ble_phase.is_none()
-                    && matches!(
-                        new_phase,
-                        Some(
-                            BlePeerPhase::Discovered
-                                | BlePeerPhase::Connecting
-                                | BlePeerPhase::Handshaking
-                                | BlePeerPhase::Connected
-                        )
-                    );
-                if is_new_sighting && should_nudge_join_inbound(peer.gossip, peer.last_join_nudge) {
+                // `reconnect_tick`. Two cases matter:
+                //
+                // 1. Fresh sighting (ble_phase was None): the typical
+                //    cold-start case where iroh-gossip's first dial timed
+                //    out before slow BLE scanning surfaced the advert.
+                // 2. BLE restore (ble_phase was non-Connected, now
+                //    Connected): a peer restart cycles BLE through
+                //    Draining → Dead → Connected. Without a nudge here,
+                //    gossip keeps using its stale QUIC connection until
+                //    max_idle_timeout fires. The nudge triggers a fresh
+                //    QUIC handshake over the new BLE path.
+                let now_connected_or_forming = matches!(
+                    new_phase,
+                    Some(
+                        BlePeerPhase::Discovered
+                            | BlePeerPhase::Connecting
+                            | BlePeerPhase::Handshaking
+                            | BlePeerPhase::Connected
+                    )
+                );
+                let is_fresh_sighting = peer.ble_phase.is_none() && now_connected_or_forming;
+                let is_ble_restored = !matches!(peer.ble_phase, Some(BlePeerPhase::Connected))
+                    && matches!(new_phase, Some(BlePeerPhase::Connected));
+                if (is_fresh_sighting || is_ble_restored)
+                    && should_nudge_join_inbound(peer.gossip, peer.last_join_nudge)
+                {
                     peer.last_join_nudge = Some(Instant::now());
                     discovery_nudge_targets.push(peer.id);
                 }
