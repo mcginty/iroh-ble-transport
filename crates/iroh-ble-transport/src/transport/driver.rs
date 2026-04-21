@@ -315,13 +315,35 @@ impl<I: BleInterface> Driver<I> {
                 let routing_v2 = Arc::clone(&self.routing_v2);
                 let routing_v1 = Arc::clone(&self.routing_v1);
                 let direction = direction_for_role(role);
-                let stable_id = routing_v2.register_pipe(device_id.clone(), direction);
-                // Step 4a: enter the pending pool. target_endpoint=None
-                // here; step 4c's resolver rewrite will pre-register
-                // outbound pendings with Some(target) when the resolver
-                // triggers a dial. For now every pipe starts with no
-                // known target.
-                routing_v2.register_pending(stable_id, None);
+                // Step 4c: if the resolver previously minted a reservation
+                // for this peer's prefix, bind this pipe to that reserved
+                // `StableConnId` rather than minting a fresh one. Keeps
+                // iroh's outstanding `CustomAddr` valid across the dial.
+                // Only outbound pipes can match — inbound accepts don't
+                // have a resolver-side reservation (we didn't dial).
+                let (stable_id, reservation_endpoint) =
+                    match routing_v2.consume_reservation_for_device(&device_id) {
+                        Some(reservation) => {
+                            routing_v2.register_pipe_with_id(
+                                reservation.stable_id,
+                                device_id.clone(),
+                                direction,
+                            );
+                            tracing::debug!(
+                                device = %device_id,
+                                stable_id = %reservation.stable_id,
+                                endpoint = %reservation.endpoint_id,
+                                "StartDataPipe: bound pipe to resolver reservation"
+                            );
+                            (reservation.stable_id, Some(reservation.endpoint_id))
+                        }
+                        None => (routing_v2.register_pipe(device_id.clone(), direction), None),
+                    };
+                // Step 4a: enter the pending pool. `target_endpoint` is
+                // the endpoint the resolver dialed for if we consumed a
+                // reservation; `None` for inbound accepts and for
+                // outbounds that didn't go through the resolver.
+                routing_v2.register_pending(stable_id, reservation_endpoint);
                 // Install the StableConnId as a device-keyed token so
                 // poll_send can resolve the CustomAddr that poll_recv
                 // will stamp on inbound packets from this pipe.
@@ -919,6 +941,67 @@ mod tests {
             }
             other => panic!("expected DataPipeReady, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn start_data_pipe_consumes_reservation_for_known_prefix() {
+        // Step 4c contract: if the resolver previously minted a
+        // reservation for this peer's prefix, StartDataPipe must bind
+        // the opened pipe to the *reserved* StableConnId (not a fresh
+        // mint). Otherwise iroh's outstanding `CustomAddr` would point
+        // at a dead reservation forever.
+        use crate::transport::peer::{ConnectPath, ConnectRole};
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::clone(&routing_v2),
+            Arc::new(crate::transport::routing::TransportRouting::new()),
+        );
+
+        // Pre-seed: scan_hint maps the peer's prefix → device_id, and
+        // the resolver reserves a stable_id. Mirrors what happens when
+        // iroh asks to dial a peer the scanner has just surfaced.
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x57u8; 32]).public();
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint);
+        let device_id = blew::DeviceId::from("reserved-peer");
+        routing_v2.note_scan_hint(prefix, device_id.clone());
+        let reserved_id = routing_v2.reserve_outbound(endpoint);
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: device_id.clone(),
+                tx_gen: 3,
+                role: ConnectRole::Central,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+
+        // The only live pipe must carry the reserved id.
+        let pipes = routing_v2.pipes_for_debug();
+        assert_eq!(pipes.len(), 1);
+        assert_eq!(
+            pipes[0].id, reserved_id,
+            "StartDataPipe must reuse the reserved StableConnId"
+        );
+        // Reservation is consumed.
+        assert_eq!(routing_v2.reservation_len(), 0);
+        // And the pending entry carries the endpoint target picked up
+        // from the reservation, so promote() has the context it needs.
+        assert_eq!(routing_v2.pending_pipe_for(&endpoint), Some(reserved_id));
+
+        // Drain the ready command so rx is clean.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
     }
 
     #[tokio::test]

@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Waker;
 use std::time::Instant;
 
 use blew::DeviceId;
@@ -158,6 +159,38 @@ struct RoutingInner {
     /// entry per peer (invariant enforced by the promotion rule in
     /// step 4b).
     routable: HashMap<EndpointId, Routable>,
+    /// Outbound-dial reservations: the resolver has yielded a
+    /// `CustomAddr(stable_id)` to iroh but no pipe exists yet. When
+    /// the driver opens a pipe for a prefix with a reservation, it
+    /// binds the reserved id to that pipe instead of minting a fresh
+    /// one — keeps iroh's `CustomAddr` valid across the dial.
+    /// Keyed on `KeyPrefix` because MAC-rotation is common and the
+    /// prefix is stable; lookup by `DeviceId` bridges through
+    /// `scan_hint`.
+    reservations: HashMap<KeyPrefix, Reservation>,
+    /// Reverse map from reserved stable_id → its prefix. Used by
+    /// `poll_send` to quickly answer "is this stable_id a reservation
+    /// waiting for a pipe?" without scanning the whole reservations
+    /// map.
+    reserved_stable_ids: HashMap<StableConnId, KeyPrefix>,
+    /// Wakers parked by `BleAddressLookup::resolve` while it waits
+    /// for a routable / pending / reservation entry for its target
+    /// endpoint. Keyed on endpoint so different resolvers don't wake
+    /// each other spuriously.
+    endpoint_wakers: HashMap<EndpointId, Vec<Waker>>,
+}
+
+/// A reservation: the resolver promised iroh a `CustomAddr(stable_id)`
+/// would eventually route somewhere, and is waiting for a pipe to
+/// that promise's target. When the driver opens a pipe to any device
+/// whose `scan_hint` prefix matches, it binds `stable_id` to the
+/// pipe (instead of minting fresh) so iroh's existing `CustomAddr`
+/// keeps working.
+#[derive(Debug, Clone)]
+pub struct Reservation {
+    pub stable_id: StableConnId,
+    pub endpoint_id: EndpointId,
+    pub reserved_at: Instant,
 }
 
 impl Routing {
@@ -242,17 +275,40 @@ impl Routing {
     /// Returns the `DeviceId` previously mapped to this prefix (if any),
     /// so callers can forget stale routing state in `routing_v1`.
     pub fn note_scan_hint(&self, prefix: KeyPrefix, device: DeviceId) -> Option<DeviceId> {
-        let mut inner = self.inner.lock();
-        let previous = inner.scan_hint.insert(prefix, device.clone());
-        if previous.as_ref() != Some(&device) {
-            tracing::trace!(
-                ?prefix,
-                device = %device,
-                previous = ?previous,
-                "routing_v2: scan_hint updated"
-            );
-        }
+        let previous = {
+            let mut inner = self.inner.lock();
+            let previous = inner.scan_hint.insert(prefix, device.clone());
+            if previous.as_ref() != Some(&device) {
+                tracing::trace!(
+                    ?prefix,
+                    device = %device,
+                    previous = ?previous,
+                    "routing_v2: scan_hint updated"
+                );
+            }
+            previous
+        };
+        // A fresh scan_hint for a prefix means any resolver parked on
+        // an endpoint with this prefix can now make progress. Wake
+        // them by iterating the endpoint_wakers map and matching on
+        // prefix.
+        self.wake_endpoint_waiters_for_prefix(&prefix);
         previous
+    }
+
+    fn wake_endpoint_waiters_for_prefix(&self, prefix: &KeyPrefix) {
+        let to_wake: Vec<EndpointId> = {
+            let inner = self.inner.lock();
+            inner
+                .endpoint_wakers
+                .keys()
+                .filter(|ep| crate::transport::routing::prefix_from_endpoint(ep) == *prefix)
+                .copied()
+                .collect()
+        };
+        for ep in to_wake {
+            self.wake_endpoint_waiters(&ep);
+        }
     }
 
     /// Clear the scan hint for `prefix`. Idempotent. Used when scan
@@ -280,16 +336,21 @@ impl Routing {
     /// outbound pipes that came from a resolver dial (step 4c wires
     /// this) and `None` for inbound accepts.
     pub fn register_pending(&self, pipe: StableConnId, target_endpoint: Option<EndpointId>) {
-        let mut inner = self.inner.lock();
-        inner.pending.insert(
-            pipe,
-            Pending {
+        {
+            let mut inner = self.inner.lock();
+            inner.pending.insert(
                 pipe,
-                target_endpoint,
-                created_at: Instant::now(),
-            },
-        );
+                Pending {
+                    pipe,
+                    target_endpoint,
+                    created_at: Instant::now(),
+                },
+            );
+        }
         tracing::trace!(%pipe, ?target_endpoint, "routing_v2: pending registered");
+        if let Some(ep) = target_endpoint {
+            self.wake_endpoint_waiters(&ep);
+        }
     }
 
     /// Remove a pending entry. Called when a pipe closes before
@@ -309,17 +370,21 @@ impl Routing {
         pipe: StableConnId,
         dialer: Dialer,
     ) -> Option<Routable> {
-        let mut inner = self.inner.lock();
-        inner.pending.remove(&pipe);
-        inner.routable.insert(
-            endpoint_id,
-            Routable {
-                pipe,
+        let prev = {
+            let mut inner = self.inner.lock();
+            inner.pending.remove(&pipe);
+            inner.routable.insert(
                 endpoint_id,
-                dialer,
-                verified_at: Instant::now(),
-            },
-        )
+                Routable {
+                    pipe,
+                    endpoint_id,
+                    dialer,
+                    verified_at: Instant::now(),
+                },
+            )
+        };
+        self.wake_endpoint_waiters(&endpoint_id);
+        prev
     }
 
     /// Remove the routable entry for an endpoint, if any. Returns the
@@ -369,6 +434,20 @@ impl Routing {
             .map(|p| p.pipe)
     }
 
+    /// Resolve a live pipe's `StableConnId` back to the `DeviceId` it
+    /// was opened against. `poll_send` consults this to translate
+    /// iroh's `CustomAddr(stable_id)` into a `SendDatagram` command.
+    /// Returns `None` if the id belongs to a reservation (no pipe yet)
+    /// or has been evicted.
+    #[must_use]
+    pub fn device_for_pipe(&self, stable_id: StableConnId) -> Option<DeviceId> {
+        self.inner
+            .lock()
+            .pipes
+            .get(&stable_id)
+            .map(|p| p.device_id.clone())
+    }
+
     /// Debug helpers for tests.
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
@@ -378,6 +457,144 @@ impl Routing {
     #[cfg(test)]
     pub(crate) fn routable_len(&self) -> usize {
         self.inner.lock().routable.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reservation_len(&self) -> usize {
+        self.inner.lock().reservations.len()
+    }
+
+    // ---------- reservations + endpoint wakers (step 4c) ----------
+
+    /// Mint a fresh `StableConnId` and stash it as an outbound-dial
+    /// reservation for `endpoint_id`. Called by
+    /// `BleAddressLookup::resolve` when `scan_hint` confirms the peer
+    /// is reachable but no pipe exists yet.
+    ///
+    /// If a reservation for this prefix already exists, return the
+    /// existing id (idempotent). This keeps `CustomAddr`s stable
+    /// across repeated resolve calls for the same peer.
+    pub fn reserve_outbound(&self, endpoint_id: EndpointId) -> StableConnId {
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
+        let mut inner = self.inner.lock();
+        if let Some(existing) = inner.reservations.get(&prefix) {
+            return existing.stable_id;
+        }
+        let stable_id = StableConnId(self.next_id.fetch_add(1, Ordering::Relaxed).wrapping_add(1));
+        inner.reservations.insert(
+            prefix,
+            Reservation {
+                stable_id,
+                endpoint_id,
+                reserved_at: Instant::now(),
+            },
+        );
+        inner.reserved_stable_ids.insert(stable_id, prefix);
+        tracing::debug!(%stable_id, %endpoint_id, ?prefix, "routing_v2: outbound reservation");
+        stable_id
+    }
+
+    /// If `stable_id` is a live reservation (not yet bound to a pipe),
+    /// return the target endpoint and prefix. `poll_send` uses this to
+    /// translate `CustomAddr(stable_id)` into "trigger a dial for
+    /// endpoint X via scan_hint[prefix]".
+    #[must_use]
+    pub fn reservation_target(&self, stable_id: StableConnId) -> Option<(EndpointId, KeyPrefix)> {
+        let inner = self.inner.lock();
+        let prefix = *inner.reserved_stable_ids.get(&stable_id)?;
+        let reservation = inner.reservations.get(&prefix)?;
+        Some((reservation.endpoint_id, prefix))
+    }
+
+    /// Look up the reservation for this prefix, if any. Resolver calls
+    /// this to decide whether to reuse an existing reservation or mint
+    /// a new one.
+    #[must_use]
+    pub fn reservation_for_prefix(&self, prefix: &KeyPrefix) -> Option<Reservation> {
+        self.inner.lock().reservations.get(prefix).cloned()
+    }
+
+    /// Consume the reservation for `prefix` (if any). Driver calls
+    /// this at pipe-open so it can bind the reserved id to the
+    /// just-opened pipe.
+    pub fn consume_reservation_for_prefix(&self, prefix: &KeyPrefix) -> Option<Reservation> {
+        let mut inner = self.inner.lock();
+        let reservation = inner.reservations.remove(prefix)?;
+        inner.reserved_stable_ids.remove(&reservation.stable_id);
+        Some(reservation)
+    }
+
+    /// Reverse-lookup via scan_hint: given a `DeviceId` the driver
+    /// just opened a pipe to, find the prefix that's been tracking it
+    /// and (if any) consume the reservation. Convenience for the
+    /// pipe-open path, which knows `DeviceId` but not `KeyPrefix`.
+    pub fn consume_reservation_for_device(&self, device_id: &DeviceId) -> Option<Reservation> {
+        let mut inner = self.inner.lock();
+        let prefix = *inner
+            .scan_hint
+            .iter()
+            .find_map(|(p, d)| (d == device_id).then_some(p))?;
+        let reservation = inner.reservations.remove(&prefix)?;
+        inner.reserved_stable_ids.remove(&reservation.stable_id);
+        Some(reservation)
+    }
+
+    /// Register a pipe with a caller-specified `StableConnId` (rather
+    /// than minting). Driver calls this when it's consuming a
+    /// reservation — the id was already handed to iroh and must be
+    /// preserved. Panics in debug if the id collides with an existing
+    /// pipe to catch lifecycle bugs early.
+    pub fn register_pipe_with_id(
+        &self,
+        stable_id: StableConnId,
+        device_id: DeviceId,
+        direction: Direction,
+    ) {
+        let pipe = Pipe {
+            id: stable_id,
+            device_id: device_id.clone(),
+            direction,
+            created_at: Instant::now(),
+        };
+        let mut inner = self.inner.lock();
+        debug_assert!(
+            !inner.pipes.contains_key(&stable_id),
+            "StableConnId collision: id={stable_id} already live"
+        );
+        inner.pipes.insert(stable_id, pipe);
+        tracing::debug!(
+            %stable_id,
+            device = %device_id,
+            ?direction,
+            "routing_v2: pipe registered (reused reserved id)"
+        );
+    }
+
+    /// Park a waker for a resolver waiting on any state change for
+    /// `endpoint_id`. Drained by `wake_endpoint_waiters`.
+    pub fn register_endpoint_waker(&self, endpoint_id: EndpointId, waker: &Waker) {
+        let mut inner = self.inner.lock();
+        let list = inner.endpoint_wakers.entry(endpoint_id).or_default();
+        if !list.iter().any(|w| w.will_wake(waker)) {
+            list.push(waker.clone());
+        }
+    }
+
+    /// Drain and wake all resolvers parked on `endpoint_id`. Called
+    /// from any state change that might advance a parked resolver:
+    /// a new scan_hint, a new pending with matching target, a new
+    /// routable entry, a new reservation.
+    fn wake_endpoint_waiters(&self, endpoint_id: &EndpointId) {
+        let wakers: Vec<Waker> = {
+            let mut inner = self.inner.lock();
+            inner
+                .endpoint_wakers
+                .remove(endpoint_id)
+                .unwrap_or_default()
+        };
+        for w in wakers {
+            w.wake();
+        }
     }
 
     // ---------- promotion rule (step 4b) ----------
@@ -1055,6 +1272,169 @@ mod tests {
         // No pipe was registered for this id.
         let outcome = r.promote(ghost, &me, peer);
         assert!(matches!(outcome, PromoteOutcome::Rejected));
+    }
+
+    // ---------- reservations + endpoint wakers (step 4c) ----------
+
+    struct CountingWaker(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for CountingWaker {
+        fn wake(self: std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &std::sync::Arc<Self>) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    fn counting_waker() -> (std::sync::Arc<CountingWaker>, std::task::Waker) {
+        let inner = std::sync::Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(std::sync::Arc::clone(&inner));
+        (inner, waker)
+    }
+
+    fn prefix_of(ep: &EndpointId) -> KeyPrefix {
+        crate::transport::routing::prefix_from_endpoint(ep)
+    }
+
+    #[test]
+    fn reserve_outbound_is_idempotent_per_prefix() {
+        let r = Routing::new();
+        let ep = test_endpoint(31);
+        let a = r.reserve_outbound(ep);
+        let b = r.reserve_outbound(ep);
+        assert_eq!(a, b, "second reserve for same prefix returns same id");
+        assert_eq!(r.reservation_len(), 1);
+    }
+
+    #[test]
+    fn reservation_target_roundtrips_prefix_and_endpoint() {
+        let r = Routing::new();
+        let ep = test_endpoint(32);
+        let id = r.reserve_outbound(ep);
+        let (got_ep, got_prefix) = r.reservation_target(id).expect("reservation present");
+        assert_eq!(got_ep, ep);
+        assert_eq!(got_prefix, prefix_of(&ep));
+    }
+
+    #[test]
+    fn consume_reservation_for_prefix_removes_both_sides() {
+        let r = Routing::new();
+        let ep = test_endpoint(33);
+        let id = r.reserve_outbound(ep);
+        let prefix = prefix_of(&ep);
+        let taken = r.consume_reservation_for_prefix(&prefix).expect("taken");
+        assert_eq!(taken.stable_id, id);
+        assert_eq!(taken.endpoint_id, ep);
+        assert_eq!(r.reservation_len(), 0);
+        assert!(r.reservation_target(id).is_none());
+        // Idempotent second call.
+        assert!(r.consume_reservation_for_prefix(&prefix).is_none());
+    }
+
+    #[test]
+    fn consume_reservation_for_device_uses_scan_hint() {
+        let r = Routing::new();
+        let ep = test_endpoint(34);
+        let prefix = prefix_of(&ep);
+        let device = dev("mac-34");
+        r.note_scan_hint(prefix, device.clone());
+        let id = r.reserve_outbound(ep);
+        let taken = r
+            .consume_reservation_for_device(&device)
+            .expect("device is tracked under reserved prefix");
+        assert_eq!(taken.stable_id, id);
+        assert_eq!(r.reservation_len(), 0);
+    }
+
+    #[test]
+    fn consume_reservation_for_device_returns_none_without_scan_hint() {
+        let r = Routing::new();
+        let ep = test_endpoint(35);
+        r.reserve_outbound(ep);
+        // No scan_hint for this prefix → can't translate the device back.
+        assert!(
+            r.consume_reservation_for_device(&dev("unknown-mac"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn register_pipe_with_id_inserts_without_minting_new() {
+        let r = Routing::new();
+        let ep = test_endpoint(36);
+        let id = r.reserve_outbound(ep);
+        r.register_pipe_with_id(id, dev("mac-36"), Direction::Outbound);
+        assert_eq!(r.snapshot().pipes, 1);
+        assert_eq!(r.device_for_pipe(id).as_ref(), Some(&dev("mac-36")));
+    }
+
+    #[test]
+    fn device_for_pipe_follows_register_and_evict() {
+        let r = Routing::new();
+        let id = r.register_pipe(dev("alive"), Direction::Outbound);
+        assert_eq!(r.device_for_pipe(id).as_ref(), Some(&dev("alive")));
+        r.evict_pipe(id);
+        assert!(r.device_for_pipe(id).is_none());
+    }
+
+    #[test]
+    fn endpoint_waker_fires_when_routable_inserted() {
+        let r = Routing::new();
+        let ep = test_endpoint(37);
+        let (counter, waker) = counting_waker();
+        r.register_endpoint_waker(ep, &waker);
+        let id = r.register_pipe(dev("peer"), Direction::Outbound);
+        r.insert_routable(ep, id, Dialer::Low);
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn endpoint_waker_fires_when_pending_registered_with_target() {
+        let r = Routing::new();
+        let ep = test_endpoint(38);
+        let (counter, waker) = counting_waker();
+        r.register_endpoint_waker(ep, &waker);
+        let id = r.register_pipe(dev("peer"), Direction::Outbound);
+        r.register_pending(id, Some(ep));
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn endpoint_waker_fires_when_scan_hint_lands_for_prefix() {
+        let r = Routing::new();
+        let ep = test_endpoint(39);
+        let (counter, waker) = counting_waker();
+        r.register_endpoint_waker(ep, &waker);
+        r.note_scan_hint(prefix_of(&ep), dev("first-sighting"));
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn endpoint_waker_does_not_fire_for_unrelated_prefix() {
+        let r = Routing::new();
+        let ep_a = test_endpoint(40);
+        let ep_b = test_endpoint(41);
+        let (counter, waker) = counting_waker();
+        r.register_endpoint_waker(ep_a, &waker);
+        // Scan hints for a different prefix must not wake ep_a's waiters.
+        r.note_scan_hint(prefix_of(&ep_b), dev("unrelated"));
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn register_endpoint_waker_dedupes() {
+        let r = Routing::new();
+        let ep = test_endpoint(42);
+        let (counter, waker) = counting_waker();
+        r.register_endpoint_waker(ep, &waker);
+        r.register_endpoint_waker(ep, &waker);
+        r.register_endpoint_waker(ep, &waker);
+        // Wake once via scan_hint.
+        r.note_scan_hint(prefix_of(&ep), dev("x"));
+        assert_eq!(
+            counter.0.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "dedup: each unique waker fires exactly once"
+        );
     }
 
     #[test]
