@@ -838,6 +838,25 @@ const KEYBOARD_MIN_OCCLUSION_PX = 120;
   vv.addEventListener("resize", update);
   vv.addEventListener("scroll", update);
   update();
+
+  // iOS path: the visualViewport does not shrink when the soft keyboard
+  // opens in WKWebView, so the above listener never fires for keyboard
+  // events. Instead, src-tauri/src/webview_helper.rs observes
+  // UIKeyboardWillShow / UIKeyboardWillHide natively and forwards the
+  // keyboard height to us as Tauri events. We translate those into the
+  // same --app-height / --safe-bottom overrides the Android path uses.
+  listen<{ height: number }>("keyboard-show", (e) => {
+    const kbHeight = e.payload.height;
+    root.style.setProperty("--app-height", `${window.innerHeight - kbHeight}px`);
+    setSafeBottom(true);
+    if (document.activeElement === msgInput) {
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+  });
+  listen("keyboard-hide", () => {
+    root.style.removeProperty("--app-height");
+    setSafeBottom(false);
+  });
 })();
 
 msgInput.addEventListener("focus", () => {
