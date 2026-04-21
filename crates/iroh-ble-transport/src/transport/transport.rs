@@ -383,6 +383,29 @@ impl BleTransport {
         Arc::clone(&self.routing_v2)
     }
 
+    /// Spawn the pipe-lifetime watchdog (step 5 of the redesign). Polls
+    /// `endpoint.remote_info` for every routable entry and, when iroh
+    /// reports no active path, tells the registry to drain the
+    /// corresponding BLE pipe. See
+    /// [`crate::transport::pipe_watchdog`] for the full contract.
+    ///
+    /// Must be called after the iroh `Endpoint` is bound. Caller owns
+    /// the returned `JoinHandle` — abort it on teardown if you want
+    /// the loop to stop before the transport shuts down.
+    #[must_use]
+    pub fn spawn_pipe_watchdog(
+        &self,
+        endpoint: Arc<iroh::Endpoint>,
+    ) -> tokio::task::JoinHandle<()> {
+        crate::transport::pipe_watchdog::spawn(
+            endpoint,
+            Arc::clone(&self.routing_v2),
+            self.handle.inbox.clone(),
+            crate::transport::pipe_watchdog::DEFAULT_POLL_INTERVAL,
+            crate::transport::pipe_watchdog::DEFAULT_GRACE_PERIOD,
+        )
+    }
+
     /// Debug-only: list the pipes currently tracked by the shadow
     /// routing table. Integration tests use this to verify mint/evict
     /// balance; not intended for production use.

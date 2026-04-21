@@ -448,6 +448,32 @@ impl Routing {
             .map(|p| p.device_id.clone())
     }
 
+    /// Snapshot of the current routable pool for the pipe-lifetime
+    /// watchdog (step 5). Each entry is resolved into
+    /// `(endpoint_id, stable_id, device_id, verified_at)` so the
+    /// watchdog can cross-reference iroh's `remote_info` and, on
+    /// mismatch, push the matching `DeviceId` to the registry for
+    /// tearing down the BLE pipe. Entries with no corresponding pipe
+    /// in `pipes` are dropped from the snapshot (the pipe was evicted
+    /// between the lock releases).
+    #[must_use]
+    pub fn routable_entries(&self) -> Vec<RoutableSnapshot> {
+        let inner = self.inner.lock();
+        inner
+            .routable
+            .values()
+            .filter_map(|r| {
+                let device_id = inner.pipes.get(&r.pipe)?.device_id.clone();
+                Some(RoutableSnapshot {
+                    endpoint_id: r.endpoint_id,
+                    stable_id: r.pipe,
+                    device_id,
+                    verified_at: r.verified_at,
+                })
+            })
+            .collect()
+    }
+
     /// Debug helpers for tests.
     #[cfg(test)]
     pub(crate) fn pending_len(&self) -> usize {
@@ -774,6 +800,18 @@ fn decide(new_dialer: Dialer, contenders: &[Contender]) -> Decision {
 pub enum PromoteOutcome {
     Accepted { evicted: Vec<StableConnId> },
     Rejected,
+}
+
+/// One routable entry surfaced to the pipe-lifetime watchdog (step 5).
+/// Pairs the routable pool's identity with the underlying pipe's
+/// `DeviceId` so the watchdog can issue a targeted teardown to the
+/// registry without racing through a second lock.
+#[derive(Debug, Clone)]
+pub struct RoutableSnapshot {
+    pub endpoint_id: EndpointId,
+    pub stable_id: StableConnId,
+    pub device_id: DeviceId,
+    pub verified_at: Instant,
 }
 
 /// Counts-only view of the shadow routing state. Does not leak any
@@ -1365,6 +1403,41 @@ mod tests {
         r.register_pipe_with_id(id, dev("mac-36"), Direction::Outbound);
         assert_eq!(r.snapshot().pipes, 1);
         assert_eq!(r.device_for_pipe(id).as_ref(), Some(&dev("mac-36")));
+    }
+
+    #[test]
+    fn routable_entries_resolves_routable_pipes_with_device_ids() {
+        let r = Routing::new();
+        let ep1 = test_endpoint(50);
+        let ep2 = test_endpoint(51);
+        let p1 = r.register_pipe(dev("mac-1"), Direction::Outbound);
+        let p2 = r.register_pipe(dev("mac-2"), Direction::Inbound);
+        r.insert_routable(ep1, p1, Dialer::Low);
+        r.insert_routable(ep2, p2, Dialer::High);
+
+        let mut snap = r.routable_entries();
+        snap.sort_by_key(|e| e.stable_id);
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].endpoint_id, ep1);
+        assert_eq!(snap[0].stable_id, p1);
+        assert_eq!(snap[0].device_id, dev("mac-1"));
+        assert_eq!(snap[1].endpoint_id, ep2);
+        assert_eq!(snap[1].stable_id, p2);
+        assert_eq!(snap[1].device_id, dev("mac-2"));
+    }
+
+    #[test]
+    fn routable_entries_drops_routable_with_missing_pipe() {
+        // If the pipes map lost the entry for a routable id (race between
+        // evict_pipe and evict_routable), the watchdog snapshot skips it
+        // rather than handing a stale DeviceId back. The next tick will
+        // pick up the eviction cleanly.
+        let r = Routing::new();
+        let ep = test_endpoint(52);
+        let id = r.register_pipe(dev("ghost-mac"), Direction::Outbound);
+        r.insert_routable(ep, id, Dialer::Low);
+        r.evict_pipe(id);
+        assert_eq!(r.routable_entries().len(), 0);
     }
 
     #[test]

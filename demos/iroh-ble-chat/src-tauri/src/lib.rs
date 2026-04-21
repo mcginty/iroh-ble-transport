@@ -330,6 +330,14 @@ async fn start_node(
 
     let (sender, receiver) = topic.split();
 
+    // Spawn the step-5 pipe-lifetime watchdog now that the iroh
+    // Endpoint is bound. When iroh decides a peer's Connection is
+    // gone (via its max_idle_timeout of 15 s above), the watchdog
+    // tells the BLE transport to tear down the pipe instead of
+    // holding the radio open. The `_watchdog` handle lives on
+    // `AppState` and is implicitly aborted when the app exits.
+    let _watchdog = ble_transport.spawn_pipe_watchdog(Arc::new(ep.clone()));
+
     st.endpoint = Some(ep);
     st._router = Some(router);
     st.gossip_sender = Some(sender.clone());
