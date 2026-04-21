@@ -72,6 +72,7 @@ pub(super) fn spawn_l2cap_io_tasks<R, W>(
     reader: R,
     writer: W,
     device_id: blew::DeviceId,
+    stable_conn_id: crate::transport::routing_v2::StableConnId,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     last_rx_at: crate::transport::peer::LivenessClock,
     tearing_down: Arc<AtomicBool>,
@@ -137,6 +138,7 @@ where
                     if incoming_tx
                         .send(IncomingPacket {
                             device_id: device_id.clone(),
+                            stable_conn_id,
                             data: data.into(),
                         })
                         .await
@@ -259,6 +261,7 @@ mod tests {
             a_rd,
             a_wr,
             device_id.clone(),
+            crate::transport::routing_v2::StableConnId::for_test(42),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),
@@ -297,6 +300,7 @@ mod tests {
             a_rd,
             a_wr,
             device_id.clone(),
+            crate::transport::routing_v2::StableConnId::for_test(42),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),
@@ -330,6 +334,7 @@ mod tests {
             a_rd,
             a_wr,
             blew::DeviceId::from("exit-test"),
+            crate::transport::routing_v2::StableConnId::for_test(42),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),
@@ -356,6 +361,7 @@ mod tests {
             a_rd,
             a_wr,
             device_id.clone(),
+            crate::transport::routing_v2::StableConnId::for_test(42),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),
@@ -393,6 +399,7 @@ mod tests {
             a_rd,
             a_wr,
             blew::DeviceId::from("abort-test"),
+            crate::transport::routing_v2::StableConnId::for_test(42),
             incoming_tx,
             crate::transport::peer::LivenessClock::new(),
             Arc::new(AtomicBool::new(false)),

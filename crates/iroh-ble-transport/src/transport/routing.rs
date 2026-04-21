@@ -244,6 +244,38 @@ impl TransportRouting {
             inner.token_origin.remove(&t);
         }
     }
+
+    /// Install a caller-provided token into the device-keyed routing.
+    /// Used by the driver to wire a `StableConnId` (from `routing_v2`)
+    /// into the v1 token namespace so `poll_send` can resolve the same
+    /// id that `poll_recv` stamped onto inbound `CustomAddr`s.
+    ///
+    /// Step 2 of the redesign: during the transition window, v1 and v2
+    /// token namespaces share the same u64 space. Outbound dialing still
+    /// mints prefix-keyed tokens via `mint_token_for_prefix`; those
+    /// continue to work. Per-pipe `StableConnId`-keyed tokens are
+    /// installed here so inbound packets stamped by `poll_recv` have a
+    /// valid reverse mapping.
+    pub fn install_stable_conn_token(&self, token: Token, device: DeviceId) {
+        let mut inner = self.inner.lock().expect("routing mutex poisoned");
+        inner
+            .token_origin
+            .insert(token, TokenOrigin::Device(device.clone()));
+        // Intentionally do NOT update `device_to_token` here — the
+        // existing prefix-keyed / recv-path mint flow still owns that
+        // for outbound resolution. Overwriting would make subsequent
+        // `mint_token_for_source` calls return this pipe-scoped token,
+        // which would tie iroh's Connection to a pipe that can die
+        // independently. Step 3 reworks this; for now, keep the lanes
+        // separate.
+    }
+
+    /// Remove a previously-installed `StableConnId` token. Called on
+    /// pipe eviction. Idempotent.
+    pub fn uninstall_stable_conn_token(&self, token: Token) {
+        let mut inner = self.inner.lock().expect("routing mutex poisoned");
+        inner.token_origin.remove(&token);
+    }
 }
 
 pub fn prefix_from_endpoint(endpoint_id: &EndpointId) -> KeyPrefix {
@@ -449,6 +481,59 @@ mod tests {
             r.device_for_token(t).as_ref(),
             Some(&d),
             "forget_device must not disturb prefix-keyed routing"
+        );
+    }
+
+    #[test]
+    fn install_stable_conn_token_makes_it_resolvable_by_device_for_token() {
+        // Step 2 contract: the driver installs a StableConnId as a
+        // device-keyed token when a pipe opens; `device_for_token`
+        // resolves it to the pipe's DeviceId so `poll_send` on an
+        // inbound-stamped CustomAddr can reach the pipe.
+        let r = TransportRouting::new();
+        let device = blew::DeviceId::from("pipe-1");
+        let stable_id: Token = 0x1000;
+
+        assert!(r.device_for_token(stable_id).is_none(), "not yet installed");
+
+        r.install_stable_conn_token(stable_id, device.clone());
+        assert_eq!(
+            r.device_for_token(stable_id).as_ref(),
+            Some(&device),
+            "installed token must resolve to the pipe's device"
+        );
+
+        r.uninstall_stable_conn_token(stable_id);
+        assert!(
+            r.device_for_token(stable_id).is_none(),
+            "uninstall must remove the mapping"
+        );
+    }
+
+    #[test]
+    fn install_stable_conn_token_does_not_affect_mint_for_source_outcome() {
+        // Separation of lanes: installing a StableConnId token must
+        // not hijack what `mint_token_for_source` returns for the same
+        // device — otherwise iroh's prefix-keyed outbound token would
+        // silently point at a pipe-lifetime-scoped id that can die
+        // independently from the prefix mapping.
+        let r = TransportRouting::new();
+        let prefix: KeyPrefix = [7u8; KEY_PREFIX_LEN];
+        let device = blew::DeviceId::from("peer");
+        r.note_discovery(prefix, device.clone());
+
+        let prefix_token = r.mint_token_for_source(&device);
+        let stable_id: Token = 0xABCD;
+        r.install_stable_conn_token(stable_id, device.clone());
+
+        let prefix_token_after = r.mint_token_for_source(&device);
+        assert_eq!(
+            prefix_token, prefix_token_after,
+            "install_stable_conn_token must not change what mint_token_for_source returns"
+        );
+        assert_ne!(
+            prefix_token, stable_id,
+            "the two tokens live in the same namespace but point at different layers"
         );
     }
 

@@ -74,6 +74,7 @@ impl ActiveWorker {
 pub async fn run_data_pipe(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
+    stable_conn_id: crate::transport::routing_v2::StableConnId,
     role: ConnectRole,
     initial_path: ConnectPath,
     initial_l2cap: Option<blew::L2capChannel>,
@@ -90,6 +91,7 @@ pub async fn run_data_pipe(
     run_pipe_supervisor(
         iface,
         device_id,
+        stable_conn_id,
         role,
         initial_path,
         initial_l2cap,
@@ -110,6 +112,7 @@ pub async fn run_data_pipe(
 async fn run_pipe_supervisor(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
+    stable_conn_id: crate::transport::routing_v2::StableConnId,
     role: ConnectRole,
     initial_path: ConnectPath,
     initial_l2cap: Option<blew::L2capChannel>,
@@ -128,6 +131,7 @@ async fn run_pipe_supervisor(
         ConnectPath::Gatt => spawn_gatt_worker(
             Arc::clone(&iface),
             device_id.clone(),
+            stable_conn_id,
             role,
             incoming_tx.clone(),
             registry_tx.clone(),
@@ -142,6 +146,7 @@ async fn run_pipe_supervisor(
             };
             spawn_l2cap_worker(
                 device_id.clone(),
+                stable_conn_id,
                 channel,
                 incoming_tx.clone(),
                 registry_tx.clone(),
@@ -195,6 +200,7 @@ async fn run_pipe_supervisor(
                 }
                 let new_active = spawn_l2cap_worker(
                     device_id.clone(),
+                    stable_conn_id,
                     channel,
                     incoming_tx.clone(),
                     registry_tx.clone(),
@@ -306,6 +312,7 @@ async fn forward_outbound(
 fn spawn_gatt_worker(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
+    stable_conn_id: crate::transport::routing_v2::StableConnId,
     role: ConnectRole,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
@@ -320,6 +327,7 @@ fn spawn_gatt_worker(
     let handle = tokio::spawn(run_gatt_pipe(
         iface,
         device_id,
+        stable_conn_id,
         role,
         outbound_fwd_rx,
         inbound_fwd_rx,
@@ -340,8 +348,10 @@ fn spawn_gatt_worker(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_l2cap_worker(
     device_id: blew::DeviceId,
+    stable_conn_id: crate::transport::routing_v2::StableConnId,
     channel: blew::L2capChannel,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
@@ -352,6 +362,7 @@ fn spawn_l2cap_worker(
     let teardown_flag = Arc::new(AtomicBool::new(false));
     let handle = tokio::spawn(run_l2cap_pipe(
         device_id,
+        stable_conn_id,
         channel,
         outbound_fwd_rx,
         Arc::clone(&teardown_flag),
@@ -427,6 +438,7 @@ fn spawn_drain_old_worker(old: ActiveWorker, device_id: blew::DeviceId, timeout:
 async fn run_gatt_pipe(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
+    stable_conn_id: crate::transport::routing_v2::StableConnId,
     role: ConnectRole,
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     mut inbound_rx: mpsc::Receiver<Bytes>,
@@ -531,6 +543,7 @@ async fn run_gatt_pipe(
                         let _ = incoming_tx
                             .send(IncomingPacket {
                                 device_id: device_id.clone(),
+                                stable_conn_id,
                                 data: Bytes::from(data),
                             })
                             .await;
@@ -571,6 +584,7 @@ async fn run_gatt_pipe(
 #[allow(clippy::too_many_arguments)]
 async fn run_l2cap_pipe(
     device_id: blew::DeviceId,
+    stable_conn_id: crate::transport::routing_v2::StableConnId,
     channel: blew::L2capChannel,
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     teardown_flag: Arc<AtomicBool>,
@@ -585,6 +599,7 @@ async fn run_l2cap_pipe(
         reader,
         writer,
         device_id.clone(),
+        stable_conn_id,
         incoming_tx,
         last_rx_at,
         Arc::clone(&teardown_flag),
@@ -694,6 +709,7 @@ mod tests {
         tokio::spawn(run_data_pipe(
             iface.clone() as Arc<dyn BleInterface>,
             device_id.clone(),
+            crate::transport::routing_v2::StableConnId::for_test(1),
             ConnectRole::Central,
             ConnectPath::Gatt,
             None,
@@ -742,6 +758,7 @@ mod tests {
         tokio::spawn(run_data_pipe(
             iface.clone() as Arc<dyn BleInterface>,
             blew::DeviceId::from("pipe-peri"),
+            crate::transport::routing_v2::StableConnId::for_test(2),
             ConnectRole::Peripheral,
             ConnectPath::Gatt,
             None,
@@ -790,6 +807,7 @@ mod tests {
         let worker = spawn_gatt_worker(
             iface as Arc<dyn BleInterface>,
             blew::DeviceId::from("pipe-quiesce"),
+            crate::transport::routing_v2::StableConnId::for_test(99),
             ConnectRole::Central,
             incoming_tx,
             registry_tx,
@@ -839,6 +857,7 @@ mod tests {
         let _pipe = tokio::spawn(run_data_pipe(
             iface as Arc<dyn BleInterface>,
             blew::DeviceId::from("l2cap-empty-out"),
+            crate::transport::routing_v2::StableConnId::for_test(3),
             ConnectRole::Central,
             ConnectPath::L2cap,
             Some(central_side),

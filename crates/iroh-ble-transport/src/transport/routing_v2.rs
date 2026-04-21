@@ -33,6 +33,14 @@ impl StableConnId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Test-only constructor. Production code only obtains `StableConnId`s
+    /// via `Routing::register_pipe`, which guarantees monotonicity.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn for_test(n: u64) -> Self {
+        Self(n)
+    }
 }
 
 impl std::fmt::Display for StableConnId {

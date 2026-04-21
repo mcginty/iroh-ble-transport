@@ -42,6 +42,7 @@ async fn swap_to_l2cap_does_not_deadlock_and_routes_subsequent_sends() {
     let pipe_handle = tokio::spawn(run_data_pipe(
         iface.clone() as Arc<dyn BleInterface>,
         device_id.clone(),
+        iroh_ble_transport::transport::routing_v2::StableConnId::for_test(1),
         ConnectRole::Central,
         ConnectPath::Gatt,
         None,
@@ -158,6 +159,7 @@ async fn supervisor_shuts_down_cleanly_on_outbound_close() {
     let handle = tokio::spawn(run_data_pipe(
         iface.clone() as Arc<dyn BleInterface>,
         blew::DeviceId::from("shutdown"),
+        iroh_ble_transport::transport::routing_v2::StableConnId::for_test(2),
         ConnectRole::Central,
         ConnectPath::Gatt,
         None,

@@ -4895,6 +4895,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(InMemoryPeerStore::new()),
             Arc::new(crate::transport::routing_v2::Routing::new()),
+            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         let snapshots_for_actor = Arc::clone(&snapshots);

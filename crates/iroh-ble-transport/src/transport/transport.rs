@@ -278,6 +278,7 @@ impl BleTransport {
             Arc::clone(&empty_frames),
             Arc::clone(&config.store),
             Arc::clone(&routing_v2),
+            Arc::clone(&routing),
         );
 
         let mut psm = None;
@@ -498,7 +499,6 @@ impl CustomTransport for BleTransport {
             receiver: incoming_rx,
             watchable,
             sender,
-            routing: Arc::clone(&self.routing),
             rx_bytes: Arc::clone(&self.rx_bytes),
             empty_frames: Arc::clone(&self.empty_frames),
         }))
@@ -509,7 +509,6 @@ struct BleEndpoint {
     receiver: mpsc::Receiver<IncomingPacket>,
     watchable: Watchable<Vec<CustomAddr>>,
     sender: Arc<BleSender>,
-    routing: Arc<TransportRouting>,
     rx_bytes: Arc<AtomicU64>,
     empty_frames: Arc<AtomicU64>,
 }
@@ -577,9 +576,18 @@ impl CustomEndpoint for BleEndpoint {
                         );
                         continue;
                     }
-                    let token = self.routing.mint_token_for_source(&packet.device_id);
+                    // Step 2 of the connection-system redesign: stamp
+                    // inbound packets with the pipe's `StableConnId`
+                    // (minted by the driver at pipe-open time). This id
+                    // is installed in v1's routing as a device-keyed
+                    // token when the pipe opens, so `poll_send` can
+                    // resolve the `CustomAddr` iroh now carries on the
+                    // inbound connection. Stable across GATT→L2CAP
+                    // swap (same id throughout the pipe's lifetime).
+                    let token = packet.stable_conn_id.as_u64();
                     tracing::trace!(
                         device = %packet.device_id,
+                        stable_conn_id = %packet.stable_conn_id,
                         token,
                         len = packet.data.len(),
                         "BleEndpoint::poll_recv delivering packet"

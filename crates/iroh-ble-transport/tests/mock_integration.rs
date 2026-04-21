@@ -78,6 +78,7 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
@@ -187,6 +188,7 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
@@ -258,6 +260,7 @@ async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
     let snap_for_actor = snapshots.clone();
@@ -325,6 +328,7 @@ async fn version_mismatch_deads_peer_and_closes_channel() {
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
@@ -415,6 +419,7 @@ async fn version_match_lets_data_pipe_start() {
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
@@ -483,6 +488,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         c_empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
     let peripheral_driver = Driver::new(
         fabric.peripheral.clone(),
@@ -493,6 +499,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         p_empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
 
     let central_reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
@@ -648,6 +655,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
@@ -765,6 +773,7 @@ async fn connect_failure_retries_on_next_tick() {
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
         Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new()),
+        Arc::new(TransportRouting::new()),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
