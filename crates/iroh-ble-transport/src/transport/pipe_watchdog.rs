@@ -136,7 +136,10 @@ pub(crate) async fn tick<E: PipeWatchdogEndpoint>(
         // Synchronously evict from the routable pool so subsequent
         // `poll_send` for this endpoint fails fast. The pending pool
         // is uncommon but safe to clean up as well.
-        if routing.evict_routable(&entry.endpoint_id).is_some() {
+        if routing
+            .evict_routable_if_pipe(&entry.endpoint_id, entry.stable_id)
+            .is_some()
+        {
             routing.evict_pipe_state(entry.stable_id);
         }
         // Ask the registry to drain the BLE pipe — this fires

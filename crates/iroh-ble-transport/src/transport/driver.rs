@@ -284,6 +284,7 @@ impl<I: BleInterface> Driver<I> {
                 device_id,
                 tx_gen,
                 role,
+                target_endpoint,
                 path,
                 l2cap_channel,
             } => {
@@ -303,30 +304,32 @@ impl<I: BleInterface> Driver<I> {
                 let pipe_last_rx_at = last_rx_at.clone();
                 // Register the pipe with routing and enter the
                 // pending pool. If the resolver previously minted a
-                // reservation for this peer's prefix, reuse that id
+                // reservation for this peer's intended endpoint, reuse that id
                 // so iroh's outstanding `CustomAddr` stays valid
                 // across the dial — only outbound pipes match
                 // reservations (inbound accepts have no resolver).
                 let routing = Arc::clone(&self.routing);
                 let direction = direction_for_role(role);
-                let (stable_id, reservation_endpoint) =
-                    match routing.consume_reservation_for_device(&device_id) {
-                        Some(reservation) => {
-                            routing.register_pipe_with_id(
-                                reservation.stable_id,
-                                device_id.clone(),
-                                direction,
-                            );
-                            tracing::info!(
-                                device = %device_id,
-                                stable_id = %reservation.stable_id,
-                                endpoint = %reservation.endpoint_id,
-                                "StartDataPipe: bound pipe to resolver reservation"
-                            );
-                            (reservation.stable_id, Some(reservation.endpoint_id))
-                        }
-                        None => (routing.register_pipe(device_id.clone(), direction), None),
-                    };
+                let (stable_id, reservation_endpoint) = match target_endpoint
+                    .and_then(|endpoint| routing.consume_reservation_for_endpoint(&endpoint))
+                    .or_else(|| routing.consume_reservation_for_device(&device_id))
+                {
+                    Some(reservation) => {
+                        routing.register_pipe_with_id(
+                            reservation.stable_id,
+                            device_id.clone(),
+                            direction,
+                        );
+                        tracing::info!(
+                            device = %device_id,
+                            stable_id = %reservation.stable_id,
+                            endpoint = %reservation.endpoint_id,
+                            "StartDataPipe: bound pipe to resolver reservation"
+                        );
+                        (reservation.stable_id, Some(reservation.endpoint_id))
+                    }
+                    None => (routing.register_pipe(device_id.clone(), direction), None),
+                };
                 routing.register_pending(stable_id, reservation_endpoint);
                 tokio::spawn(async move {
                     run_data_pipe(
@@ -786,6 +789,7 @@ mod tests {
                 device_id: blew::DeviceId::from("start-pipe"),
                 tx_gen: 7,
                 role: ConnectRole::Central,
+                target_endpoint: None,
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
             })
@@ -829,6 +833,7 @@ mod tests {
                 device_id: blew::DeviceId::from("start-pipe-peri"),
                 tx_gen: 9,
                 role: ConnectRole::Peripheral,
+                target_endpoint: None,
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
             })
@@ -850,9 +855,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_data_pipe_consumes_reservation_for_known_prefix() {
+    async fn start_data_pipe_consumes_reservation_for_target_endpoint() {
         // Step 4c contract: if the resolver previously minted a
-        // reservation for this peer's prefix, StartDataPipe must bind
+        // reservation for this peer's endpoint, StartDataPipe must bind
         // the opened pipe to the *reserved* StableConnId (not a fresh
         // mint). Otherwise iroh's outstanding `CustomAddr` would point
         // at a dead reservation forever.
@@ -874,7 +879,7 @@ mod tests {
         );
 
         // Pre-seed: scan_hint maps the peer's prefix → device_id, and
-        // the resolver reserves a stable_id. Mirrors what happens when
+        // the resolver reserves a stable_id for the endpoint. Mirrors what happens when
         // iroh asks to dial a peer the scanner has just surfaced.
         let endpoint = iroh_base::SecretKey::from_bytes(&[0x57u8; 32]).public();
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint);
@@ -887,6 +892,7 @@ mod tests {
                 device_id: device_id.clone(),
                 tx_gen: 3,
                 role: ConnectRole::Central,
+                target_endpoint: Some(endpoint),
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
             })
@@ -942,6 +948,7 @@ mod tests {
                 device_id: old_device,
                 tx_gen: 3,
                 role: ConnectRole::Central,
+                target_endpoint: Some(endpoint),
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
             })
@@ -990,6 +997,7 @@ mod tests {
                 device_id: blew::DeviceId::from("pending-peer"),
                 tx_gen: 1,
                 role: ConnectRole::Central,
+                target_endpoint: None,
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
             })
@@ -1070,6 +1078,7 @@ mod tests {
                 device_id: blew::DeviceId::from("shadow-peer"),
                 tx_gen: 1,
                 role: ConnectRole::Central,
+                target_endpoint: None,
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
             })
@@ -1141,6 +1150,7 @@ mod tests {
                 device_id: blew::DeviceId::from("central-peer"),
                 tx_gen: 1,
                 role: ConnectRole::Central,
+                target_endpoint: None,
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
             })
@@ -1150,6 +1160,7 @@ mod tests {
                 device_id: blew::DeviceId::from("peripheral-peer"),
                 tx_gen: 1,
                 role: ConnectRole::Peripheral,
+                target_endpoint: None,
                 path: ConnectPath::Gatt,
                 l2cap_channel: None,
             })

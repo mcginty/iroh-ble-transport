@@ -225,6 +225,7 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     a.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: dev_b.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: Bytes::from_static(b"hello-from-a"),
             waker,
@@ -391,6 +392,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
     a.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: dev_b.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: Bytes::from_static(b"initial"),
             waker,
@@ -549,6 +551,7 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
     node.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: dev_peer.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: Bytes::from_static(b"initial"),
             waker,
@@ -619,6 +622,7 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
             let _ = sender
                 .send(PeerCommand::SendDatagram {
                     device_id: dev_peer_clone.clone(),
+                    target_endpoint: None,
                     tx_gen: live_tx_gen,
                     datagram: Bytes::from(vec![0xAB; 64]),
                     waker,

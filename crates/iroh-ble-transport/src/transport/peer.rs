@@ -103,6 +103,11 @@ pub struct PeerEntry {
     /// before scan ever saw the advertisement — those peers don't get
     /// persisted to the `PeerStore` because we have no stable key for them.
     pub prefix: Option<KeyPrefix>,
+    /// Intended remote endpoint for an outbound dial that started from an
+    /// address-lookup reservation. Distinct from `verified_endpoint`: this is
+    /// caller intent carried through retries until the pipe binds that
+    /// reservation or the attempt is abandoned.
+    pub target_endpoint: Option<iroh_base::EndpointId>,
     pub verified_endpoint: Option<iroh_base::EndpointId>,
     pub verified_at: Option<Instant>,
     pub l2cap_upgrade_failed: bool,
@@ -126,6 +131,7 @@ impl PeerEntry {
             l2cap_channel: None,
             subscribed_chars: HashSet::new(),
             prefix: None,
+            target_endpoint: None,
             verified_endpoint: None,
             verified_at: None,
             l2cap_upgrade_failed: false,
@@ -262,6 +268,7 @@ pub enum PeerCommand {
     },
     SendDatagram {
         device_id: DeviceId,
+        target_endpoint: Option<iroh_base::EndpointId>,
         tx_gen: u64,
         datagram: Bytes,
         waker: Waker,
@@ -371,6 +378,7 @@ pub enum PeerAction {
         device_id: DeviceId,
         tx_gen: u64,
         role: ConnectRole,
+        target_endpoint: Option<iroh_base::EndpointId>,
         path: ConnectPath,
         l2cap_channel: Option<L2capChannel>,
     },
@@ -455,6 +463,7 @@ mod tests {
             device_id: DeviceId::from("x"),
             tx_gen: 1,
             role: ConnectRole::Central,
+            target_endpoint: None,
             path: ConnectPath::Gatt,
             l2cap_channel: None,
         };

@@ -257,13 +257,23 @@ async fn forward_outbound(
     device_id: &blew::DeviceId,
     registry_tx: &mpsc::Sender<PeerCommand>,
 ) {
+    let mut send = Some(send);
     // Prefer L2CAP when present.
-    let send = if let Some(l2cap) = workers.l2cap.as_ref() {
-        match l2cap
-            .outbound_fwd_tx
-            .send_timeout(send, L2CAP_HANDOVER_TIMEOUT)
-            .await
-        {
+    let l2cap_send = if let Some(l2cap) = workers.l2cap.as_ref() {
+        Some(
+            l2cap
+                .outbound_fwd_tx
+                .send_timeout(
+                    send.take().expect("outbound datagram available for L2CAP"),
+                    L2CAP_HANDOVER_TIMEOUT,
+                )
+                .await,
+        )
+    } else {
+        None
+    };
+    let send = if let Some(result) = l2cap_send {
+        match result {
             Ok(()) => return,
             Err(mpsc::error::SendTimeoutError::Timeout(send)) => {
                 tracing::warn!(
@@ -271,7 +281,9 @@ async fn forward_outbound(
                     timeout_ms = L2CAP_HANDOVER_TIMEOUT.as_millis(),
                     "L2CAP outbound wedged; evicting L2CAP path and falling back to GATT"
                 );
-                workers.l2cap = None;
+                if let Some(worker) = workers.l2cap.take() {
+                    teardown_l2cap_worker(worker, device_id.clone(), L2CAP_HANDOVER_TIMEOUT).await;
+                }
                 let _ = registry_tx
                     .send(PeerCommand::L2capHandoverTimeout {
                         device_id: device_id.clone(),
@@ -284,12 +296,14 @@ async fn forward_outbound(
                     device = %device_id,
                     "L2CAP path closed during outbound; falling back to GATT"
                 );
-                workers.l2cap = None;
+                if let Some(worker) = workers.l2cap.take() {
+                    teardown_l2cap_worker(worker, device_id.clone(), L2CAP_HANDOVER_TIMEOUT).await;
+                }
                 send
             }
         }
     } else {
-        send
+        send.expect("outbound datagram available for fallback path")
     };
     if let Some(gatt) = workers.gatt.as_ref() {
         match gatt.outbound_fwd_tx.try_send(send) {
@@ -641,7 +655,7 @@ async fn run_l2cap_pipe(
 ) {
     let (reader, writer) = tokio::io::split(channel);
 
-    let (l2cap_tx, _send_task, _recv_task, done) = crate::transport::l2cap::spawn_l2cap_io_tasks(
+    let (l2cap_tx, send_task, recv_task, done) = crate::transport::l2cap::spawn_l2cap_io_tasks(
         reader,
         writer,
         device_id.clone(),
@@ -651,6 +665,8 @@ async fn run_l2cap_pipe(
         Arc::clone(&teardown_flag),
         Arc::clone(&empty_frames_counter),
     );
+    let _send_task = AbortOnDrop(send_task);
+    let _recv_task = AbortOnDrop(recv_task);
 
     let mut io_died = false;
     loop {
@@ -1029,7 +1045,10 @@ mod tests {
         tokio::time::advance(L2CAP_HANDOVER_TIMEOUT + Duration::from_millis(1)).await;
         let workers = (&mut task).await.expect("forward_outbound should complete");
 
-        assert!(workers.l2cap.is_none(), "timed-out L2CAP worker must be evicted");
+        assert!(
+            workers.l2cap.is_none(),
+            "timed-out L2CAP worker must be evicted"
+        );
         match registry_rx.recv().await.expect("timeout metric command") {
             PeerCommand::L2capHandoverTimeout { device_id: got } => {
                 assert_eq!(got, blew::DeviceId::from("l2cap-timeout"));

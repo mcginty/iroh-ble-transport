@@ -710,9 +710,10 @@ impl CustomSender for BleSender {
         // driver to open a pipe to the peer. Translate both into a
         // `DeviceId` the registry actor can route on.
         let stable_id = crate::transport::routing::StableConnId::from_raw(token);
-        let device_id = if let Some(d) = self.routing.device_for_pipe(stable_id) {
-            d
-        } else if let Some((_endpoint, prefix)) = self.routing.reservation_target(stable_id) {
+        let (device_id, target_endpoint) = if let Some(d) = self.routing.device_for_pipe(stable_id)
+        {
+            (d, None)
+        } else if let Some((endpoint, prefix)) = self.routing.reservation_target(stable_id) {
             // Reservation path: poll_send is iroh's *trigger* to start
             // the dial. scan_hint tells us which `DeviceId` is nearby
             // under this prefix right now; hand that to the registry
@@ -722,7 +723,7 @@ impl CustomSender for BleSender {
             // pipe-open time so iroh's outstanding `CustomAddr`
             // resolves to the new pipe's `StableConnId`.
             match self.routing.scan_hint_for_prefix(&prefix) {
-                Some(d) => d,
+                Some(d) => (d, Some(endpoint)),
                 None => {
                     return Poll::Ready(Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -743,6 +744,7 @@ impl CustomSender for BleSender {
         tracing::trace!(device = %device_id, %stable_id, len, "BleSender::poll_send");
         let cmd = PeerCommand::SendDatagram {
             device_id,
+            target_endpoint,
             tx_gen,
             datagram: Bytes::copy_from_slice(transmit.contents),
             waker: cx.waker().clone(),

@@ -91,10 +91,19 @@ impl Registry {
             } => self.handle_advertised(&mut actions, now, prefix, device, rssi),
             PeerCommand::SendDatagram {
                 device_id,
+                target_endpoint,
                 tx_gen,
                 datagram,
                 waker,
-            } => self.handle_send_datagram(&mut actions, now, device_id, tx_gen, datagram, waker),
+            } => self.handle_send_datagram(
+                &mut actions,
+                now,
+                device_id,
+                target_endpoint,
+                tx_gen,
+                datagram,
+                waker,
+            ),
             PeerCommand::ConnectSucceeded { device_id, channel } => {
                 self.handle_connect_succeeded(&mut actions, now, device_id, channel);
             }
@@ -500,6 +509,7 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        target_endpoint: Option<iroh_base::EndpointId>,
         tx_gen: u64,
         datagram: bytes::Bytes,
         waker: std::task::Waker,
@@ -551,6 +561,14 @@ impl Registry {
             decision = decision_tag,
             "registry SendDatagram"
         );
+        if let Some(target_endpoint) = target_endpoint
+            && matches!(
+                decision,
+                SendDecision::Buffer | SendDecision::StartAndEnqueue
+            )
+        {
+            entry.target_endpoint = Some(target_endpoint);
+        }
         match decision {
             SendDecision::Enqueue => {
                 if entry.pipe.is_some() && !entry.pending_sends.is_empty() {
@@ -712,6 +730,7 @@ impl Registry {
             device_id: device_id.clone(),
             tx_gen,
             role,
+            target_endpoint: entry.target_endpoint,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
@@ -804,6 +823,7 @@ impl Registry {
                 device_id: device_id.clone(),
                 tx_gen: 1,
                 role: crate::transport::peer::ConnectRole::Peripheral,
+                target_endpoint: entry.target_endpoint,
                 path: crate::transport::peer::ConnectPath::Gatt,
                 l2cap_channel: None,
             });
@@ -833,6 +853,7 @@ impl Registry {
                 device_id: device_id.clone(),
                 tx_gen,
                 role,
+                target_endpoint: entry.target_endpoint,
                 path: crate::transport::peer::ConnectPath::Gatt,
                 l2cap_channel: None,
             });
@@ -936,6 +957,7 @@ impl Registry {
             device_id: device_id.clone(),
             tx_gen: entry.tx_gen,
             role,
+            target_endpoint: entry.target_endpoint,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
@@ -972,6 +994,7 @@ impl Registry {
             device_id,
             tx_gen: entry.tx_gen,
             role: crate::transport::peer::ConnectRole::Peripheral,
+            target_endpoint: entry.target_endpoint,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
@@ -1339,6 +1362,7 @@ impl Registry {
             swap_tx,
             last_rx_at,
         });
+        entry.target_endpoint = None;
     }
 
     fn handle_open_l2cap_succeeded(
@@ -1376,6 +1400,7 @@ impl Registry {
                     device_id: device_id.clone(),
                     tx_gen,
                     role,
+                    target_endpoint: entry.target_endpoint,
                     path: crate::transport::peer::ConnectPath::L2cap,
                     l2cap_channel: entry.l2cap_channel.take(),
                 });
@@ -1455,6 +1480,7 @@ impl Registry {
                     device_id: device_id.clone(),
                     tx_gen,
                     role,
+                    target_endpoint: entry.target_endpoint,
                     path: crate::transport::peer::ConnectPath::Gatt,
                     l2cap_channel: None,
                 });
@@ -1529,6 +1555,7 @@ impl Registry {
                     device_id: device_id.clone(),
                     tx_gen: 1,
                     role: crate::transport::peer::ConnectRole::Peripheral,
+                    target_endpoint: inserted.target_endpoint,
                     path: crate::transport::peer::ConnectPath::L2cap,
                     l2cap_channel: inserted.l2cap_channel.take(),
                 });
@@ -1607,6 +1634,7 @@ impl Registry {
                         device_id: device_id.clone(),
                         tx_gen,
                         role,
+                        target_endpoint: entry.target_endpoint,
                         path: crate::transport::peer::ConnectPath::L2cap,
                         l2cap_channel: entry.l2cap_channel.take(),
                     });
@@ -2207,6 +2235,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 3,
             datagram: bytes::Bytes::from_static(b"hi"),
             waker: noop_waker(),
@@ -2235,6 +2264,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 4,
             datagram: bytes::Bytes::from_static(b"stale"),
             waker: noop_waker(),
@@ -2514,6 +2544,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: bytes::Bytes::from_static(b"hello"),
             waker: noop_waker(),
@@ -2527,6 +2558,71 @@ mod tests {
             PeerPhase::Connecting { attempt: 0, .. }
         ));
         assert_eq!(reg.peer(&device_id).unwrap().pending_sends.len(), 1);
+    }
+
+    #[test]
+    fn outbound_target_endpoint_flows_into_start_data_pipe_and_clears_on_ready() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x5Au8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        assert!(matches!(
+            actions.as_slice(),
+            [PeerAction::StartConnect { .. }]
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 1,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                PeerAction::StartDataPipe {
+                    device_id: d,
+                    target_endpoint: Some(target),
+                    ..
+                } if *d == device_id && *target == endpoint
+            )
+        }));
+
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(1);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel(1);
+        let tx_gen = reg.peer(&device_id).unwrap().tx_gen;
+        let _ = reg.handle(PeerCommand::DataPipeReady {
+            device_id: device_id.clone(),
+            tx_gen,
+            outbound_tx,
+            inbound_tx,
+            swap_tx,
+            last_rx_at: crate::transport::peer::LivenessClock::new(),
+        });
+        assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
     }
 
     #[test]
@@ -3214,6 +3310,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 9,
             datagram: bytes::Bytes::from_static(b"fast"),
             waker: noop_waker(),
@@ -3263,6 +3360,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 8,
             datagram: bytes::Bytes::from_static(b"fallback"),
             waker: noop_waker(),
@@ -3315,6 +3413,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 7,
             datagram: bytes::Bytes::from_static(b"closed"),
             waker: noop_waker(),
@@ -4282,6 +4381,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 5,
             datagram: bytes::Bytes::from_static(b"new"),
             waker: noop_waker(),

@@ -109,6 +109,7 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
     let waker = waker_from_channel(waker_tx);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"ping"),
         waker,
@@ -226,6 +227,7 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
         tx.send(PeerCommand::SendDatagram {
             device_id,
+            target_endpoint: None,
             tx_gen: 0,
             datagram: bytes::Bytes::from_static(b"x"),
             waker: waker_from_channel(waker_tx),
@@ -372,6 +374,7 @@ async fn version_mismatch_deads_peer_and_closes_channel() {
     let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"x"),
         waker: waker_from_channel(waker_tx),
@@ -469,6 +472,7 @@ async fn version_match_lets_data_pipe_start() {
     let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"x"),
         waker: waker_from_channel(waker_tx),
@@ -572,6 +576,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
     central_inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: fabric.peripheral_as_device.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: bytes::Bytes::from_static(b"c->p"),
             waker: waker_from_channel(waker_tx),
@@ -615,6 +620,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
     peripheral_inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: peripheral_peer_device,
+            target_endpoint: None,
             tx_gen: peripheral_tx_gen,
             datagram: bytes::Bytes::from_static(b"p->c"),
             waker: waker_from_channel(waker_tx2),
@@ -710,6 +716,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"first"),
         waker: waker_from_channel(waker_tx),
@@ -760,6 +767,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     let (waker_tx2, _waker_rx2) = mpsc::channel::<()>(1);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"second"),
         waker: waker_from_channel(waker_tx2),
@@ -835,6 +843,7 @@ async fn connect_failure_retries_on_next_tick() {
     let waker = waker_from_channel(waker_tx);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"retry-ping"),
         waker,

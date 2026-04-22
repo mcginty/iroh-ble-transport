@@ -534,6 +534,27 @@ impl Routing {
         removed
     }
 
+    /// Remove the routable entry for `endpoint_id` only if it still
+    /// points at `pipe`. Used by the pipe watchdog to avoid evicting a
+    /// freshly-promoted replacement route from a stale snapshot.
+    pub fn evict_routable_if_pipe(
+        &self,
+        endpoint_id: &EndpointId,
+        pipe: StableConnId,
+    ) -> Option<Routable> {
+        let removed = {
+            let mut inner = self.inner.lock();
+            match inner.routable.get(endpoint_id) {
+                Some(current) if current.pipe == pipe => inner.routable.remove(endpoint_id),
+                _ => None,
+            }
+        };
+        if removed.is_some() {
+            self.wake_endpoint_waiters(endpoint_id);
+        }
+        removed
+    }
+
     /// Evict whichever pool (if any) holds `pipe`. Called from the
     /// driver's pipe-close path — the pipe is about to disappear, so
     /// clean up both pools uniformly. Returns `true` if an entry was
@@ -700,6 +721,16 @@ impl Routing {
         let reservation = inner.reservations.remove(prefix)?;
         inner.reserved_stable_ids.remove(&reservation.stable_id);
         Some(reservation)
+    }
+
+    /// Consume the reservation for `endpoint_id` (if any). The driver uses
+    /// this when the registry has carried the dial's intended endpoint through
+    /// to pipe-open time.
+    pub fn consume_reservation_for_endpoint(
+        &self,
+        endpoint_id: &EndpointId,
+    ) -> Option<Reservation> {
+        self.consume_reservation_for_prefix(&prefix_from_endpoint(endpoint_id))
     }
 
     /// Reverse-lookup via scan_hint: given a `DeviceId` the driver
@@ -883,8 +914,10 @@ impl Routing {
             evicted_count = evicted.len(),
             "routing::promote"
         );
+        drop(inner);
 
         if promoted {
+            self.wake_endpoint_waiters(&remote_endpoint);
             PromoteOutcome::Accepted { evicted }
         } else {
             PromoteOutcome::Rejected
