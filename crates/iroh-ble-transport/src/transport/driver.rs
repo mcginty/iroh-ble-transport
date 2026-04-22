@@ -29,23 +29,6 @@ pub struct IncomingPacket {
 /// slow-path before we give up and fall back to GATT.
 const READ_PSM_BACKOFFS_MS: [u64; 3] = [0, 150, 400];
 
-/// Upper bound on `iface.connect()` before we treat the attempt as failed
-/// and force a platform-side cleanup.
-///
-/// Successful Android connects in our traces complete in 700–1300 ms; a
-/// 5 s budget leaves plenty of headroom for radio contention while still
-/// letting iroh-gossip (default dial timeout ~15 s) see multiple retries
-/// before it gives up.
-///
-/// TODO(blew): reconsider (and likely remove) this timeout once blew
-/// grows its own connect timeout + post-GATT-133 `BluetoothGatt.close()`
-/// cleanup. Without that, a platform-side hang after `status=133` leaves
-/// `central.connect().await` sitting on its one-shot receiver forever,
-/// which wedges the registry's `Connecting` phase with no recovery. See
-/// `.claude/plans/2026-04-22-blew-android-connect-timeout-issue.md` for
-/// the upstream issue draft.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Translate the registry's role (`Central` = we dialed, `Peripheral` =
 /// they dialed) into `routing`'s observer-local `Direction`.
 fn direction_for_role(
@@ -180,17 +163,15 @@ impl<I: BleInterface> Driver<I> {
                 let iface = Arc::clone(&self.iface);
                 let inbox = self.inbox.clone();
                 let dev_for_msg = device_id.clone();
+                // blew enforces `CentralConfig::connect_timeout` itself
+                // (15 s default, overridable by the app). On expiry it
+                // refresh()+close()s the Android GATT client and
+                // returns `BlewError::ConnectTimedOut`, which flows
+                // through the `Err` arm below into the registry's
+                // normal retry logic.
                 tokio::spawn(async move {
-                    // Cap how long we're willing to wait on the platform
-                    // `connect`. On Android, `BluetoothGatt.connectGatt`
-                    // can silently drop its state-change callback after a
-                    // prior `status=133` disconnect, leaving blew's
-                    // `rx.await` parked indefinitely. See the `CONNECT_TIMEOUT`
-                    // doc for the blew-side fix we're waiting on.
-                    let outcome =
-                        tokio::time::timeout(CONNECT_TIMEOUT, iface.connect(&device_id)).await;
-                    match outcome {
-                        Ok(Ok(channel)) => {
+                    match iface.connect(&device_id).await {
+                        Ok(channel) => {
                             let _ = inbox
                                 .send(PeerCommand::ConnectSucceeded {
                                     device_id: dev_for_msg,
@@ -198,37 +179,11 @@ impl<I: BleInterface> Driver<I> {
                                 })
                                 .await;
                         }
-                        Ok(Err(e)) => {
+                        Err(e) => {
                             let _ = inbox
                                 .send(PeerCommand::ConnectFailed {
                                     device_id: dev_for_msg,
                                     error: format!("{e}"),
-                                })
-                                .await;
-                        }
-                        Err(_elapsed) => {
-                            tracing::warn!(
-                                device = %device_id,
-                                timeout_ms = CONNECT_TIMEOUT.as_millis() as u64,
-                                "iface.connect timed out; forcing disconnect before retry"
-                            );
-                            // Best-effort: push the platform to release the
-                            // GATT client so the next `StartConnect` isn't
-                            // saddled with the same wedged handle. If
-                            // `disconnect` itself errors we still want the
-                            // registry to advance to Reconnecting, so we
-                            // always follow through with `ConnectFailed`.
-                            if let Err(e) = iface.disconnect(&device_id).await {
-                                tracing::debug!(
-                                    device = %device_id,
-                                    error = %e,
-                                    "disconnect after connect-timeout also errored"
-                                );
-                            }
-                            let _ = inbox
-                                .send(PeerCommand::ConnectFailed {
-                                    device_id: dev_for_msg,
-                                    error: "connect timed out".to_string(),
                                 })
                                 .await;
                         }
@@ -1274,72 +1229,5 @@ mod tests {
             .unwrap();
         assert!(matches!(cmd, PeerCommand::ConnectSucceeded { .. }));
         iface.assert_called(&CallKind::Connect(device_id));
-    }
-
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn start_connect_times_out_and_forces_disconnect_then_reports_failure() {
-        // Android `connectGatt` can silently drop its state-change callback
-        // after a prior 133-disconnect, leaving blew's `connect().await`
-        // parked indefinitely. The driver-side timeout must fire a fake
-        // `ConnectFailed` so the registry can advance its Reconnecting
-        // state, AND issue a best-effort `disconnect()` to nudge the
-        // platform into releasing the GATT client before we retry.
-        let iface = Arc::new(MockBleInterface::new());
-        // Simulate a hang longer than `CONNECT_TIMEOUT`: the mock sleeps
-        // for 60 s before returning, which under `start_paused` means we
-        // control exactly when (and whether) it returns.
-        iface.set_connect_delay(std::time::Duration::from_secs(60));
-
-        let (tx, mut rx) = mpsc::channel(16);
-        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(1);
-        let driver = Driver::new(
-            iface.clone(),
-            tx,
-            incoming_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing::Routing::new()),
-        );
-        let device_id = blew::DeviceId::from("hangs");
-        driver
-            .execute(PeerAction::StartConnect {
-                device_id: device_id.clone(),
-                attempt: 0,
-            })
-            .await;
-
-        // Advance the paused clock just past the connect timeout so the
-        // spawned task's `tokio::time::timeout` elapses, but nowhere near
-        // the 60 s mock delay. Yield a few times so the runtime actually
-        // polls the spawned task between the timer firing and our recv.
-        tokio::time::advance(CONNECT_TIMEOUT + std::time::Duration::from_millis(100)).await;
-        for _ in 0..4 {
-            tokio::task::yield_now().await;
-        }
-
-        let cmd = rx
-            .recv()
-            .await
-            .expect("ConnectFailed should arrive after the timeout fires");
-        match cmd {
-            PeerCommand::ConnectFailed {
-                device_id: dev,
-                error,
-            } => {
-                assert_eq!(dev, device_id);
-                assert!(
-                    error.contains("timed out"),
-                    "expected timeout error, got: {error}"
-                );
-            }
-            other => panic!("expected ConnectFailed, got {other:?}"),
-        }
-
-        // The spawned task must have invoked `disconnect` as its
-        // Android cleanup step before reporting failure.
-        iface.assert_called(&CallKind::Connect(device_id.clone()));
-        iface.assert_called(&CallKind::Disconnect(device_id));
     }
 }

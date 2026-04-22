@@ -10,8 +10,8 @@ use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_ble_transport::transport::BleTransport;
 use iroh_ble_transport::{
-    BleDedupHook, BlePeerInfo, BlePeerPhase, BleTransportConfig, Central, ConnectPath,
-    InMemoryPeerStore, L2capPolicy, Peripheral,
+    BleDedupHook, BlePeerInfo, BlePeerPhase, BleTransportConfig, Central, CentralConfig,
+    ConnectPath, InMemoryPeerStore, L2capPolicy, Peripheral,
 };
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
@@ -232,7 +232,20 @@ async fn start_node(
 
     let (verified_tx, verified_rx) = tokio::sync::mpsc::unbounded_channel();
     let ble_transport: Arc<BleTransport> = {
-        let central = Arc::new(Central::new().await.map_err(|e| e.to_string())?);
+        // Tighten blew's connect deadline below its 15 s default so a wedged
+        // dial attempt (Android's post-133 zombie state is the classic case)
+        // fails fast enough for the registry to retry within iroh-gossip's
+        // 15 s dial budget. Successful Android connects in our traces
+        // complete in under 1.5 s; 5 s leaves headroom for radio contention.
+        let central_config = CentralConfig {
+            connect_timeout: Some(std::time::Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let central = Arc::new(
+            Central::with_config(central_config)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
         let peripheral = Arc::new(Peripheral::new().await.map_err(|e| e.to_string())?);
         let local_id = st.secret_key.public();
         let transport = BleTransport::with_config(
