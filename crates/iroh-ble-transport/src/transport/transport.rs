@@ -313,6 +313,21 @@ impl BleTransport {
             let inbox = inbox_tx.clone();
             tokio::spawn(async move {
                 while let Some(verified) = verified_rx.recv().await {
+                    // Fire teardown for any pipes the promote rule
+                    // evicted to make room for this handshake. Each
+                    // `Stalled` causes the registry to drain the
+                    // device's pipe and close its BLE channel; the
+                    // pipe worker then exits, which evicts the
+                    // lingering routing_v2 pipe record.
+                    for device_id in verified.evicted_devices {
+                        if inbox
+                            .send(PeerCommand::Stalled { device_id })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     if inbox
                         .send(PeerCommand::VerifiedEndpoint {
                             endpoint_id: verified.endpoint_id,
@@ -981,11 +996,7 @@ mod tests {
             routing_v2: Arc::clone(&routing_v2),
         };
         let endpoint_id = endpoint_id_with_first_byte(0xBB);
-        let pipe_id = routing_v2.register_pipe(
-            blew::DeviceId::from("mac-bb"),
-            Direction::Outbound,
-            crate::transport::peer::LivenessClock::new(),
-        );
+        let pipe_id = routing_v2.register_pipe(blew::DeviceId::from("mac-bb"), Direction::Outbound);
         routing_v2.insert_routable(
             endpoint_id,
             pipe_id,

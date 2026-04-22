@@ -161,7 +161,6 @@ pub(crate) async fn tick<E: PipeWatchdogEndpoint>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::peer::LivenessClock;
     use crate::transport::routing_v2::{Dialer, Direction, StableConnId};
     use std::collections::HashSet;
     use std::sync::Mutex;
@@ -206,7 +205,7 @@ mod tests {
     async fn tick_is_noop_when_endpoint_is_active() {
         let routing = Arc::new(Routing::new());
         let ep = test_endpoint(1);
-        let id = routing.register_pipe(dev("mac"), Direction::Outbound, LivenessClock::new());
+        let id = routing.register_pipe(dev("mac"), Direction::Outbound);
         routing.insert_routable(ep, id, Dialer::Low);
 
         let endpoint = MockEndpoint::new();
@@ -232,7 +231,7 @@ mod tests {
     async fn tick_evicts_and_stalls_when_endpoint_has_no_active_path() {
         let routing = Arc::new(Routing::new());
         let ep = test_endpoint(2);
-        let id = routing.register_pipe(dev("mac-b"), Direction::Outbound, LivenessClock::new());
+        let id = routing.register_pipe(dev("mac-b"), Direction::Outbound);
         routing.insert_routable(ep, id, Dialer::High);
 
         let endpoint = MockEndpoint::new();
@@ -264,7 +263,7 @@ mod tests {
         // watchdog weighs in.
         let routing = Arc::new(Routing::new());
         let ep = test_endpoint(3);
-        let id = routing.register_pipe(dev("mac-c"), Direction::Outbound, LivenessClock::new());
+        let id = routing.register_pipe(dev("mac-c"), Direction::Outbound);
         routing.insert_routable(ep, id, Dialer::Low);
 
         let endpoint = MockEndpoint::new();
@@ -311,9 +310,9 @@ mod tests {
         let ep_a = test_endpoint(4);
         let ep_b = test_endpoint(5);
         let ep_c = test_endpoint(6);
-        let ia = routing.register_pipe(dev("a"), Direction::Outbound, LivenessClock::new());
-        let ib = routing.register_pipe(dev("b"), Direction::Inbound, LivenessClock::new());
-        let ic = routing.register_pipe(dev("c"), Direction::Outbound, LivenessClock::new());
+        let ia = routing.register_pipe(dev("a"), Direction::Outbound);
+        let ib = routing.register_pipe(dev("b"), Direction::Inbound);
+        let ic = routing.register_pipe(dev("c"), Direction::Outbound);
         routing.insert_routable(ep_a, ia, Dialer::Low);
         routing.insert_routable(ep_b, ib, Dialer::High);
         routing.insert_routable(ep_c, ic, Dialer::Low);
@@ -353,7 +352,7 @@ mod tests {
     async fn tick_skips_routable_with_missing_pipe() {
         let routing = Arc::new(Routing::new());
         let ep = test_endpoint(7);
-        let id = routing.register_pipe(dev("ghost"), Direction::Outbound, LivenessClock::new());
+        let id = routing.register_pipe(dev("ghost"), Direction::Outbound);
         routing.insert_routable(ep, id, Dialer::Low);
         // Simulate a race: pipe evicted but routable still present.
         routing.evict_pipe(id);

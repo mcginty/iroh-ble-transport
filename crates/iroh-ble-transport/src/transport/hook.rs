@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use blew::DeviceId;
 use iroh::endpoint::{AfterHandshakeOutcome, ConnectionInfo, EndpointHooks};
 use iroh_base::{EndpointId, TransportAddr};
 use tokio::sync::mpsc;
@@ -42,10 +43,16 @@ use crate::transport::transport::BLE_TRANSPORT_ID;
 /// cycle because the endpoint holds the hook via its own Arc. The `Arc`s
 /// this struct holds all point at transport-owned state, not at the
 /// endpoint, so there's no cycle.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct VerifiedEndpointEvent {
     pub endpoint_id: EndpointId,
     pub token: Option<u64>,
+    /// `DeviceId`s of pipes the `promote()` rule evicted to make room
+    /// for this handshake. The forwarder on the transport side turns
+    /// each into a `PeerCommand::Stalled` so the old BLE pipes get
+    /// drained and closed rather than zombied until their own
+    /// `LinkDead` detection or BLE ACL drop.
+    pub evicted_devices: Vec<DeviceId>,
 }
 
 #[derive(Debug, Clone)]
@@ -82,16 +89,14 @@ impl EndpointHooks for BleDedupHook {
                 _ => None,
             });
 
-        // Run the promotion rule synchronously. This is the only place
-        // routing_v2's authority invariants are established — reject
-        // here is the one mechanism for enforcing "one routable entry
-        // per peer" against symmetric-dial or re-dial collisions.
-        //
-        // Step 4b: the hook reports Accept/Reject to iroh. Step 4c
-        // will also coordinate tearing down pipes we evicted + the
-        // pipes attached to rejected connections (iroh closes QUIC on
-        // reject, but our BLE pipe survives until the peer's ACL
-        // drops or its own close logic fires).
+        // Run the promotion rule synchronously. This is the only
+        // place routing_v2's authority invariants are established.
+        // Same-positional-category (peer re-dialed us) always evicts
+        // the old and accepts the new — the new handshake completing
+        // is authoritative evidence that the peer abandoned the old
+        // connection. The evicted pipes' DeviceIds are forwarded so
+        // the registry can `Stalled` them into teardown.
+        let mut evicted_devices: Vec<DeviceId> = Vec::new();
         if let Some(token) = token {
             let stable_id = StableConnId::from_raw(token);
             match self
@@ -104,11 +109,10 @@ impl EndpointHooks for BleDedupHook {
                         %stable_id,
                         "BleDedupHook: rejecting handshake (promotion rule said so)"
                     );
-                    // Notify the actor loop so downstream state
-                    // (legacy v1 dedup) can settle symmetrically.
                     let _ = self.tx.send(VerifiedEndpointEvent {
                         endpoint_id: remote_endpoint,
                         token: Some(token),
+                        evicted_devices: Vec::new(),
                     });
                     return AfterHandshakeOutcome::Reject {
                         error_code: noq_proto::VarInt::from_u32(0),
@@ -116,29 +120,34 @@ impl EndpointHooks for BleDedupHook {
                     };
                 }
                 PromoteOutcome::Accepted { evicted } => {
-                    // Info: one per peer per handshake — this is the
-                    // moment a peer becomes authoritatively routable
-                    // in v2. Lifecycle-sized cadence, very useful for
-                    // cross-referencing with symmetric-dial rejects.
+                    // Resolve evicted StableConnIds → DeviceIds for
+                    // teardown. We do this before logging so the log
+                    // can show how many pipes actually had devices
+                    // registered (edge case: a pipe might have been
+                    // evicted between the promote call and now).
+                    for id in &evicted {
+                        if let Some(dev) = self.routing_v2.device_for_pipe(*id) {
+                            evicted_devices.push(dev);
+                        }
+                    }
                     tracing::info!(
                         %remote_endpoint,
                         %stable_id,
                         evicted_count = evicted.len(),
+                        evicted_devices = evicted_devices.len(),
                         "BleDedupHook: promoted to routable"
                     );
-                    // evicted pipes need to be torn down by the
-                    // driver; wired in step 4c via a side channel.
-                    // For 4b: pipes stay alive but their routable
-                    // slot is gone, so outbound routing (after step
-                    // 4c) skips them naturally.
                 }
             }
         }
 
-        // Forward to the actor loop for backward-compatible v1 flows.
+        // Forward to the actor loop; the forwarder on the transport
+        // side dispatches `PeerCommand::Stalled` for each evicted
+        // device so its pipe worker is properly drained.
         let _ = self.tx.send(VerifiedEndpointEvent {
             endpoint_id: remote_endpoint,
             token,
+            evicted_devices,
         });
         AfterHandshakeOutcome::Accept
     }

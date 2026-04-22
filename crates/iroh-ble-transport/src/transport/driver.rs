@@ -303,29 +303,24 @@ impl<I: BleInterface> Driver<I> {
                 // reservations (inbound accepts have no resolver).
                 let routing_v2 = Arc::clone(&self.routing_v2);
                 let direction = direction_for_role(role);
-                let (stable_id, reservation_endpoint) = match routing_v2
-                    .consume_reservation_for_device(&device_id)
-                {
-                    Some(reservation) => {
-                        routing_v2.register_pipe_with_id(
-                            reservation.stable_id,
-                            device_id.clone(),
-                            direction,
-                            last_rx_at.clone(),
-                        );
-                        tracing::info!(
-                            device = %device_id,
-                            stable_id = %reservation.stable_id,
-                            endpoint = %reservation.endpoint_id,
-                            "StartDataPipe: bound pipe to resolver reservation"
-                        );
-                        (reservation.stable_id, Some(reservation.endpoint_id))
-                    }
-                    None => (
-                        routing_v2.register_pipe(device_id.clone(), direction, last_rx_at.clone()),
-                        None,
-                    ),
-                };
+                let (stable_id, reservation_endpoint) =
+                    match routing_v2.consume_reservation_for_device(&device_id) {
+                        Some(reservation) => {
+                            routing_v2.register_pipe_with_id(
+                                reservation.stable_id,
+                                device_id.clone(),
+                                direction,
+                            );
+                            tracing::info!(
+                                device = %device_id,
+                                stable_id = %reservation.stable_id,
+                                endpoint = %reservation.endpoint_id,
+                                "StartDataPipe: bound pipe to resolver reservation"
+                            );
+                            (reservation.stable_id, Some(reservation.endpoint_id))
+                        }
+                        None => (routing_v2.register_pipe(device_id.clone(), direction), None),
+                    };
                 routing_v2.register_pending(stable_id, reservation_endpoint);
                 tokio::spawn(async move {
                     run_data_pipe(
@@ -401,8 +396,7 @@ impl<I: BleInterface> Driver<I> {
                 // already evicted on its own exit.
                 let routing_v2 = Arc::clone(&self.routing_v2);
                 let direction = direction_for_role(role);
-                let stable_id =
-                    routing_v2.register_pipe(device_id.clone(), direction, last_rx_at.clone());
+                let stable_id = routing_v2.register_pipe(device_id.clone(), direction);
                 routing_v2.register_pending(stable_id, None);
                 tokio::spawn(async move {
                     run_data_pipe(
