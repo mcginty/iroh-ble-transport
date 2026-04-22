@@ -75,9 +75,9 @@ pub enum Direction {
 }
 
 /// Observer-independent "who physically dialed the ACL link."
-/// Materialized only after a handshake yields both endpoint_ids.
-/// Not used in step 1 — carried here so subsequent steps don't need to
-/// redefine it.
+/// Materialized only after a handshake yields both endpoint_ids, and
+/// used by [`decide`] to arbitrate cross-category collisions
+/// symmetrically on both sides of a pair.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Dialer {
     /// Lower-endpoint-id peer dialed.
