@@ -504,6 +504,7 @@ impl Registry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_send_datagram(
         &mut self,
         actions: &mut Vec<PeerAction>,
