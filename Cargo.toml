@@ -15,16 +15,3 @@ tag-message = "{{crate_name}}: release {{version}}"
 pre-release-commit-message = "{{crate_name}}: release {{version}}"
 push = true
 publish = true
-
-# Pin `tauri-plugin-blew` to the blew-v0.3.0 cut of the upstream repo so
-# it resolves against the same `blew` crate as our direct dep. Published
-# `tauri-plugin-blew 0.2.3` pulls in blew 0.2.3 transitively, which
-# would collide with our 0.3.0 direct dep on the `links = "blew"`
-# native-library slot. Pointing both at the same git tree forces a
-# single `blew` copy. `blew` itself is patched the same way so the
-# workspace doesn't see two path/crates.io copies under the same name.
-# Drop once tauri-plugin-blew is re-released on crates.io with a
-# blew-0.3-compatible version.
-[patch.crates-io]
-blew = { git = "https://github.com/mcginty/blew", tag = "blew-v0.3.0" }
-tauri-plugin-blew = { git = "https://github.com/mcginty/blew", tag = "blew-v0.3.0" }
