@@ -1274,6 +1274,7 @@ impl Registry {
             });
         }
         entry.rx_backlog.clear();
+        entry.target_endpoint = None;
         entry.phase = PeerPhase::Dead {
             reason: crate::transport::peer::DeadReason::Forgotten,
             at: now,
@@ -1903,6 +1904,38 @@ mod tests {
         }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
         unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn assert_start_data_pipe_target(
+        actions: &[PeerAction],
+        device_id: &DeviceId,
+        endpoint: iroh_base::EndpointId,
+    ) {
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                PeerAction::StartDataPipe {
+                    device_id: d,
+                    target_endpoint: Some(target),
+                    ..
+                } if d == device_id && *target == endpoint
+            )
+        }));
+    }
+
+    fn mark_data_pipe_ready(reg: &mut Registry, device_id: &DeviceId) {
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(1);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel(1);
+        let tx_gen = reg.peer(device_id).unwrap().tx_gen;
+        let _ = reg.handle(PeerCommand::DataPipeReady {
+            device_id: device_id.clone(),
+            tx_gen,
+            outbound_tx,
+            inbound_tx,
+            swap_tx,
+            last_rx_at: crate::transport::peer::LivenessClock::new(),
+        });
     }
 
     #[test]
@@ -2600,30 +2633,230 @@ mod tests {
                 path: crate::transport::peer::ConnectPath::Gatt,
             },
         });
-        assert!(actions.iter().any(|action| {
-            matches!(
-                action,
-                PeerAction::StartDataPipe {
-                    device_id: d,
-                    target_endpoint: Some(target),
-                    ..
-                } if *d == device_id && *target == endpoint
-            )
-        }));
+        assert_start_data_pipe_target(&actions, &device_id, endpoint);
 
-        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
-        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(1);
-        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel(1);
-        let tx_gen = reg.peer(&device_id).unwrap().tx_gen;
-        let _ = reg.handle(PeerCommand::DataPipeReady {
-            device_id: device_id.clone(),
-            tx_gen,
-            outbound_tx,
-            inbound_tx,
-            swap_tx,
-            last_rx_at: crate::transport::peer::LivenessClock::new(),
-        });
+        mark_data_pipe_ready(&mut reg, &device_id);
         assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
+    }
+
+    #[test]
+    fn target_endpoint_survives_connect_failed_retry_until_pipe_ready() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target-connect-failed");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x61u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        assert!(matches!(
+            actions.as_slice(),
+            [PeerAction::StartConnect { .. }]
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let _ = reg.handle(PeerCommand::ConnectFailed {
+            device_id: device_id.clone(),
+            error: "timeout".into(),
+        });
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Reconnecting { attempt: 1, .. }
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let actions = reg.handle(PeerCommand::Tick(
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        assert!(matches!(
+            actions.as_slice(),
+            [PeerAction::StartConnect { device_id: d, attempt: 1 }] if d == &device_id
+        ));
+
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 2,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert_start_data_pipe_target(&actions, &device_id, endpoint);
+
+        mark_data_pipe_ready(&mut reg, &device_id);
+        assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
+    }
+
+    #[test]
+    fn target_endpoint_survives_connecting_disconnect_retry_until_pipe_ready() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target-disconnect");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x62u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let _ = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::Timeout,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, PeerAction::EmitMetric(metric) if metric == "connect_failed:Timeout"))
+        );
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Reconnecting { attempt: 1, .. }
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let _ = reg.handle(PeerCommand::Tick(
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 3,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert_start_data_pipe_target(&actions, &device_id, endpoint);
+
+        mark_data_pipe_ready(&mut reg, &device_id);
+        assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
+    }
+
+    #[test]
+    fn target_endpoint_survives_adapter_cycle_until_pipe_ready() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target-adapter");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x63u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let _ = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        let _ = reg.handle(PeerCommand::AdapterStateChanged { powered: false });
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Restoring { .. }
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let _ = reg.handle(PeerCommand::AdapterStateChanged { powered: true });
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Reconnecting { attempt: 0, .. }
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let _ = reg.handle(PeerCommand::Tick(
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 4,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert_start_data_pipe_target(&actions, &device_id, endpoint);
+
+        mark_data_pipe_ready(&mut reg, &device_id);
+        assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
+    }
+
+    #[test]
+    fn forget_clears_target_endpoint() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target-forget");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x64u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+        let _ = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+
+        let _ = reg.handle(PeerCommand::Forget {
+            device_id: device_id.clone(),
+        });
+
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(matches!(
+            entry.phase,
+            PeerPhase::Dead {
+                reason: crate::transport::peer::DeadReason::Forgotten,
+                ..
+            }
+        ));
+        assert_eq!(entry.target_endpoint, None);
     }
 
     #[test]

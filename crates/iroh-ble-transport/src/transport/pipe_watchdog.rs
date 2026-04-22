@@ -376,6 +376,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_tick_interleaving_never_evicts_promoted_replacement_route() {
+        let self_endpoint = test_endpoint(40);
+
+        for seed in 0u8..16 {
+            let routing = Arc::new(Routing::new());
+            let remote_endpoint = test_endpoint(80 + seed);
+            let old_device = blew::DeviceId::from(format!("stale-old-{seed}"));
+            let new_device = blew::DeviceId::from(format!("fresh-new-{seed}"));
+            let old_id = routing.register_pipe(old_device.clone(), Direction::Outbound);
+            routing.insert_routable(
+                remote_endpoint,
+                old_id,
+                Dialer::compute(&self_endpoint, &remote_endpoint, Direction::Outbound),
+            );
+
+            let endpoint = BlockingEndpoint::new();
+            let (tx, mut rx) = mpsc::channel::<PeerCommand>(4);
+            let tick_task = {
+                let routing = Arc::clone(&routing);
+                let endpoint = Arc::clone(&endpoint);
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    tick(
+                        endpoint.as_ref(),
+                        &routing,
+                        &tx,
+                        Duration::from_secs(10),
+                        Instant::now() + Duration::from_secs(3600),
+                    )
+                    .await;
+                })
+            };
+
+            endpoint.wait_until_queried().await;
+
+            let new_id = routing.register_pipe(new_device.clone(), Direction::Outbound);
+            routing.register_pending(new_id, Some(remote_endpoint));
+            match routing.promote(new_id, &self_endpoint, remote_endpoint) {
+                crate::transport::routing::PromoteOutcome::Accepted { evicted } => {
+                    assert_eq!(evicted, vec![old_id]);
+                }
+                crate::transport::routing::PromoteOutcome::Rejected => {
+                    panic!("promote should accept the redial replacement");
+                }
+            }
+
+            endpoint.release();
+            tick_task.await.expect("tick task should not panic");
+
+            assert_eq!(
+                routing.routable_pipe_for(&remote_endpoint),
+                Some(new_id),
+                "watchdog must not evict the promoted replacement route"
+            );
+
+            let mut saw_old_stalled = false;
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    PeerCommand::Stalled { device_id } => {
+                        if device_id == old_device {
+                            saw_old_stalled = true;
+                        }
+                        assert_ne!(
+                            device_id, new_device,
+                            "watchdog must not stall the replacement pipe"
+                        );
+                    }
+                    other => panic!("unexpected command {other:?}"),
+                }
+            }
+            assert!(
+                saw_old_stalled,
+                "tick should still stall the snapshot's stale device"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn tick_handles_empty_routable_pool() {
         let routing = Arc::new(Routing::new());
         let endpoint = MockEndpoint::new();

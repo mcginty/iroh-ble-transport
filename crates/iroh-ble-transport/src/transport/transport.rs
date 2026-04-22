@@ -1318,4 +1318,151 @@ mod tests {
         assert_eq!(c3.0.load(AtomicOrdering::SeqCst), 1);
         assert!(wakers.lock().is_empty(), "drain must clear the list");
     }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn resolve_poll_send_and_start_data_pipe_preserve_reserved_token_after_scan_hint_flip() {
+        use crate::transport::driver::{Driver, IncomingPacket};
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PeerAction};
+        use crate::transport::registry::{Registry, SnapshotMaps};
+        use crate::transport::test_util::MockBleInterface;
+
+        fn test_transmit(contents: &[u8]) -> Transmit<'_> {
+            // iroh 0.98.1 keeps `ecn` private but `poll_send` only reads the
+            // public payload fields. Mirror the current layout in tests so the
+            // real `BleSender::poll_send` path can still be exercised.
+            unsafe {
+                std::mem::transmute::<
+                    (Option<noq_udp::EcnCodepoint>, &[u8], Option<usize>),
+                    Transmit<'_>,
+                >((None, contents, None))
+            }
+        }
+
+        let routing = Arc::new(Routing::new());
+        let lookup = BleAddressLookup {
+            routing: Arc::clone(&routing),
+        };
+        let snapshots = Arc::new(ArcSwap::from_pointee(SnapshotMaps::default()));
+        let (inbox_tx, mut inbox_rx) = mpsc::channel(8);
+        let sender = BleSender {
+            inbox: inbox_tx,
+            snapshots,
+            routing: Arc::clone(&routing),
+            tx_bytes: Arc::new(AtomicU64::new(0)),
+            inbox_capacity_wakers: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let endpoint = endpoint_id_with_first_byte(0xC1);
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint);
+        let old_device = blew::DeviceId::from("transport-old-device");
+        let new_device = blew::DeviceId::from("transport-new-device");
+        routing.note_scan_hint(prefix, old_device.clone());
+
+        let mut stream = lookup.resolve(endpoint).expect("Some");
+        let (_counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let token = extract_token(&mut stream, &mut cx);
+        let reserved_id = StableConnId::from_raw(token);
+
+        let transmit = test_transmit(b"hello");
+        assert!(matches!(
+            CustomSender::poll_send(&sender, &mut cx, &token_custom_addr(token), &transmit),
+            Poll::Ready(Ok(()))
+        ));
+
+        let mut reg = Registry::new_for_test();
+        reg.handle(PeerCommand::Advertised {
+            prefix,
+            device: blew::BleDevice {
+                id: old_device.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let send_cmd = inbox_rx.recv().await.expect("SendDatagram queued");
+        let start_actions = reg.handle(send_cmd);
+        assert!(matches!(
+            start_actions.as_slice(),
+            [PeerAction::StartConnect { device_id, .. }] if device_id == &old_device
+        ));
+        assert_eq!(
+            reg.peer(&old_device).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        routing.note_scan_hint(prefix, new_device);
+
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: old_device.clone(),
+            channel: ChannelHandle {
+                id: 9,
+                path: ConnectPath::Gatt,
+            },
+        });
+        let start_pipe = actions
+            .into_iter()
+            .find_map(|action| match action {
+                PeerAction::StartDataPipe {
+                    device_id,
+                    tx_gen,
+                    role,
+                    target_endpoint,
+                    path,
+                    l2cap_channel,
+                } => Some((
+                    device_id,
+                    tx_gen,
+                    role,
+                    target_endpoint,
+                    path,
+                    l2cap_channel,
+                )),
+                _ => None,
+            })
+            .expect("StartDataPipe emitted");
+        assert_eq!(start_pipe.0, old_device);
+        assert_eq!(start_pipe.3, Some(endpoint));
+        assert_eq!(start_pipe.4, ConnectPath::Gatt);
+        assert!(start_pipe.5.is_none());
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (driver_tx, mut driver_rx) = mpsc::channel(8);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let driver = Driver::new(
+            iface,
+            driver_tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::clone(&routing),
+        );
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: start_pipe.0.clone(),
+                tx_gen: start_pipe.1,
+                role: start_pipe.2,
+                target_endpoint: start_pipe.3,
+                path: start_pipe.4,
+                l2cap_channel: start_pipe.5,
+            })
+            .await;
+
+        let pipes = routing.pipes_for_debug();
+        assert_eq!(pipes.len(), 1);
+        assert_eq!(pipes[0].id, reserved_id);
+        assert_eq!(pipes[0].device_id, old_device);
+        assert_eq!(routing.reservation_len(), 0);
+        assert_eq!(routing.pending_pipe_for(&endpoint), Some(reserved_id));
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), driver_rx.recv())
+            .await
+            .unwrap();
+    }
 }
