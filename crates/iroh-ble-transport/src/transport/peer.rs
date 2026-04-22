@@ -49,6 +49,17 @@ impl LivenessClock {
         }
     }
 
+    /// Construct a clock whose `last()` value is `at`. Test-only;
+    /// lets `routing_v2` regression tests simulate a stale pipe
+    /// without spinning for `STALE_PIPE_DEADLINE` of wall-clock.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn with_last(at: Instant) -> Self {
+        Self {
+            inner: Arc::new(parking_lot::Mutex::new(at)),
+        }
+    }
+
     pub fn bump(&self) {
         *self.inner.lock() = Instant::now();
     }

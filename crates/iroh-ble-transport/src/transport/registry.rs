@@ -4963,7 +4963,11 @@ mod tests {
         // stable_id so the registry can resolve token → DeviceId.
         let routing_v2 = Arc::new(Routing::new());
         routing_v2.note_scan_hint(peer_prefix, stale_scan_dev.clone());
-        let stable_id = routing_v2.register_pipe(live_dev.clone(), Direction::Inbound);
+        let stable_id = routing_v2.register_pipe(
+            live_dev.clone(),
+            Direction::Inbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         let token = stable_id.as_u64();
 
         let mut reg = Registry::new_for_test_with_endpoint(my_ep);

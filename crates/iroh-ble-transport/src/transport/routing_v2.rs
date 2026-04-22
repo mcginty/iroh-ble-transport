@@ -19,13 +19,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Waker;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use blew::DeviceId;
 use iroh_base::EndpointId;
 use parking_lot::Mutex;
 
-use crate::transport::peer::KeyPrefix;
+use crate::transport::peer::{KeyPrefix, LivenessClock};
 
 /// Opaque handle iroh sees (wrapped in a `CustomAddr`) for a BLE pipe.
 ///
@@ -101,6 +101,23 @@ impl Dialer {
     }
 }
 
+/// How long a pipe may go without any inbound activity before
+/// `promote()` will treat it as stale (i.e. eligible for eviction
+/// by a new dial for the same `EndpointId`).
+///
+/// Tuned just above iroh's QUIC keep-alive interval (5 s in
+/// `BlePreset`) so that a healthy idle connection still registers
+/// as fresh between heartbeats. When the underlying BLE ACL dies
+/// and keep-alives stop arriving, the pipe's `last_rx_at` freezes;
+/// after this deadline elapses, a peer redial is permitted to evict.
+///
+/// This replaces the prior `is_healthy = pipes.contains_key` check,
+/// which was too lenient — a pipe whose worker had not yet noticed
+/// the ACL drop would be considered healthy and block a peer's
+/// legitimate reconnect (the "Handshaking stuck" symptom observed
+/// on Android close/reopen).
+pub const STALE_PIPE_DEADLINE: Duration = Duration::from_secs(8);
+
 /// Record of one live BLE pipe.
 #[derive(Debug, Clone)]
 pub struct Pipe {
@@ -108,6 +125,10 @@ pub struct Pipe {
     pub device_id: DeviceId,
     pub direction: Direction,
     pub created_at: Instant,
+    /// Shared liveness handle the pipe worker bumps on every inbound
+    /// fragment / L2CAP frame. `promote()` reads `last()` to decide
+    /// whether the pipe is still carrying traffic or has gone silent.
+    pub last_rx_at: LivenessClock,
 }
 
 /// A pipe that exists but whose iroh-TLS identity hasn't been verified
@@ -227,9 +248,16 @@ impl Routing {
     /// Mint a fresh `StableConnId` and record a pipe. Caller should
     /// `evict_pipe` when the pipe's worker task terminates.
     ///
-    /// In step 1 this is the only mutator; later steps will add
-    /// `set_pending_target`, `promote`, etc.
-    pub fn register_pipe(&self, device_id: DeviceId, direction: Direction) -> StableConnId {
+    /// `last_rx_at` is the liveness handle the pipe worker bumps on
+    /// inbound activity. `promote()` reads it to distinguish a
+    /// healthy pipe from one whose worker hasn't noticed the ACL
+    /// drop yet.
+    pub fn register_pipe(
+        &self,
+        device_id: DeviceId,
+        direction: Direction,
+        last_rx_at: LivenessClock,
+    ) -> StableConnId {
         // Tokens are always non-zero. The wrapping guard is defensive —
         // a mobile app session won't exhaust u64, but we don't want a
         // hypothetical overflow silently handing out `StableConnId(0)`
@@ -240,6 +268,7 @@ impl Routing {
             device_id: device_id.clone(),
             direction,
             created_at: Instant::now(),
+            last_rx_at,
         };
         {
             let mut inner = self.inner.lock();
@@ -662,12 +691,14 @@ impl Routing {
         stable_id: StableConnId,
         device_id: DeviceId,
         direction: Direction,
+        last_rx_at: LivenessClock,
     ) {
         let pipe = Pipe {
             id: stable_id,
             device_id: device_id.clone(),
             direction,
             created_at: Instant::now(),
+            last_rx_at,
         };
         let mut inner = self.inner.lock();
         debug_assert!(
@@ -749,14 +780,29 @@ impl Routing {
         //   - other pendings targeting this endpoint (outbound that
         //     named this target) — excludes inbound pendings whose
         //     target is unknown.
+        //
+        // "Healthy" here specifically means "recently carrying
+        // traffic" — pipes whose `last_rx_at` hasn't advanced within
+        // `STALE_PIPE_DEADLINE` are treated as unhealthy so a peer
+        // that reopened its app can reclaim its slot rather than be
+        // rejected because our side hasn't yet noticed the old pipe
+        // is dead. This is the fix for the Android-close/reopen
+        // "stuck at Handshaking" symptom: the old pipe's worker was
+        // still in `pipes` but no bytes had flowed since the ACL
+        // dropped.
+        let now = Instant::now();
+        let is_pipe_fresh = |pipe: &Pipe| -> bool {
+            now.saturating_duration_since(pipe.last_rx_at.last()) < STALE_PIPE_DEADLINE
+        };
         let mut contenders: Vec<Contender> = Vec::new();
         if let Some(existing) = inner.routable.get(&remote_endpoint)
             && existing.pipe != pipe_id
         {
+            let healthy = inner.pipes.get(&existing.pipe).is_some_and(is_pipe_fresh);
             contenders.push(Contender {
                 pipe: existing.pipe,
                 dialer: existing.dialer,
-                is_healthy: inner.pipes.contains_key(&existing.pipe),
+                is_healthy: healthy,
             });
         }
         for (pid, p) in &inner.pending {
@@ -774,7 +820,7 @@ impl Routing {
             contenders.push(Contender {
                 pipe: *pid,
                 dialer: other_dialer,
-                is_healthy: true, // a live pending pipe is healthy by definition
+                is_healthy: is_pipe_fresh(other_pipe),
             });
         }
 
@@ -925,9 +971,21 @@ mod tests {
     #[test]
     fn mint_is_monotonic_and_nonzero() {
         let r = Routing::new();
-        let a = r.register_pipe(dev("a"), Direction::Outbound);
-        let b = r.register_pipe(dev("b"), Direction::Inbound);
-        let c = r.register_pipe(dev("c"), Direction::Outbound);
+        let a = r.register_pipe(
+            dev("a"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
+        let b = r.register_pipe(
+            dev("b"),
+            Direction::Inbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
+        let c = r.register_pipe(
+            dev("c"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         assert_ne!(a.as_u64(), 0, "id 0 reserved as sentinel");
         assert!(a.as_u64() < b.as_u64());
         assert!(b.as_u64() < c.as_u64());
@@ -938,8 +996,16 @@ mod tests {
         let r = Routing::new();
         assert_eq!(r.snapshot().pipes, 0);
 
-        let id1 = r.register_pipe(dev("one"), Direction::Outbound);
-        let id2 = r.register_pipe(dev("two"), Direction::Inbound);
+        let id1 = r.register_pipe(
+            dev("one"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
+        let id2 = r.register_pipe(
+            dev("two"),
+            Direction::Inbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         assert_eq!(r.snapshot().pipes, 2);
 
         r.evict_pipe(id1);
@@ -952,7 +1018,11 @@ mod tests {
     #[test]
     fn evict_is_idempotent_for_unknown_id() {
         let r = Routing::new();
-        let id = r.register_pipe(dev("peer"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("peer"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.evict_pipe(id);
         r.evict_pipe(id); // no panic, no underflow
         assert_eq!(r.snapshot().pipes, 0);
@@ -961,9 +1031,17 @@ mod tests {
     #[test]
     fn stable_conn_ids_are_not_reused_after_evict() {
         let r = Routing::new();
-        let first = r.register_pipe(dev("peer"), Direction::Outbound);
+        let first = r.register_pipe(
+            dev("peer"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.evict_pipe(first);
-        let second = r.register_pipe(dev("peer"), Direction::Outbound);
+        let second = r.register_pipe(
+            dev("peer"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         assert_ne!(first, second, "StableConnId must not recycle");
         assert!(second.as_u64() > first.as_u64());
     }
@@ -971,8 +1049,16 @@ mod tests {
     #[test]
     fn pipes_for_debug_reflects_register_and_evict() {
         let r = Routing::new();
-        let id1 = r.register_pipe(dev("x"), Direction::Outbound);
-        let id2 = r.register_pipe(dev("y"), Direction::Inbound);
+        let id1 = r.register_pipe(
+            dev("x"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
+        let id2 = r.register_pipe(
+            dev("y"),
+            Direction::Inbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
 
         let mut pipes = r.pipes_for_debug();
         pipes.sort_by_key(|p| p.id);
@@ -1025,7 +1111,11 @@ mod tests {
         let spurious_scan_device = dev("rotated-mac");
 
         // Set up a routable pipe for the endpoint on bound_device.
-        let id = r.register_pipe(bound_device.clone(), Direction::Outbound);
+        let id = r.register_pipe(
+            bound_device.clone(),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(ep, id, Dialer::Low);
         // Scan previously saw the same (correct) device.
         r.note_scan_hint(prefix, bound_device.clone());
@@ -1055,7 +1145,11 @@ mod tests {
         let ep = test_endpoint(78);
         let prefix = prefix_of(&ep);
         let d = dev("peer");
-        let id = r.register_pipe(d.clone(), Direction::Outbound);
+        let id = r.register_pipe(
+            d.clone(),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(ep, id, Dialer::Low);
         r.note_scan_hint(prefix, d.clone());
 
@@ -1087,7 +1181,11 @@ mod tests {
         assert_eq!(r.device_for_endpoint(&ep), Some(scan_device.clone()));
 
         // Add a routable pipe with a different DeviceId — preference flips.
-        let id = r.register_pipe(routable_device.clone(), Direction::Outbound);
+        let id = r.register_pipe(
+            routable_device.clone(),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(ep, id, Dialer::Low);
         assert_eq!(r.device_for_endpoint(&ep), Some(routable_device));
     }
@@ -1125,7 +1223,11 @@ mod tests {
         r.note_scan_hint(prefix, d.clone());
         assert_eq!(r.snapshot().pipes, 0);
 
-        let id = r.register_pipe(dev("mac-of-peer-c"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("mac-of-peer-c"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         // scan_hint count unaffected by pipe registration.
         assert_eq!(r.snapshot().scan_hints, 1);
         r.evict_pipe(id);
@@ -1142,7 +1244,11 @@ mod tests {
     #[test]
     fn register_pending_records_entry() {
         let r = Routing::new();
-        let id = r.register_pipe(dev("p"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("p"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         assert_eq!(r.pending_len(), 0);
         r.register_pending(id, None);
         assert_eq!(r.pending_len(), 1);
@@ -1152,7 +1258,11 @@ mod tests {
     #[test]
     fn register_pending_with_target_is_findable_by_endpoint() {
         let r = Routing::new();
-        let id = r.register_pipe(dev("p"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("p"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         let ep = test_endpoint(1);
         r.register_pending(id, Some(ep));
         assert_eq!(r.pending_pipe_for(&ep), Some(id));
@@ -1163,7 +1273,11 @@ mod tests {
     #[test]
     fn evict_pending_removes_entry() {
         let r = Routing::new();
-        let id = r.register_pipe(dev("p"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("p"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.register_pending(id, None);
         assert!(r.evict_pending(id).is_some());
         assert_eq!(r.pending_len(), 0);
@@ -1173,7 +1287,11 @@ mod tests {
     #[test]
     fn insert_routable_removes_pending_and_keys_by_endpoint() {
         let r = Routing::new();
-        let id = r.register_pipe(dev("p"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("p"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         let ep = test_endpoint(3);
         r.register_pending(id, Some(ep));
         assert_eq!(r.pending_len(), 1);
@@ -1189,8 +1307,16 @@ mod tests {
     fn insert_routable_returns_previous_entry_on_replace() {
         let r = Routing::new();
         let ep = test_endpoint(4);
-        let old = r.register_pipe(dev("old"), Direction::Outbound);
-        let new = r.register_pipe(dev("new"), Direction::Outbound);
+        let old = r.register_pipe(
+            dev("old"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
+        let new = r.register_pipe(
+            dev("new"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
 
         r.insert_routable(ep, old, Dialer::Low);
         let prev = r.insert_routable(ep, new, Dialer::High);
@@ -1206,19 +1332,31 @@ mod tests {
         let ep = test_endpoint(5);
 
         // Pipe A: routable.
-        let a = r.register_pipe(dev("a"), Direction::Outbound);
+        let a = r.register_pipe(
+            dev("a"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(ep, a, Dialer::Low);
         assert!(r.evict_pipe_state(a), "routable removed");
         assert_eq!(r.routable_len(), 0);
 
         // Pipe B: pending.
-        let b = r.register_pipe(dev("b"), Direction::Outbound);
+        let b = r.register_pipe(
+            dev("b"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.register_pending(b, None);
         assert!(r.evict_pipe_state(b), "pending removed");
         assert_eq!(r.pending_len(), 0);
 
         // Pipe C: in neither pool.
-        let c = r.register_pipe(dev("c"), Direction::Outbound);
+        let c = r.register_pipe(
+            dev("c"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         assert!(
             !r.evict_pipe_state(c),
             "no pool entry — evict_pipe_state returns false, no panic"
@@ -1238,7 +1376,11 @@ mod tests {
         // routing purposes." Authority-model invariant: these are
         // orthogonal dimensions.
         let r = Routing::new();
-        let id = r.register_pipe(dev("x"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("x"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         assert_eq!(r.snapshot().pipes, 1);
         assert_eq!(r.snapshot().pending, 0);
         assert_eq!(r.snapshot().routable, 0);
@@ -1330,7 +1472,11 @@ mod tests {
         let me = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
         let peer = iroh_base::SecretKey::from_bytes(&[0xFEu8; 32]).public();
         let r = Routing::new();
-        let id = r.register_pipe(dev("peer-mac"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("peer-mac"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.register_pending(id, Some(peer));
 
         let outcome = r.promote(id, &me, peer);
@@ -1353,8 +1499,16 @@ mod tests {
         // Case A: outbound pipe's handshake completes first.
         {
             let r = Routing::new();
-            let outbound = r.register_pipe(dev("peer-mac-a"), Direction::Outbound);
-            let inbound = r.register_pipe(dev("peer-cbcentral-a"), Direction::Inbound);
+            let outbound = r.register_pipe(
+                dev("peer-mac-a"),
+                Direction::Outbound,
+                crate::transport::peer::LivenessClock::new(),
+            );
+            let inbound = r.register_pipe(
+                dev("peer-cbcentral-a"),
+                Direction::Inbound,
+                crate::transport::peer::LivenessClock::new(),
+            );
             r.register_pending(outbound, Some(peer));
             r.register_pending(inbound, None);
 
@@ -1381,8 +1535,16 @@ mod tests {
         // Case B: inbound pipe's handshake completes first.
         {
             let r = Routing::new();
-            let outbound = r.register_pipe(dev("peer-mac-b"), Direction::Outbound);
-            let inbound = r.register_pipe(dev("peer-cbcentral-b"), Direction::Inbound);
+            let outbound = r.register_pipe(
+                dev("peer-mac-b"),
+                Direction::Outbound,
+                crate::transport::peer::LivenessClock::new(),
+            );
+            let inbound = r.register_pipe(
+                dev("peer-cbcentral-b"),
+                Direction::Inbound,
+                crate::transport::peer::LivenessClock::new(),
+            );
             r.register_pending(outbound, Some(peer));
             r.register_pending(inbound, None);
 
@@ -1422,12 +1584,20 @@ mod tests {
         assert!(me.as_bytes() < peer.as_bytes(), "test invariant: me < peer");
 
         let r = Routing::new();
-        let stale = r.register_pipe(dev("old-mac"), Direction::Outbound);
+        let stale = r.register_pipe(
+            dev("old-mac"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(peer, stale, Dialer::Low);
         r.evict_pipe(stale); // BLE link died; pipe gone but routable stale
         assert!(r.routable_pipe_for(&peer).is_some());
 
-        let fresh = r.register_pipe(dev("new-mac"), Direction::Outbound);
+        let fresh = r.register_pipe(
+            dev("new-mac"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.register_pending(fresh, Some(peer));
         let outcome = r.promote(fresh, &me, peer);
 
@@ -1444,6 +1614,85 @@ mod tests {
     }
 
     #[test]
+    fn promote_stale_but_still_registered_pipe_loses_to_redial() {
+        // Hardware regression: Android closed + reopened the app. The
+        // old routable pipe's worker on the peer side had NOT yet
+        // exited (BLE ACL drop undetected), so `pipes.contains_key`
+        // returned true and the old `is_healthy` rule rejected the
+        // new dial. Phones sat at "Handshaking" with no way forward
+        // until max_idle_timeout fired on the Connection.
+        //
+        // Fix: is_healthy now checks `last_rx_at.last()` against
+        // STALE_PIPE_DEADLINE. Force the stale pipe's liveness to an
+        // old instant here and verify the new dial replaces it.
+        let me = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer = iroh_base::SecretKey::from_bytes(&[0xFEu8; 32]).public();
+        assert!(me.as_bytes() < peer.as_bytes(), "test invariant: me < peer");
+
+        let r = Routing::new();
+        // Synthesize a liveness whose `last()` is already past
+        // `STALE_PIPE_DEADLINE` so the test doesn't need to sleep
+        // for wall-clock seconds. In production the pipe worker
+        // bumps on every inbound fragment; here we simulate the
+        // BLE-silent case directly.
+        let stale_liveness = LivenessClock::with_last(
+            Instant::now() - (STALE_PIPE_DEADLINE + Duration::from_secs(1)),
+        );
+        let stale = r.register_pipe(dev("old-mac"), Direction::Outbound, stale_liveness.clone());
+        r.insert_routable(peer, stale, Dialer::Low);
+
+        // Old pipe IS still in the pipes map — this is the bug
+        // precondition. The worker hasn't exited; only liveness has
+        // aged.
+        assert!(
+            r.pipes_for_debug().iter().any(|p| p.id == stale),
+            "test precondition: stale pipe must still be in the pipes map"
+        );
+
+        let fresh = r.register_pipe(dev("new-mac"), Direction::Outbound, LivenessClock::new());
+        r.register_pending(fresh, Some(peer));
+        let outcome = r.promote(fresh, &me, peer);
+
+        match outcome {
+            PromoteOutcome::Accepted { evicted } => {
+                assert!(
+                    evicted.contains(&stale),
+                    "stale-but-registered pipe must be evicted by the redial"
+                );
+            }
+            _ => panic!("stale pipe should lose to redial; got {outcome:?}"),
+        }
+        assert_eq!(r.routable_pipe_for(&peer), Some(fresh));
+    }
+
+    #[test]
+    fn promote_fresh_existing_still_wins_redial() {
+        // Companion to the above: when the existing pipe's liveness
+        // IS fresh (recent activity), a redundant redial should
+        // still be rejected. Prevents thrash when two concurrent
+        // dials race.
+        let me = iroh_base::SecretKey::from_bytes(&[0x01u8; 32]).public();
+        let peer = iroh_base::SecretKey::from_bytes(&[0xFEu8; 32]).public();
+
+        let r = Routing::new();
+        let fresh_liveness = LivenessClock::new();
+        let existing = r.register_pipe(dev("alive"), Direction::Outbound, fresh_liveness.clone());
+        r.insert_routable(peer, existing, Dialer::Low);
+        // Don't sleep: the pipe's liveness is fresh.
+
+        let redundant =
+            r.register_pipe(dev("duplicate"), Direction::Outbound, LivenessClock::new());
+        r.register_pending(redundant, Some(peer));
+        let outcome = r.promote(redundant, &me, peer);
+
+        assert!(
+            matches!(outcome, PromoteOutcome::Rejected),
+            "fresh existing pipe must beat same-direction redial; got {outcome:?}"
+        );
+        assert_eq!(r.routable_pipe_for(&peer), Some(existing));
+    }
+
+    #[test]
     fn promote_same_direction_healthy_existing_wins() {
         // Redundant re-dial: new pipe, same direction, existing pipe
         // still healthy → reject the new one.
@@ -1456,10 +1705,18 @@ mod tests {
         // Both outbound → both Dialer::Low (lower endpoint dialed).
 
         let r = Routing::new();
-        let existing = r.register_pipe(dev("a"), Direction::Outbound);
+        let existing = r.register_pipe(
+            dev("a"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(peer, existing, Dialer::Low);
 
-        let redundant = r.register_pipe(dev("b"), Direction::Outbound);
+        let redundant = r.register_pipe(
+            dev("b"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.register_pending(redundant, Some(peer));
         let outcome = r.promote(redundant, &me, peer);
 
@@ -1573,7 +1830,12 @@ mod tests {
         let r = Routing::new();
         let ep = test_endpoint(36);
         let id = r.reserve_outbound(ep);
-        r.register_pipe_with_id(id, dev("mac-36"), Direction::Outbound);
+        r.register_pipe_with_id(
+            id,
+            dev("mac-36"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         assert_eq!(r.snapshot().pipes, 1);
         assert_eq!(r.device_for_pipe(id).as_ref(), Some(&dev("mac-36")));
     }
@@ -1583,8 +1845,16 @@ mod tests {
         let r = Routing::new();
         let ep1 = test_endpoint(50);
         let ep2 = test_endpoint(51);
-        let p1 = r.register_pipe(dev("mac-1"), Direction::Outbound);
-        let p2 = r.register_pipe(dev("mac-2"), Direction::Inbound);
+        let p1 = r.register_pipe(
+            dev("mac-1"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
+        let p2 = r.register_pipe(
+            dev("mac-2"),
+            Direction::Inbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(ep1, p1, Dialer::Low);
         r.insert_routable(ep2, p2, Dialer::High);
 
@@ -1607,7 +1877,11 @@ mod tests {
         // pick up the eviction cleanly.
         let r = Routing::new();
         let ep = test_endpoint(52);
-        let id = r.register_pipe(dev("ghost-mac"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("ghost-mac"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(ep, id, Dialer::Low);
         r.evict_pipe(id);
         assert_eq!(r.routable_entries().len(), 0);
@@ -1616,7 +1890,11 @@ mod tests {
     #[test]
     fn device_for_pipe_follows_register_and_evict() {
         let r = Routing::new();
-        let id = r.register_pipe(dev("alive"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("alive"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         assert_eq!(r.device_for_pipe(id).as_ref(), Some(&dev("alive")));
         r.evict_pipe(id);
         assert!(r.device_for_pipe(id).is_none());
@@ -1628,7 +1906,11 @@ mod tests {
         let ep = test_endpoint(37);
         let (counter, waker) = counting_waker();
         r.register_endpoint_waker(ep, &waker);
-        let id = r.register_pipe(dev("peer"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("peer"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.insert_routable(ep, id, Dialer::Low);
         assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -1639,7 +1921,11 @@ mod tests {
         let ep = test_endpoint(38);
         let (counter, waker) = counting_waker();
         r.register_endpoint_waker(ep, &waker);
-        let id = r.register_pipe(dev("peer"), Direction::Outbound);
+        let id = r.register_pipe(
+            dev("peer"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         r.register_pending(id, Some(ep));
         assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
     }

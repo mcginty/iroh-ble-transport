@@ -981,7 +981,11 @@ mod tests {
             routing_v2: Arc::clone(&routing_v2),
         };
         let endpoint_id = endpoint_id_with_first_byte(0xBB);
-        let pipe_id = routing_v2.register_pipe(blew::DeviceId::from("mac-bb"), Direction::Outbound);
+        let pipe_id = routing_v2.register_pipe(
+            blew::DeviceId::from("mac-bb"),
+            Direction::Outbound,
+            crate::transport::peer::LivenessClock::new(),
+        );
         routing_v2.insert_routable(
             endpoint_id,
             pipe_id,
