@@ -379,19 +379,14 @@ pub enum PeerAction {
     UpgradeToL2cap {
         device_id: DeviceId,
     },
-    /// L2CAP open succeeded; swap the pipe worker from GATT to L2CAP on
-    /// this peer. The existing GATT worker enters drain-only mode.
+    /// L2CAP open succeeded; add the L2CAP worker to this peer's pipe
+    /// supervisor alongside the existing GATT worker (both-paths-alive;
+    /// see `pipe::WorkerSet`). Outbound sends prefer L2CAP; inbound
+    /// continues on whichever path the fragment arrived on.
     SwapPipeToL2cap {
         device_id: DeviceId,
         channel: L2capChannel,
         swap_tx: tokio::sync::mpsc::Sender<L2capChannel>,
-    },
-    /// L2CAP handover stalled; kill the L2CAP worker, respawn a GATT
-    /// worker, and stay Connected{Gatt} for the rest of this session.
-    RevertToGattPipe {
-        device_id: DeviceId,
-        tx_gen: u64,
-        role: ConnectRole,
     },
     /// Persist a snapshot of this peer to the configured `PeerStore`. Emitted
     /// when a peer leaves `Connected` for `Draining`: we've seen enough of
@@ -485,11 +480,6 @@ mod tests {
         };
         let _act1 = PeerAction::UpgradeToL2cap {
             device_id: DeviceId::from("x"),
-        };
-        let _act2 = PeerAction::RevertToGattPipe {
-            device_id: DeviceId::from("x"),
-            tx_gen: 1,
-            role: ConnectRole::Central,
         };
         assert_eq!(DisconnectReason::DedupLoser, DisconnectReason::DedupLoser);
     }

@@ -14,7 +14,6 @@ use tokio::sync::mpsc;
 
 use crate::transport::driver::Driver;
 use crate::transport::interface::BleInterface;
-#[allow(unused_imports)]
 use crate::transport::peer::{PeerAction, PeerCommand, PeerEntry, PeerPhase};
 use crate::transport::transport::L2capPolicy;
 
@@ -5989,11 +5988,13 @@ mod tests {
     fn l2cap_handover_timeout_marks_failed_and_demotes_path_telemetry() {
         // Both-paths-alive model: `L2capHandoverTimeout` arrives when
         // the pipe supervisor evicted its wedged L2CAP worker. GATT
-        // was never torn down, so the registry just flips the
-        // `l2cap_upgrade_failed` policy flag and updates the
-        // telemetry `channel.path` to Gatt — NO `RevertToGattPipe`
-        // action, which is now semantically wrong (there's no pipe
-        // to revert; GATT is still there).
+        // was never torn down, so the registry's only job is
+        // bookkeeping — flip the `l2cap_upgrade_failed` policy flag so
+        // we stop re-proposing L2CAP to this peer for the rest of the
+        // session, and demote the `channel.path` telemetry to Gatt
+        // so the snapshot matches what the supervisor is actually
+        // running on. No pipe-lifecycle actions: the GATT pipe was
+        // never evicted, so there is nothing to respawn.
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
 
         let my_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
@@ -6018,10 +6019,8 @@ mod tests {
         });
 
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, PeerAction::RevertToGattPipe { .. })),
-            "RevertToGattPipe is obsolete in the both-paths-alive design; \
+            actions.is_empty(),
+            "L2capHandoverTimeout is pure bookkeeping under both-paths-alive; \
              got {actions:?}"
         );
         let e = &reg.peers[&dev];

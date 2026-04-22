@@ -22,10 +22,6 @@ fn test_wakers() -> Arc<Mutex<Vec<Waker>>> {
     Arc::new(Mutex::new(Vec::new()))
 }
 
-fn test_routing_v2() -> Arc<iroh_ble_transport::transport::routing_v2::Routing> {
-    Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new())
-}
-
 fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
     (
         Arc::new(AtomicU64::new(0)),

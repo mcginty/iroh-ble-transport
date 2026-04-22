@@ -423,66 +423,6 @@ impl<I: BleInterface> Driver<I> {
                     }
                 });
             }
-            PeerAction::RevertToGattPipe {
-                device_id,
-                tx_gen,
-                role,
-            } => {
-                tracing::debug!(device = %device_id, "RevertToGattPipe: spawning fresh GATT pipe");
-                let (outbound_tx, outbound_rx) =
-                    mpsc::channel::<crate::transport::peer::PendingSend>(32);
-                let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(64);
-                let (swap_tx, swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
-                let last_rx_at = crate::transport::peer::LivenessClock::new();
-                let iface: Arc<dyn BleInterface> = Arc::clone(&self.iface) as Arc<dyn BleInterface>;
-                let incoming_tx = self.incoming_tx.clone();
-                let inbox = self.inbox.clone();
-                let retransmit_counter = Arc::clone(&self.retransmit_counter);
-                let truncation_counter = Arc::clone(&self.truncation_counter);
-                let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
-                let dev_for_ready = device_id.clone();
-                let pipe_last_rx_at = last_rx_at.clone();
-                // Reverting to GATT is a fresh pipe lifecycle; mint
-                // a new StableConnId. The old pipe's pool entry was
-                // already evicted on its own exit.
-                let routing_v2 = Arc::clone(&self.routing_v2);
-                let direction = direction_for_role(role);
-                let stable_id = routing_v2.register_pipe(device_id.clone(), direction);
-                routing_v2.register_pending(stable_id, None);
-                tokio::spawn(async move {
-                    run_data_pipe(
-                        iface,
-                        device_id,
-                        stable_id,
-                        role,
-                        crate::transport::peer::ConnectPath::Gatt,
-                        None,
-                        outbound_rx,
-                        inbound_rx,
-                        incoming_tx,
-                        inbox,
-                        swap_rx,
-                        retransmit_counter,
-                        truncation_counter,
-                        empty_frames_counter,
-                        pipe_last_rx_at,
-                    )
-                    .await;
-                    routing_v2.evict_pipe_state(stable_id);
-                    routing_v2.evict_pipe(stable_id);
-                });
-                let ready = PeerCommand::DataPipeReady {
-                    device_id: dev_for_ready,
-                    tx_gen,
-                    outbound_tx,
-                    inbound_tx,
-                    swap_tx,
-                    last_rx_at,
-                };
-                if self.inbox.send(ready).await.is_err() {
-                    tracing::debug!("inbox closed before DataPipeReady (revert) forwarded");
-                }
-            }
         }
     }
 
@@ -1304,45 +1244,6 @@ mod tests {
             .expect("timed out waiting for channel on swap_rx")
             .expect("swap_rx closed unexpectedly");
         drop(received);
-    }
-
-    #[tokio::test]
-    async fn revert_to_gatt_pipe_emits_data_pipe_ready() {
-        let iface = Arc::new(MockBleInterface::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
-        let driver = Driver::new(
-            iface,
-            tx,
-            incoming_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing_v2::Routing::new()),
-        );
-
-        driver
-            .execute(PeerAction::RevertToGattPipe {
-                device_id: blew::DeviceId::from("revert-dev"),
-                tx_gen: 11,
-                role: crate::transport::peer::ConnectRole::Central,
-            })
-            .await;
-
-        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match cmd {
-            PeerCommand::DataPipeReady {
-                device_id, tx_gen, ..
-            } => {
-                assert_eq!(device_id, blew::DeviceId::from("revert-dev"));
-                assert_eq!(tx_gen, 11);
-            }
-            other => panic!("expected DataPipeReady after revert, got {other:?}"),
-        }
     }
 
     #[tokio::test]
