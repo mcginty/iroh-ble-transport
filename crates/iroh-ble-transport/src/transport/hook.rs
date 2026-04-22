@@ -11,8 +11,8 @@ use crate::transport::transport::BLE_TRANSPORT_ID;
 
 /// `EndpointHooks` implementation that runs the pending→routable
 /// promotion rule against `routing` the instant iroh's TLS
-/// handshake binds a connection to an `EndpointId`. See §9.5 of the
-/// study doc for the rule.
+/// handshake binds a connection to an `EndpointId`. See
+/// [`crate::transport::routing::Routing::promote`] for the rule.
 ///
 /// Install alongside `add_custom_transport`:
 ///

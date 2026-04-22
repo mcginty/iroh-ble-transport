@@ -137,7 +137,7 @@ async fn wait_both_connected(a: &TestNode, b: &TestNode, timeout: Duration) {
     .expect("timed out waiting for both nodes to reach Connected");
 }
 
-// ─── Task 19 ─────────────────────────────────────────────────────────────────
+// ─── symmetric dial ──────────────────────────────────────────────────────────
 
 /// Two nodes discover each other. Node A (higher EndpointId) dials as Central;
 /// after both reach Connected and receive VerifiedEndpoint for their peer,
@@ -333,7 +333,7 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     );
 }
 
-// ─── Task 20 ─────────────────────────────────────────────────────────────────
+// ─── verified-live suppresses redundant dials ────────────────────────────────
 
 /// After a peer is verified (VerifiedEndpoint received), repeated
 /// advertisements from that peer must NOT trigger new StartConnect actions.
@@ -478,7 +478,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
     );
 }
 
-// ─── Task 21 ─────────────────────────────────────────────────────────────────
+// ─── L2CAP handover timeout ──────────────────────────────────────────────────
 
 /// With L2capPolicy::PreferL2cap, a VerifiedEndpoint triggers UpgradeToL2cap.
 /// When the L2CAP channel is accepted but the peer never reads (buffer fills),

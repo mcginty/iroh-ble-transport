@@ -394,7 +394,7 @@ impl BleTransport {
         Arc::clone(&self.routing)
     }
 
-    /// Spawn the pipe-lifetime watchdog (step 5 of the redesign). Polls
+    /// Spawn the pipe-lifetime watchdog. Polls
     /// `endpoint.remote_info` for every routable entry and, when iroh
     /// reports no active path, tells the registry to drain the
     /// corresponding BLE pipe. See

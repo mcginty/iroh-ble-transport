@@ -37,8 +37,9 @@ pub struct Registry {
     peers: HashMap<DeviceId, PeerEntry>,
     l2cap_policy: L2capPolicy,
     /// Prefixes whose identity has been verified by iroh's QUIC handshake.
-    /// Populated by VerifiedEndpoint; consulted by handle_advertised (Task 4)
-    /// and the dedup pass (Task 7).
+    /// Populated by `VerifiedEndpoint`; consulted by `handle_advertised`
+    /// (to suppress redundant redials of a verified peer) and by the
+    /// dedup pass that retires losing duplicate entries.
     verified_prefixes: HashMap<crate::transport::peer::KeyPrefix, iroh_base::EndpointId>,
     my_endpoint: iroh_base::EndpointId,
     my_prefix: crate::transport::peer::KeyPrefix,

@@ -80,8 +80,9 @@ pub fn parse_token_addr(addr: &CustomAddr) -> io::Result<u64> {
 /// Opaque handle iroh sees (wrapped in a `CustomAddr`) for a BLE pipe.
 ///
 /// Monotonic, minted fresh every time a pipe is opened, never reused.
-/// Later steps will embed the numeric value into `CustomAddr` payloads so
-/// iroh's Connections carry a stable id across the pipe's lifetime.
+/// The numeric value is carried as the payload of a BLE-transport
+/// `CustomAddr` via [`token_custom_addr`] / [`parse_token_addr`] so
+/// iroh's Connections keep a stable id across the pipe's lifetime.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct StableConnId(u64);
 
@@ -162,21 +163,21 @@ pub struct Pipe {
 
 /// A pipe that exists but whose iroh-TLS identity hasn't been verified
 /// yet. Promotes to `Routable` (and leaves the pending pool) when
-/// `after_handshake` runs the promotion rule and accepts — see step 4b.
+/// `after_handshake` runs the promotion rule ([`Routing::promote`]).
 #[derive(Debug, Clone)]
 pub struct Pending {
     pub pipe: StableConnId,
     /// `Some(endpoint_id)` when we know what the outbound dial is
-    /// targeting (set by the resolver in step 4c). `None` for inbound
-    /// accepts — we only learn their target at `after_handshake`.
+    /// targeting (set by the resolver). `None` for inbound accepts —
+    /// we only learn their target at `after_handshake`.
     pub target_endpoint: Option<EndpointId>,
     pub created_at: Instant,
 }
 
 /// A pipe whose iroh-TLS handshake has completed, binding it to an
 /// authenticated `EndpointId`. The `routable` pool is the only
-/// structure that drives routing decisions — see the authority model
-/// in §9.1 of the study doc.
+/// structure that drives routing decisions — authoritative post-
+/// handshake routing, as opposed to the `scan_hint` guess before it.
 #[derive(Debug, Clone)]
 pub struct Routable {
     pub pipe: StableConnId,
@@ -187,8 +188,9 @@ pub struct Routable {
     pub verified_at: Instant,
 }
 
-/// Shadow routing table. Step 1: tracks pipes only. Future steps add
-/// `pending`, `routable`, `scan_hint`, resolver wakers, token payloads.
+/// Authoritative routing table shared across the transport. Owns every
+/// piece of connection-system state that isn't the per-peer lifecycle
+/// machine in `registry.rs`.
 #[derive(Debug, Default)]
 pub struct Routing {
     inner: Mutex<RoutingInner>,
@@ -202,16 +204,14 @@ struct RoutingInner {
     /// central-side event pump sees an advertising packet whose service
     /// UUID matches the iroh-ble prefix shape. Answers "who might be
     /// nearby under this public-key prefix" — a hint for dialing only;
-    /// never an authority for routing (see authority model in §9.1 of
-    /// the study doc).
+    /// never an authority for routing.
     scan_hint: HashMap<KeyPrefix, DeviceId>,
     /// Pipes that exist but haven't been authenticated yet. Mutually
     /// exclusive with `routable` — a pipe is in exactly one pool at
     /// any moment (or neither, briefly, during promotion transitions).
     pending: HashMap<StableConnId, Pending>,
     /// Pipes bound to an authenticated `EndpointId`. At most one
-    /// entry per peer (invariant enforced by the promotion rule in
-    /// step 4b).
+    /// entry per peer (invariant enforced by [`Routing::promote`]).
     routable: HashMap<EndpointId, Routable>,
     /// Outbound-dial reservations: the resolver has yielded a
     /// `CustomAddr(stable_id)` to iroh but no pipe exists yet. When
@@ -463,12 +463,12 @@ impl Routing {
         inner.scan_hint.get(&prefix).cloned()
     }
 
-    // ---------- pending / routable pool bookkeeping (step 4a) ----------
+    // ---------- pending / routable pool bookkeeping ----------
 
     /// Register a newly-opened pipe as pending. Called by the driver
     /// right after `register_pipe`. `target_endpoint` is `Some(id)` for
-    /// outbound pipes that came from a resolver dial (step 4c wires
-    /// this) and `None` for inbound accepts.
+    /// outbound pipes that came from a resolver dial and `None` for
+    /// inbound accepts.
     pub fn register_pending(&self, pipe: StableConnId, target_endpoint: Option<EndpointId>) {
         {
             let mut inner = self.inner.lock();
@@ -601,7 +601,7 @@ impl Routing {
     }
 
     /// Snapshot of the current routable pool for the pipe-lifetime
-    /// watchdog (step 5). Each entry is resolved into
+    /// watchdog. Each entry is resolved into
     /// `(endpoint_id, stable_id, device_id, verified_at)` so the
     /// watchdog can cross-reference iroh's `remote_info` and, on
     /// mismatch, push the matching `DeviceId` to the registry for
@@ -642,7 +642,7 @@ impl Routing {
         self.inner.lock().reservations.len()
     }
 
-    // ---------- reservations + endpoint wakers (step 4c) ----------
+    // ---------- reservations + endpoint wakers ----------
 
     /// Mint a fresh `StableConnId` and stash it as an outbound-dial
     /// reservation for `endpoint_id`. Called by
@@ -775,7 +775,7 @@ impl Routing {
         }
     }
 
-    // ---------- promotion rule (step 4b) ----------
+    // ---------- promotion rule ----------
 
     /// Run the promotion rule (see `decide()`) for a pending pipe whose
     /// iroh TLS handshake just completed. Mutates `pending`/`routable`
@@ -892,7 +892,7 @@ impl Routing {
     }
 }
 
-// ---------- decide() rule (step 4b, pure function) ----------
+// ---------- decide() rule (pure function) ----------
 
 /// A contender for the routable slot of some `EndpointId`. Used only
 /// inside the promotion rule — never exposed outside `routing`.
@@ -912,8 +912,10 @@ enum Decision {
     Reject,
 }
 
-/// Observer-symmetric resolution of a handshake collision. See §9.5
-/// of the study doc for the derivation.
+/// Observer-symmetric resolution of a handshake collision. Both sides
+/// of a pair arrive at the same decision without any explicit
+/// negotiation, because [`Dialer`] is computed from the pair's
+/// (self, remote) endpoint_ids identically on both sides.
 ///
 /// - No contender → `Accept` (single dial, fresh inbound).
 /// - Different positional category (one lower-dialed, one higher-
@@ -947,10 +949,10 @@ pub enum PromoteOutcome {
     Rejected,
 }
 
-/// One routable entry surfaced to the pipe-lifetime watchdog (step 5).
-/// Pairs the routable pool's identity with the underlying pipe's
-/// `DeviceId` so the watchdog can issue a targeted teardown to the
-/// registry without racing through a second lock.
+/// One routable entry surfaced to the pipe-lifetime watchdog. Pairs
+/// the routable pool's identity with the underlying pipe's `DeviceId`
+/// so the watchdog can issue a targeted teardown to the registry
+/// without racing through a second lock.
 #[derive(Debug, Clone)]
 pub struct RoutableSnapshot {
     pub endpoint_id: EndpointId,
@@ -1203,9 +1205,8 @@ mod tests {
     fn scan_hint_is_independent_from_pipes() {
         // Dial hints and live pipes live in orthogonal state. Recording
         // a hint must not create a pipe entry, and opening a pipe must
-        // not create a hint. Keeps the authority model clean (§9.1 of
-        // the study doc): scan_hint is pre-authentication, pipes are
-        // post-dial.
+        // not create a hint. Keeps the authority model clean:
+        // scan_hint is pre-authentication, pipes are post-dial.
         let r = Routing::new();
         let prefix: KeyPrefix = [12u8; 12];
         let d = dev("peer-c");
@@ -1225,7 +1226,7 @@ mod tests {
         iroh_base::SecretKey::from_bytes(&[seed; 32]).public()
     }
 
-    // ---------- pending / routable pool bookkeeping (step 4a) ----------
+    // ---------- pending / routable pool bookkeeping ----------
 
     #[test]
     fn register_pending_records_entry() {
@@ -1345,7 +1346,7 @@ mod tests {
         assert_eq!(r.snapshot().pending, 1);
     }
 
-    // ---------- decide() rule (step 4b) ----------
+    // ---------- decide() rule ----------
 
     fn contender(dialer: Dialer) -> Contender {
         Contender {
@@ -1398,7 +1399,7 @@ mod tests {
         }
     }
 
-    // ---------- promote() integration (step 4b) ----------
+    // ---------- promote() integration ----------
 
     #[test]
     fn promote_single_dial_accepts() {
@@ -1532,7 +1533,7 @@ mod tests {
         assert!(matches!(outcome, PromoteOutcome::Rejected));
     }
 
-    // ---------- reservations + endpoint wakers (step 4c) ----------
+    // ---------- reservations + endpoint wakers ----------
 
     struct CountingWaker(std::sync::atomic::AtomicUsize);
     impl std::task::Wake for CountingWaker {

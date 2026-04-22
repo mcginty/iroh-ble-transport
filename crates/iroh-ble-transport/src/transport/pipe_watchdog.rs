@@ -1,4 +1,4 @@
-//! Pipe-lifetime watchdog (step 5 of the connection-system redesign).
+//! Pipe-lifetime watchdog.
 //!
 //! Polls iroh's `Endpoint::remote_info` for every routable entry and
 //! tears the BLE pipe down when iroh reports the Connection has no
@@ -12,9 +12,6 @@
 //! drain." The registry's normal `Stalled` path does the rest (drain,
 //! close channel, which causes the pipe worker to exit, which evicts
 //! routing state).
-//!
-//! See `.claude/plans/2026-04-21-connection-system-study.md` §9.6 for
-//! the full rationale.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

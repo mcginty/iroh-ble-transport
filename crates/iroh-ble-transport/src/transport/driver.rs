@@ -956,11 +956,11 @@ mod tests {
 
     #[tokio::test]
     async fn start_data_pipe_registers_pending_and_evicts_on_close() {
-        // Step 4a contract: StartDataPipe adds the new pipe to the
-        // pending pool with target_endpoint=None; pipe close evicts
-        // from whichever pool (pending or routable) held it. Without
-        // this, step 4b's promotion rule would see no pending entry
-        // to promote, and step 4c's resolver wouldn't find the pipe.
+        // StartDataPipe adds the new pipe to the pending pool with
+        // target_endpoint=None; pipe close evicts from whichever pool
+        // (pending or routable) held it. Without this, `promote` would
+        // see no pending entry to promote, and the resolver wouldn't
+        // find the pipe.
         use crate::transport::peer::{ConnectPath, ConnectRole};
 
         let iface = Arc::new(MockBleInterface::new());
