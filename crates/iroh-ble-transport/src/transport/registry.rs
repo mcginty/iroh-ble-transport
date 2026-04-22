@@ -773,6 +773,7 @@ impl Registry {
         entry.consecutive_failures += 1;
         actions.push(PeerAction::EmitMetric(format!("connect_failed:{error}")));
         if next_attempt >= MAX_CONNECT_ATTEMPTS {
+            entry.target_endpoint = None;
             entry.phase = PeerPhase::Dead {
                 reason: crate::transport::peer::DeadReason::MaxRetries,
                 at: now,
@@ -1028,6 +1029,7 @@ impl Registry {
             entry.pending_sends.clear();
             actions.push(PeerAction::EmitMetric(format!("connect_failed:{reason:?}")));
             if next_attempt >= MAX_CONNECT_ATTEMPTS {
+                entry.target_endpoint = None;
                 entry.phase = PeerPhase::Dead {
                     reason: crate::transport::peer::DeadReason::MaxRetries,
                     at: now,
@@ -1186,12 +1188,14 @@ impl Registry {
                     // Android MAC randomization on peer restart) or by
                     // iroh issuing a new SendDatagram, not by the
                     // registry's own retry loop.
+                    entry.target_endpoint = None;
                     entry.phase = PeerPhase::Dead {
                         reason: crate::transport::peer::DeadReason::Forgotten,
                         at: tick_now,
                     };
                 }
                 TickAction::RestoringToDead => {
+                    entry.target_endpoint = None;
                     entry.phase = PeerPhase::Dead {
                         reason: crate::transport::peer::DeadReason::Forgotten,
                         at: tick_now,
@@ -1668,6 +1672,7 @@ impl Registry {
             crate::transport::peer::DisconnectReason::ProtocolMismatch,
         );
         actions.extend(broken_pipe_acks);
+        entry.target_endpoint = None;
         entry.phase = PeerPhase::Dead {
             reason: crate::transport::peer::DeadReason::ProtocolMismatch { got, want },
             at: now,
@@ -1895,6 +1900,7 @@ pub struct RegistryHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn noop_waker() -> std::task::Waker {
         use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -1936,6 +1942,176 @@ mod tests {
             swap_tx,
             last_rx_at: crate::transport::peer::LivenessClock::new(),
         });
+    }
+
+    #[derive(Debug, Clone)]
+    enum TargetLifecycleCommand {
+        Advertise { endpoint_seed: u8 },
+        SendReserved { endpoint_seed: u8 },
+        ConnectSucceeded,
+        ConnectFailed,
+        CentralDisconnectedTimeout,
+        AdapterOff,
+        AdapterOn,
+        Tick,
+        DataPipeReady,
+        Forget,
+    }
+
+    fn target_lifecycle_command_strategy() -> impl Strategy<Value = TargetLifecycleCommand> {
+        prop_oneof![
+            any::<u8>()
+                .prop_map(|endpoint_seed| TargetLifecycleCommand::Advertise { endpoint_seed }),
+            any::<u8>()
+                .prop_map(|endpoint_seed| TargetLifecycleCommand::SendReserved { endpoint_seed }),
+            Just(TargetLifecycleCommand::ConnectSucceeded),
+            Just(TargetLifecycleCommand::ConnectFailed),
+            Just(TargetLifecycleCommand::CentralDisconnectedTimeout),
+            Just(TargetLifecycleCommand::AdapterOff),
+            Just(TargetLifecycleCommand::AdapterOn),
+            Just(TargetLifecycleCommand::Tick),
+            Just(TargetLifecycleCommand::DataPipeReady),
+            Just(TargetLifecycleCommand::Forget),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn target_endpoint_and_tx_gen_invariants_hold_across_random_lifecycle_sequences(
+            commands in prop::collection::vec(target_lifecycle_command_strategy(), 1..80)
+        ) {
+            let mut reg = Registry::new_for_test();
+            let device_id = blew::DeviceId::from("prop-target-peer");
+            let mut expected_target = None;
+            let mut last_seen_tx_gen = None;
+
+            for command in commands {
+                let phase_before = reg.peer(&device_id).map(|entry| &entry.phase);
+                let current_tx_gen = reg.peer(&device_id).map_or(0, |entry| entry.tx_gen);
+
+                let actions = match command {
+                    TargetLifecycleCommand::Advertise { endpoint_seed } => {
+                        let endpoint = iroh_base::SecretKey::from_bytes(&[endpoint_seed; 32]).public();
+                        reg.handle(PeerCommand::Advertised {
+                            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+                            device: blew::BleDevice {
+                                id: device_id.clone(),
+                                name: None,
+                                rssi: None,
+                                services: vec![],
+                            },
+                            rssi: None,
+                        })
+                    }
+                    TargetLifecycleCommand::SendReserved { endpoint_seed } => {
+                        let endpoint = iroh_base::SecretKey::from_bytes(&[endpoint_seed; 32]).public();
+                        if !matches!(
+                            phase_before,
+                            Some(PeerPhase::Connected { .. })
+                                | Some(PeerPhase::Draining { .. })
+                                | Some(PeerPhase::Dead { .. })
+                        ) {
+                            expected_target = Some(endpoint);
+                        }
+                        reg.handle(PeerCommand::SendDatagram {
+                            device_id: device_id.clone(),
+                            target_endpoint: Some(endpoint),
+                            tx_gen: current_tx_gen,
+                            datagram: bytes::Bytes::from_static(b"hello"),
+                            waker: noop_waker(),
+                        })
+                    }
+                    TargetLifecycleCommand::ConnectSucceeded => reg.handle(PeerCommand::ConnectSucceeded {
+                        device_id: device_id.clone(),
+                        channel: crate::transport::peer::ChannelHandle {
+                            id: 1,
+                            path: crate::transport::peer::ConnectPath::Gatt,
+                        },
+                    }),
+                    TargetLifecycleCommand::ConnectFailed => reg.handle(PeerCommand::ConnectFailed {
+                        device_id: device_id.clone(),
+                        error: "timeout".into(),
+                    }),
+                    TargetLifecycleCommand::CentralDisconnectedTimeout => reg.handle(
+                        PeerCommand::CentralDisconnected {
+                            device_id: device_id.clone(),
+                            cause: blew::DisconnectCause::Timeout,
+                        }
+                    ),
+                    TargetLifecycleCommand::AdapterOff => {
+                        reg.handle(PeerCommand::AdapterStateChanged { powered: false })
+                    }
+                    TargetLifecycleCommand::AdapterOn => {
+                        reg.handle(PeerCommand::AdapterStateChanged { powered: true })
+                    }
+                    TargetLifecycleCommand::Tick => reg.handle(PeerCommand::Tick(
+                        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                    )),
+                    TargetLifecycleCommand::DataPipeReady => {
+                        if matches!(phase_before, Some(PeerPhase::Connected { .. })) {
+                            expected_target = None;
+                            mark_data_pipe_ready(&mut reg, &device_id);
+                        }
+                        Vec::new()
+                    }
+                    TargetLifecycleCommand::Forget => {
+                        expected_target = None;
+                        reg.handle(PeerCommand::Forget {
+                            device_id: device_id.clone(),
+                        })
+                    }
+                };
+
+                for action in &actions {
+                    if let PeerAction::StartDataPipe {
+                        device_id: start_device,
+                        target_endpoint,
+                        ..
+                    } = action
+                        && *start_device == device_id
+                    {
+                        prop_assert_eq!(*target_endpoint, expected_target);
+                    }
+                }
+
+                match reg.peer(&device_id) {
+                    Some(entry) => {
+                        if matches!(entry.phase, PeerPhase::Dead { .. }) {
+                            expected_target = None;
+                        }
+                        prop_assert_eq!(entry.target_endpoint, expected_target);
+                        if let Some(prev_tx_gen) = last_seen_tx_gen {
+                            prop_assert!(
+                                entry.tx_gen >= prev_tx_gen,
+                                "tx_gen must be monotonic across lifecycle transitions"
+                            );
+                        }
+                        last_seen_tx_gen = Some(entry.tx_gen);
+                        if let PeerPhase::Connected { tx_gen, .. } = &entry.phase {
+                            prop_assert_eq!(
+                                entry.tx_gen, *tx_gen,
+                                "entry.tx_gen must match the live connected generation"
+                            );
+                        }
+                        if matches!(
+                            entry.phase,
+                            PeerPhase::Dead {
+                                reason: crate::transport::peer::DeadReason::Forgotten,
+                                ..
+                            }
+                        ) {
+                            prop_assert_eq!(entry.target_endpoint, None);
+                        }
+                    }
+                    None => {
+                        expected_target = None;
+                        last_seen_tx_gen = None;
+                    }
+                }
+            }
+        }
     }
 
     #[test]

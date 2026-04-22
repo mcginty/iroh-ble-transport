@@ -44,3 +44,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 rand = "0.9"
 blew = { version = "0.3", features = ["testing"] }
+proptest = "1"

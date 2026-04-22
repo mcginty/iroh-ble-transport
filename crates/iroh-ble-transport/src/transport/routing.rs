@@ -1010,9 +1010,329 @@ pub struct RoutingSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::HashSet;
 
     fn dev(s: &str) -> DeviceId {
         DeviceId::from(s)
+    }
+
+    fn dev_idx(i: u8) -> DeviceId {
+        DeviceId::from(format!("dev-{i}"))
+    }
+
+    const PROP_SLOT_COUNT: usize = 8;
+
+    #[derive(Debug, Clone)]
+    enum RoutingCommand {
+        NoteScanHint {
+            endpoint_seed: u8,
+            device_idx: u8,
+        },
+        ForgetScanHint {
+            endpoint_seed: u8,
+        },
+        ReserveOutbound {
+            endpoint_seed: u8,
+        },
+        ConsumeReservationForEndpoint {
+            endpoint_seed: u8,
+        },
+        ConsumeReservationForDevice {
+            device_idx: u8,
+        },
+        BindReservedPipe {
+            slot: u8,
+            endpoint_seed: u8,
+            device_idx: u8,
+            outbound: bool,
+        },
+        RegisterPipe {
+            slot: u8,
+            device_idx: u8,
+            outbound: bool,
+        },
+        RegisterPending {
+            slot: u8,
+            target_seed: Option<u8>,
+        },
+        InsertRoutable {
+            slot: u8,
+            endpoint_seed: u8,
+            high_dialer: bool,
+        },
+        EvictPipe {
+            slot: u8,
+        },
+        EvictPipeState {
+            slot: u8,
+        },
+        EvictPending {
+            slot: u8,
+        },
+        EvictRoutable {
+            endpoint_seed: u8,
+        },
+    }
+
+    fn direction_from_flag(outbound: bool) -> Direction {
+        if outbound {
+            Direction::Outbound
+        } else {
+            Direction::Inbound
+        }
+    }
+
+    fn dialer_from_flag(high: bool) -> Dialer {
+        if high { Dialer::High } else { Dialer::Low }
+    }
+
+    fn slot_index(slot: u8) -> usize {
+        usize::from(slot) % PROP_SLOT_COUNT
+    }
+
+    fn routing_command_strategy() -> impl Strategy<Value = RoutingCommand> {
+        prop_oneof![
+            (any::<u8>(), any::<u8>()).prop_map(|(endpoint_seed, device_idx)| {
+                RoutingCommand::NoteScanHint {
+                    endpoint_seed,
+                    device_idx,
+                }
+            }),
+            any::<u8>().prop_map(|endpoint_seed| RoutingCommand::ForgetScanHint { endpoint_seed }),
+            any::<u8>().prop_map(|endpoint_seed| RoutingCommand::ReserveOutbound { endpoint_seed }),
+            any::<u8>().prop_map(
+                |endpoint_seed| RoutingCommand::ConsumeReservationForEndpoint { endpoint_seed }
+            ),
+            any::<u8>()
+                .prop_map(|device_idx| RoutingCommand::ConsumeReservationForDevice { device_idx }),
+            (any::<u8>(), any::<u8>(), any::<u8>(), any::<bool>()).prop_map(
+                |(slot, endpoint_seed, device_idx, outbound)| RoutingCommand::BindReservedPipe {
+                    slot,
+                    endpoint_seed,
+                    device_idx,
+                    outbound,
+                },
+            ),
+            (any::<u8>(), any::<u8>(), any::<bool>()).prop_map(|(slot, device_idx, outbound)| {
+                RoutingCommand::RegisterPipe {
+                    slot,
+                    device_idx,
+                    outbound,
+                }
+            }),
+            (any::<u8>(), prop::option::of(any::<u8>())).prop_map(|(slot, target_seed)| {
+                RoutingCommand::RegisterPending { slot, target_seed }
+            }),
+            (any::<u8>(), any::<u8>(), any::<bool>()).prop_map(
+                |(slot, endpoint_seed, high_dialer)| RoutingCommand::InsertRoutable {
+                    slot,
+                    endpoint_seed,
+                    high_dialer,
+                },
+            ),
+            any::<u8>().prop_map(|slot| RoutingCommand::EvictPipe { slot }),
+            any::<u8>().prop_map(|slot| RoutingCommand::EvictPipeState { slot }),
+            any::<u8>().prop_map(|slot| RoutingCommand::EvictPending { slot }),
+            any::<u8>().prop_map(|endpoint_seed| RoutingCommand::EvictRoutable { endpoint_seed }),
+        ]
+    }
+
+    fn assert_routing_invariants(
+        routing: &Routing,
+        touched_endpoints: &HashSet<EndpointId>,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        let snapshot = routing.snapshot();
+        let pipes = routing.pipes_for_debug();
+
+        prop_assert_eq!(snapshot.pipes, pipes.len());
+        prop_assert_eq!(snapshot.pending, routing.pending_len());
+        prop_assert_eq!(snapshot.routable, routing.routable_len());
+        prop_assert_eq!(snapshot.reservations, routing.reservation_len());
+
+        let mut live_ids = HashSet::new();
+        for pipe in &pipes {
+            prop_assert!(
+                live_ids.insert(pipe.id),
+                "live pipes must have unique StableConnIds"
+            );
+            prop_assert_eq!(
+                routing.device_for_pipe(pipe.id),
+                Some(pipe.device_id.clone())
+            );
+        }
+
+        let mut reservation_prefixes = HashSet::new();
+        for endpoint in touched_endpoints {
+            let prefix = prefix_of(endpoint);
+            let expected_device = routing
+                .routable_pipe_for(endpoint)
+                .and_then(|pipe| routing.device_for_pipe(pipe))
+                .or_else(|| routing.scan_hint_for_prefix(&prefix));
+            prop_assert_eq!(routing.device_for_endpoint(endpoint), expected_device);
+
+            if let Some(reservation) = routing.reservation_for_prefix(&prefix) {
+                prop_assert_eq!(reservation.endpoint_id, *endpoint);
+                prop_assert_eq!(
+                    routing.reservation_target(reservation.stable_id),
+                    Some((reservation.endpoint_id, prefix))
+                );
+                prop_assert!(
+                    reservation_prefixes.insert(prefix),
+                    "there must be at most one reservation per prefix"
+                );
+                prop_assert!(
+                    !live_ids.contains(&reservation.stable_id),
+                    "live pipe ids must not alias active reservation ids"
+                );
+            }
+        }
+
+        prop_assert_eq!(reservation_prefixes.len(), routing.reservation_len());
+        Ok(())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn routing_invariants_hold_across_random_command_sequences(
+            commands in prop::collection::vec(routing_command_strategy(), 1..80)
+        ) {
+            let routing = Routing::new();
+            let mut touched_endpoints = HashSet::new();
+            let mut slots = [None; PROP_SLOT_COUNT];
+            let mut issued_ids = HashSet::new();
+
+            for command in commands {
+                match command {
+                    RoutingCommand::NoteScanHint {
+                        endpoint_seed,
+                        device_idx,
+                    } => {
+                        let endpoint = test_endpoint(endpoint_seed);
+                        touched_endpoints.insert(endpoint);
+                        routing.note_scan_hint(prefix_of(&endpoint), dev_idx(device_idx));
+                    }
+                    RoutingCommand::ForgetScanHint { endpoint_seed } => {
+                        let endpoint = test_endpoint(endpoint_seed);
+                        touched_endpoints.insert(endpoint);
+                        routing.forget_scan_hint(&prefix_of(&endpoint));
+                    }
+                    RoutingCommand::ReserveOutbound { endpoint_seed } => {
+                        let endpoint = test_endpoint(endpoint_seed);
+                        let prefix = prefix_of(&endpoint);
+                        touched_endpoints.insert(endpoint);
+                        let existing = routing.reservation_for_prefix(&prefix).map(|r| r.stable_id);
+                        let reserved = routing.reserve_outbound(endpoint);
+                        if let Some(existing) = existing {
+                            prop_assert_eq!(reserved, existing);
+                        } else {
+                            prop_assert!(
+                                issued_ids.insert(reserved.as_u64()),
+                                "minted ids must be monotonic and never reused"
+                            );
+                        }
+                    }
+                    RoutingCommand::ConsumeReservationForEndpoint { endpoint_seed } => {
+                        let endpoint = test_endpoint(endpoint_seed);
+                        let prefix = prefix_of(&endpoint);
+                        touched_endpoints.insert(endpoint);
+                        let expected = routing.reservation_for_prefix(&prefix).map(|r| r.stable_id);
+                        let taken = routing.consume_reservation_for_endpoint(&endpoint);
+                        prop_assert_eq!(taken.as_ref().map(|r| r.stable_id), expected);
+                        if let Some(reservation) = taken {
+                            prop_assert_eq!(reservation.endpoint_id, endpoint);
+                            prop_assert!(routing.reservation_target(reservation.stable_id).is_none());
+                        }
+                    }
+                    RoutingCommand::ConsumeReservationForDevice { device_idx } => {
+                        if let Some(reservation) =
+                            routing.consume_reservation_for_device(&dev_idx(device_idx))
+                        {
+                            prop_assert!(routing.reservation_target(reservation.stable_id).is_none());
+                        }
+                    }
+                    RoutingCommand::BindReservedPipe {
+                        slot,
+                        endpoint_seed,
+                        device_idx,
+                        outbound,
+                    } => {
+                        let endpoint = test_endpoint(endpoint_seed);
+                        touched_endpoints.insert(endpoint);
+                        if let Some(reservation) = routing.consume_reservation_for_endpoint(&endpoint)
+                        {
+                            let stable_id = reservation.stable_id;
+                            routing.register_pipe_with_id(
+                                stable_id,
+                                dev_idx(device_idx),
+                                direction_from_flag(outbound),
+                            );
+                            slots[slot_index(slot)] = Some(stable_id);
+                            prop_assert!(issued_ids.contains(&stable_id.as_u64()));
+                        }
+                    }
+                    RoutingCommand::RegisterPipe {
+                        slot,
+                        device_idx,
+                        outbound,
+                    } => {
+                        let pipe = routing.register_pipe(
+                            dev_idx(device_idx),
+                            direction_from_flag(outbound),
+                        );
+                        slots[slot_index(slot)] = Some(pipe);
+                        prop_assert!(
+                            issued_ids.insert(pipe.as_u64()),
+                            "minted ids must be monotonic and never reused"
+                        );
+                    }
+                    RoutingCommand::RegisterPending { slot, target_seed } => {
+                        if let Some(pipe) = slots[slot_index(slot)] {
+                            let target_endpoint = target_seed.map(test_endpoint);
+                            if let Some(endpoint) = target_endpoint {
+                                touched_endpoints.insert(endpoint);
+                            }
+                            routing.register_pending(pipe, target_endpoint);
+                        }
+                    }
+                    RoutingCommand::InsertRoutable {
+                        slot,
+                        endpoint_seed,
+                        high_dialer,
+                    } => {
+                        if let Some(pipe) = slots[slot_index(slot)] {
+                            let endpoint = test_endpoint(endpoint_seed);
+                            touched_endpoints.insert(endpoint);
+                            routing.insert_routable(endpoint, pipe, dialer_from_flag(high_dialer));
+                        }
+                    }
+                    RoutingCommand::EvictPipe { slot } => {
+                        if let Some(pipe) = slots[slot_index(slot)] {
+                            routing.evict_pipe(pipe);
+                        }
+                    }
+                    RoutingCommand::EvictPipeState { slot } => {
+                        if let Some(pipe) = slots[slot_index(slot)] {
+                            routing.evict_pipe_state(pipe);
+                        }
+                    }
+                    RoutingCommand::EvictPending { slot } => {
+                        if let Some(pipe) = slots[slot_index(slot)] {
+                            routing.evict_pending(pipe);
+                        }
+                    }
+                    RoutingCommand::EvictRoutable { endpoint_seed } => {
+                        let endpoint = test_endpoint(endpoint_seed);
+                        touched_endpoints.insert(endpoint);
+                        routing.evict_routable(&endpoint);
+                    }
+                }
+
+                assert_routing_invariants(&routing, &touched_endpoints)?;
+            }
+        }
     }
 
     // ---------- address-layer helpers ----------
