@@ -988,6 +988,42 @@ impl Registry {
             return;
         };
         let reason = crate::transport::peer::DisconnectReason::from(cause);
+        // A DeviceDisconnected for a peer we were in the middle of
+        // dialing IS the connect failure — there is no live pipe to
+        // drain. Historically this arm raced with `ConnectFailed`
+        // from the driver: central-event-pump reached the registry
+        // first, `drain_to_draining` moved us to `Draining`, and by
+        // the time `ConnectFailed` fired the phase no longer matched
+        // `Connecting`, so retry state was never set. Peer then sat
+        // 5s in Draining → Dead → GC, never retried. Fold this case
+        // into the connect-failure retry path so Android GATT 133
+        // (and similar) can back off + retry correctly.
+        if let PeerPhase::Connecting { attempt, .. } = entry.phase {
+            let next_attempt = attempt + 1;
+            entry.consecutive_failures += 1;
+            entry.pending_sends.clear();
+            actions.push(PeerAction::EmitMetric(format!("connect_failed:{reason:?}")));
+            if next_attempt >= MAX_CONNECT_ATTEMPTS {
+                entry.phase = PeerPhase::Dead {
+                    reason: crate::transport::peer::DeadReason::MaxRetries,
+                    at: now,
+                };
+                if let Some(prefix) = entry.prefix {
+                    actions.push(PeerAction::ForgetPeerStore { prefix });
+                }
+                self.prune_verified_prefixes();
+            } else {
+                entry.phase = PeerPhase::Reconnecting {
+                    attempt: next_attempt,
+                    next_at: now + reconnect_backoff(next_attempt),
+                    reason: reason.clone(),
+                };
+            }
+            if matches!(reason, crate::transport::peer::DisconnectReason::Gatt133) {
+                actions.push(PeerAction::Refresh { device_id });
+            }
+            return;
+        }
         let channel = match &entry.phase {
             PeerPhase::Connected { channel, .. } | PeerPhase::Handshaking { channel, .. } => {
                 Some(channel.clone())
@@ -2280,6 +2316,123 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, PeerAction::CloseChannel { .. }))
         );
+    }
+
+    #[test]
+    fn gatt133_during_connecting_schedules_retry_not_draining() {
+        // Regression: the hardware-observed Phone-B failure. When
+        // blew's central event pump fires `DeviceDisconnected`
+        // BEFORE the driver's `ConnectFailed`, the former used to
+        // sweep the Connecting peer into Draining via
+        // `drain_to_draining`, after which the later-arriving
+        // `ConnectFailed` silently returned (phase no longer
+        // Connecting). Peer then sat 5s in Draining → Dead → GC,
+        // never retried. The fix folds the Connecting-phase
+        // disconnect into the retry path here.
+        use crate::transport::peer::ConnectPath;
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-gatt133-dialing");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::Gatt133,
+        });
+
+        // Phase should be Reconnecting (not Draining), with attempt
+        // incremented and a future next_at scheduled.
+        let entry = reg.peer(&device_id).expect("entry still present");
+        match &entry.phase {
+            PeerPhase::Reconnecting {
+                attempt, next_at, ..
+            } => {
+                assert_eq!(*attempt, 1, "attempt must be bumped");
+                assert!(
+                    *next_at > std::time::Instant::now(),
+                    "next_at must be in the future so tick retries with backoff"
+                );
+            }
+            other => panic!("expected Reconnecting, got {other:?}"),
+        }
+        assert_eq!(entry.consecutive_failures, 1);
+
+        // Gatt133 still fires Refresh so the cache gets cleared
+        // before the next attempt.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::Refresh { .. })),
+            "Gatt133 must fire Refresh on Connecting→retry path too; got {actions:?}"
+        );
+        // But no CloseChannel — there was no channel to close.
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::CloseChannel { .. })),
+            "no CloseChannel when there was no live pipe; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn connect_failed_after_device_disconnect_is_harmless_noop() {
+        // The companion race: after the fast-path DeviceDisconnected
+        // has already moved the peer to Reconnecting, the slow-path
+        // ConnectFailed arrives. It must NOT double-count the
+        // failure or knock the phase back.
+        use crate::transport::peer::ConnectPath;
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-race");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+
+        // Fast path first.
+        reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::Gatt133,
+        });
+        let reconnecting_at_after_fast = match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Reconnecting { next_at, .. } => *next_at,
+            other => panic!("expected Reconnecting, got {other:?}"),
+        };
+        assert_eq!(reg.peer(&device_id).unwrap().consecutive_failures, 1);
+
+        // Slow path arrives after the fast one.
+        let actions = reg.handle(PeerCommand::ConnectFailed {
+            device_id: device_id.clone(),
+            error: "gatt 133".into(),
+        });
+        assert!(actions.is_empty(), "ConnectFailed must be a no-op");
+        assert_eq!(
+            reg.peer(&device_id).unwrap().consecutive_failures,
+            1,
+            "failures must NOT double-count"
+        );
+        match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Reconnecting { next_at, .. } => {
+                assert_eq!(
+                    *next_at, reconnecting_at_after_fast,
+                    "next_at must be unchanged"
+                );
+            }
+            other => panic!("phase regressed; got {other:?}"),
+        }
     }
 
     #[test]
