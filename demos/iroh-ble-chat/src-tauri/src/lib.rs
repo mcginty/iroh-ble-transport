@@ -289,7 +289,7 @@ async fn start_node(
     let ep = Endpoint::builder(presets::N0DisableRelay)
         .hooks(BleDedupHook::new(
             st.secret_key.public(),
-            ble_transport.routing_v2_handle(),
+            ble_transport.routing_handle(),
             verified_tx,
         ))
         .add_custom_transport(Arc::clone(&transport))
@@ -775,10 +775,10 @@ async fn bandwidth_tick(app: AppHandle, transport: Arc<BleTransport>) {
         let truncation_delta = now.truncations.saturating_sub(prev.truncations);
         let tx_kbps = (tx_delta as f64 * 8.0 / 1000.0) / elapsed;
         let rx_kbps = (rx_delta as f64 * 8.0 / 1000.0) / elapsed;
-        // routing_v2 counts: surfaces pending/routable/reservations
+        // routing counts: surfaces pending/routable/reservations
         // for the debug panel during hardware testing. Small enough
         // to ship with every bandwidth tick; counts are read-through.
-        let snap = transport.routing_v2_snapshot();
+        let snap = transport.routing_snapshot();
         let _ = app.emit(
             "bandwidth",
             serde_json::json!({

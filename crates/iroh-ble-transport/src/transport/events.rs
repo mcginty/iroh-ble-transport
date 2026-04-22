@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::transport::peer::{KEY_PREFIX_LEN, KeyPrefix, PeerCommand};
-use crate::transport::routing_v2::{Routing, ScanHintUpdate};
+use crate::transport::routing::{Routing, ScanHintUpdate};
 
 /// Extract the 12-byte key prefix from a list of advertised service UUIDs.
 ///
@@ -34,7 +34,7 @@ pub fn extract_prefix_from_services(services: &[Uuid]) -> Option<KeyPrefix> {
 /// closed.
 pub async fn run_central_events(
     central: Arc<Central>,
-    routing_v2: Arc<Routing>,
+    routing: Arc<Routing>,
     inbox: mpsc::Sender<PeerCommand>,
 ) {
     use tokio_stream::StreamExt as _;
@@ -46,7 +46,7 @@ pub async fn run_central_events(
                     continue;
                 };
                 let rssi = device.rssi;
-                match routing_v2.note_scan_hint(prefix, device.id.clone()) {
+                match routing.note_scan_hint(prefix, device.id.clone()) {
                     ScanHintUpdate::Unchanged => {}
                     ScanHintUpdate::New => {
                         tracing::debug!(
@@ -134,7 +134,7 @@ pub async fn run_central_events(
 /// Returns when the stream ends or `inbox` is closed.
 pub async fn run_peripheral_state_events(
     peripheral: Arc<Peripheral>,
-    routing_v2: Arc<Routing>,
+    routing: Arc<Routing>,
     inbox: mpsc::Sender<PeerCommand>,
 ) {
     use tokio_stream::StreamExt as _;
@@ -156,7 +156,7 @@ pub async fn run_peripheral_state_events(
                     "peripheral SubscriptionChanged"
                 );
                 if subscribed {
-                    let prefix = routing_v2.prefix_for_device(&client_id);
+                    let prefix = routing.prefix_for_device(&client_id);
                     PeerCommand::PeripheralClientSubscribed {
                         client_id,
                         char_uuid,

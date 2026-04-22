@@ -70,7 +70,7 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
     let iface = fabric.add_node(device_id.clone(), inbox_tx.clone());
     let (retransmits, truncations, empty_frames) = zero_counters();
 
-    let routing_v2_local = Arc::new(iroh_ble_transport::transport::routing_v2::Routing::new());
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface,
         inbox_tx.clone(),
@@ -79,14 +79,14 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
-        Arc::clone(&routing_v2_local),
+        Arc::clone(&routing_local),
     );
     let registry = Registry::new_for_test_with_policy(policy);
     let snap = snapshots.clone();
     let wakers = Arc::new(Mutex::new(Vec::<Waker>::new()));
     tokio::spawn(async move {
         registry
-            .run(inbox_rx, driver, snap, wakers, routing_v2_local)
+            .run(inbox_rx, driver, snap, wakers, routing_local)
             .await;
     });
 

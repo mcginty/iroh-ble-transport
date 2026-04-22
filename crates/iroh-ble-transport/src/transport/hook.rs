@@ -6,11 +6,11 @@ use iroh_base::{EndpointId, TransportAddr};
 use tokio::sync::mpsc;
 
 use crate::transport::routing::parse_token_addr;
-use crate::transport::routing_v2::{PromoteOutcome, Routing, StableConnId};
+use crate::transport::routing::{PromoteOutcome, Routing, StableConnId};
 use crate::transport::transport::BLE_TRANSPORT_ID;
 
 /// `EndpointHooks` implementation that runs the pending→routable
-/// promotion rule against `routing_v2` the instant iroh's TLS
+/// promotion rule against `routing` the instant iroh's TLS
 /// handshake binds a connection to an `EndpointId`. See §9.5 of the
 /// study doc for the rule.
 ///
@@ -28,7 +28,7 @@ use crate::transport::transport::BLE_TRANSPORT_ID;
 /// }).await?;
 /// let hook = BleDedupHook::new(
 ///     id,
-///     transport.routing_v2_handle(),
+///     transport.routing_handle(),
 ///     tx,
 /// );
 /// iroh::Endpoint::builder()
@@ -58,7 +58,7 @@ pub struct VerifiedEndpointEvent {
 #[derive(Debug, Clone)]
 pub struct BleDedupHook {
     self_endpoint: EndpointId,
-    routing_v2: Arc<Routing>,
+    routing: Arc<Routing>,
     tx: mpsc::UnboundedSender<VerifiedEndpointEvent>,
 }
 
@@ -66,12 +66,12 @@ impl BleDedupHook {
     #[must_use]
     pub fn new(
         self_endpoint: EndpointId,
-        routing_v2: Arc<Routing>,
+        routing: Arc<Routing>,
         tx: mpsc::UnboundedSender<VerifiedEndpointEvent>,
     ) -> Self {
         Self {
             self_endpoint,
-            routing_v2,
+            routing,
             tx,
         }
     }
@@ -90,7 +90,7 @@ impl EndpointHooks for BleDedupHook {
             });
 
         // Run the promotion rule synchronously. This is the only
-        // place routing_v2's authority invariants are established.
+        // place routing's authority invariants are established.
         // Same-positional-category (peer re-dialed us) always evicts
         // the old and accepts the new — the new handshake completing
         // is authoritative evidence that the peer abandoned the old
@@ -100,7 +100,7 @@ impl EndpointHooks for BleDedupHook {
         if let Some(token) = token {
             let stable_id = StableConnId::from_raw(token);
             match self
-                .routing_v2
+                .routing
                 .promote(stable_id, &self.self_endpoint, remote_endpoint)
             {
                 PromoteOutcome::Rejected => {
@@ -126,7 +126,7 @@ impl EndpointHooks for BleDedupHook {
                     // registered (edge case: a pipe might have been
                     // evicted between the promote call and now).
                     for id in &evicted {
-                        if let Some(dev) = self.routing_v2.device_for_pipe(*id) {
+                        if let Some(dev) = self.routing.device_for_pipe(*id) {
                             evicted_devices.push(dev);
                         }
                     }

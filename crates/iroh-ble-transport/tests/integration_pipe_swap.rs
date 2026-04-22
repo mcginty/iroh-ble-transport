@@ -63,7 +63,7 @@ async fn adding_l2cap_routes_new_sends_there_and_leaves_gatt_receiving() {
     let pipe_handle = tokio::spawn(run_data_pipe(
         iface.clone() as Arc<dyn BleInterface>,
         device_id.clone(),
-        iroh_ble_transport::transport::routing_v2::StableConnId::for_test(1),
+        iroh_ble_transport::transport::routing::StableConnId::for_test(1),
         ConnectRole::Central,
         ConnectPath::Gatt,
         None,
@@ -176,7 +176,7 @@ async fn late_gatt_fragments_after_l2cap_add_still_reassemble() {
     let pipe_handle = tokio::spawn(run_data_pipe(
         iface.clone() as Arc<dyn BleInterface>,
         device_id.clone(),
-        iroh_ble_transport::transport::routing_v2::StableConnId::for_test(2),
+        iroh_ble_transport::transport::routing::StableConnId::for_test(2),
         ConnectRole::Peripheral, // the role where the original bug bit
         ConnectPath::Gatt,
         None,
@@ -242,7 +242,7 @@ async fn supervisor_shuts_down_cleanly_on_outbound_close() {
     let handle = tokio::spawn(run_data_pipe(
         iface.clone() as Arc<dyn BleInterface>,
         blew::DeviceId::from("shutdown"),
-        iroh_ble_transport::transport::routing_v2::StableConnId::for_test(3),
+        iroh_ble_transport::transport::routing::StableConnId::for_test(3),
         ConnectRole::Central,
         ConnectPath::Gatt,
         None,

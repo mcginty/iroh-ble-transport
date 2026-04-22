@@ -26,7 +26,7 @@
 //!
 //! Supervisor exit: when `outbound_rx` closes (registry signals the
 //! pipe is done) OR both paths die, the supervisor tears down the
-//! workers and returns. `routing_v2::evict_pipe` then fires from the
+//! workers and returns. `routing::evict_pipe` then fires from the
 //! driver's spawn site.
 
 use std::pin::Pin;
@@ -119,7 +119,7 @@ impl WorkerSet {
 pub async fn run_data_pipe(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
-    stable_conn_id: crate::transport::routing_v2::StableConnId,
+    stable_conn_id: crate::transport::routing::StableConnId,
     role: ConnectRole,
     initial_path: ConnectPath,
     initial_l2cap: Option<blew::L2capChannel>,
@@ -414,7 +414,7 @@ async fn teardown_l2cap_worker(w: L2capWorker, device_id: blew::DeviceId, timeou
 fn spawn_gatt_worker(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
-    stable_conn_id: crate::transport::routing_v2::StableConnId,
+    stable_conn_id: crate::transport::routing::StableConnId,
     role: ConnectRole,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
@@ -453,7 +453,7 @@ fn spawn_gatt_worker(
 #[allow(clippy::too_many_arguments)]
 fn spawn_l2cap_worker(
     device_id: blew::DeviceId,
-    stable_conn_id: crate::transport::routing_v2::StableConnId,
+    stable_conn_id: crate::transport::routing::StableConnId,
     channel: blew::L2capChannel,
     incoming_tx: mpsc::Sender<IncomingPacket>,
     registry_tx: mpsc::Sender<PeerCommand>,
@@ -484,7 +484,7 @@ fn spawn_l2cap_worker(
 async fn run_gatt_pipe(
     iface: Arc<dyn BleInterface>,
     device_id: blew::DeviceId,
-    stable_conn_id: crate::transport::routing_v2::StableConnId,
+    stable_conn_id: crate::transport::routing::StableConnId,
     role: ConnectRole,
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     mut inbound_rx: mpsc::Receiver<Bytes>,
@@ -630,7 +630,7 @@ async fn run_gatt_pipe(
 #[allow(clippy::too_many_arguments)]
 async fn run_l2cap_pipe(
     device_id: blew::DeviceId,
-    stable_conn_id: crate::transport::routing_v2::StableConnId,
+    stable_conn_id: crate::transport::routing::StableConnId,
     channel: blew::L2capChannel,
     mut outbound_rx: mpsc::Receiver<PendingSend>,
     teardown_flag: Arc<AtomicBool>,
@@ -755,7 +755,7 @@ mod tests {
         tokio::spawn(run_data_pipe(
             iface.clone() as Arc<dyn BleInterface>,
             device_id.clone(),
-            crate::transport::routing_v2::StableConnId::for_test(1),
+            crate::transport::routing::StableConnId::for_test(1),
             ConnectRole::Central,
             ConnectPath::Gatt,
             None,
@@ -804,7 +804,7 @@ mod tests {
         tokio::spawn(run_data_pipe(
             iface.clone() as Arc<dyn BleInterface>,
             blew::DeviceId::from("pipe-peri"),
-            crate::transport::routing_v2::StableConnId::for_test(2),
+            crate::transport::routing::StableConnId::for_test(2),
             ConnectRole::Peripheral,
             ConnectPath::Gatt,
             None,
@@ -853,7 +853,7 @@ mod tests {
         let worker = spawn_gatt_worker(
             iface as Arc<dyn BleInterface>,
             blew::DeviceId::from("pipe-quiesce"),
-            crate::transport::routing_v2::StableConnId::for_test(99),
+            crate::transport::routing::StableConnId::for_test(99),
             ConnectRole::Central,
             incoming_tx,
             registry_tx,
@@ -903,7 +903,7 @@ mod tests {
         let _pipe = tokio::spawn(run_data_pipe(
             iface as Arc<dyn BleInterface>,
             blew::DeviceId::from("l2cap-empty-out"),
-            crate::transport::routing_v2::StableConnId::for_test(3),
+            crate::transport::routing::StableConnId::for_test(3),
             ConnectRole::Central,
             ConnectPath::L2cap,
             Some(central_side),

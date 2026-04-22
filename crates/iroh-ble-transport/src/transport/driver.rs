@@ -13,13 +13,13 @@ use crate::transport::store::PeerStore;
 
 /// A fully-reassembled datagram delivered up to iroh.
 ///
-/// `stable_conn_id` is the `routing_v2` handle for the pipe that
+/// `stable_conn_id` is the `routing` handle for the pipe that
 /// delivered this packet. `poll_recv` stamps iroh-facing
 /// `CustomAddr`s with this id, so replies from iroh route back to
 /// the exact pipe the bytes came in on.
 pub struct IncomingPacket {
     pub device_id: blew::DeviceId,
-    pub stable_conn_id: crate::transport::routing_v2::StableConnId,
+    pub stable_conn_id: crate::transport::routing::StableConnId,
     pub data: Bytes,
 }
 
@@ -47,12 +47,12 @@ const READ_PSM_BACKOFFS_MS: [u64; 3] = [0, 150, 400];
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Translate the registry's role (`Central` = we dialed, `Peripheral` =
-/// they dialed) into `routing_v2`'s observer-local `Direction`.
+/// they dialed) into `routing`'s observer-local `Direction`.
 fn direction_for_role(
     role: crate::transport::peer::ConnectRole,
-) -> crate::transport::routing_v2::Direction {
+) -> crate::transport::routing::Direction {
     use crate::transport::peer::ConnectRole;
-    use crate::transport::routing_v2::Direction;
+    use crate::transport::routing::Direction;
     match role {
         ConnectRole::Central => Direction::Outbound,
         ConnectRole::Peripheral => Direction::Inbound,
@@ -144,7 +144,7 @@ pub struct Driver<I: BleInterface> {
     /// Authoritative routing table. Mints a `StableConnId` on every
     /// pipe open (or reuses a reservation's id) and evicts on pipe
     /// close. `poll_send` and `poll_recv` both resolve via this.
-    routing_v2: Arc<crate::transport::routing_v2::Routing>,
+    routing: Arc<crate::transport::routing::Routing>,
 }
 
 impl<I: BleInterface> Driver<I> {
@@ -157,7 +157,7 @@ impl<I: BleInterface> Driver<I> {
         truncation_counter: Arc<AtomicU64>,
         empty_frames_counter: Arc<AtomicU64>,
         store: Arc<dyn PeerStore>,
-        routing_v2: Arc<crate::transport::routing_v2::Routing>,
+        routing: Arc<crate::transport::routing::Routing>,
     ) -> Self {
         Self {
             iface,
@@ -167,7 +167,7 @@ impl<I: BleInterface> Driver<I> {
             truncation_counter,
             empty_frames_counter,
             store,
-            routing_v2,
+            routing,
         }
     }
 
@@ -346,18 +346,18 @@ impl<I: BleInterface> Driver<I> {
                 let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
                 let pipe_last_rx_at = last_rx_at.clone();
-                // Register the pipe with routing_v2 and enter the
+                // Register the pipe with routing and enter the
                 // pending pool. If the resolver previously minted a
                 // reservation for this peer's prefix, reuse that id
                 // so iroh's outstanding `CustomAddr` stays valid
                 // across the dial — only outbound pipes match
                 // reservations (inbound accepts have no resolver).
-                let routing_v2 = Arc::clone(&self.routing_v2);
+                let routing = Arc::clone(&self.routing);
                 let direction = direction_for_role(role);
                 let (stable_id, reservation_endpoint) =
-                    match routing_v2.consume_reservation_for_device(&device_id) {
+                    match routing.consume_reservation_for_device(&device_id) {
                         Some(reservation) => {
-                            routing_v2.register_pipe_with_id(
+                            routing.register_pipe_with_id(
                                 reservation.stable_id,
                                 device_id.clone(),
                                 direction,
@@ -370,9 +370,9 @@ impl<I: BleInterface> Driver<I> {
                             );
                             (reservation.stable_id, Some(reservation.endpoint_id))
                         }
-                        None => (routing_v2.register_pipe(device_id.clone(), direction), None),
+                        None => (routing.register_pipe(device_id.clone(), direction), None),
                     };
-                routing_v2.register_pending(stable_id, reservation_endpoint);
+                routing.register_pending(stable_id, reservation_endpoint);
                 tokio::spawn(async move {
                     run_data_pipe(
                         iface,
@@ -394,8 +394,8 @@ impl<I: BleInterface> Driver<I> {
                     .await;
                     // Drop the pool entry before the pipe itself so
                     // the pool never references a non-existent pipe.
-                    routing_v2.evict_pipe_state(stable_id);
-                    routing_v2.evict_pipe(stable_id);
+                    routing.evict_pipe_state(stable_id);
+                    routing.evict_pipe(stable_id);
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
@@ -802,7 +802,7 @@ mod tests {
     fn incoming_packet_carries_device_id() {
         let pkt = IncomingPacket {
             device_id: blew::DeviceId::from("test"),
-            stable_conn_id: crate::transport::routing_v2::StableConnId::for_test(1),
+            stable_conn_id: crate::transport::routing::StableConnId::for_test(1),
             data: Bytes::from_static(b"x"),
         };
         assert_eq!(pkt.device_id, blew::DeviceId::from("test"));
@@ -823,7 +823,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing_v2::Routing::new()),
+            Arc::new(crate::transport::routing::Routing::new()),
         );
 
         driver
@@ -866,7 +866,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing_v2::Routing::new()),
+            Arc::new(crate::transport::routing::Routing::new()),
         );
 
         driver
@@ -906,7 +906,7 @@ mod tests {
         let iface = Arc::new(MockBleInterface::new());
         let (tx, mut rx) = mpsc::channel(16);
         let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
-        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
+        let routing = Arc::new(crate::transport::routing::Routing::new());
         let driver = Driver::new(
             iface,
             tx,
@@ -915,7 +915,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::clone(&routing_v2),
+            Arc::clone(&routing),
         );
 
         // Pre-seed: scan_hint maps the peer's prefix → device_id, and
@@ -924,8 +924,8 @@ mod tests {
         let endpoint = iroh_base::SecretKey::from_bytes(&[0x57u8; 32]).public();
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint);
         let device_id = blew::DeviceId::from("reserved-peer");
-        routing_v2.note_scan_hint(prefix, device_id.clone());
-        let reserved_id = routing_v2.reserve_outbound(endpoint);
+        routing.note_scan_hint(prefix, device_id.clone());
+        let reserved_id = routing.reserve_outbound(endpoint);
 
         driver
             .execute(PeerAction::StartDataPipe {
@@ -938,17 +938,17 @@ mod tests {
             .await;
 
         // The only live pipe must carry the reserved id.
-        let pipes = routing_v2.pipes_for_debug();
+        let pipes = routing.pipes_for_debug();
         assert_eq!(pipes.len(), 1);
         assert_eq!(
             pipes[0].id, reserved_id,
             "StartDataPipe must reuse the reserved StableConnId"
         );
         // Reservation is consumed.
-        assert_eq!(routing_v2.reservation_len(), 0);
+        assert_eq!(routing.reservation_len(), 0);
         // And the pending entry carries the endpoint target picked up
         // from the reservation, so promote() has the context it needs.
-        assert_eq!(routing_v2.pending_pipe_for(&endpoint), Some(reserved_id));
+        assert_eq!(routing.pending_pipe_for(&endpoint), Some(reserved_id));
 
         // Drain the ready command so rx is clean.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
@@ -966,7 +966,7 @@ mod tests {
         let iface = Arc::new(MockBleInterface::new());
         let (tx, mut rx) = mpsc::channel(16);
         let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
-        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
+        let routing = Arc::new(crate::transport::routing::Routing::new());
         let driver = Driver::new(
             iface,
             tx,
@@ -975,10 +975,10 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::clone(&routing_v2),
+            Arc::clone(&routing),
         );
 
-        assert_eq!(routing_v2.snapshot().pending, 0);
+        assert_eq!(routing.snapshot().pending, 0);
 
         driver
             .execute(PeerAction::StartDataPipe {
@@ -991,11 +991,11 @@ mod tests {
             .await;
 
         assert_eq!(
-            routing_v2.snapshot().pending,
+            routing.snapshot().pending,
             1,
             "StartDataPipe must register the pipe as pending"
         );
-        let pipes = routing_v2.pipes_for_debug();
+        let pipes = routing.pipes_for_debug();
         assert_eq!(pipes.len(), 1);
         let pipe_id = pipes[0].id;
 
@@ -1017,7 +1017,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let snap = routing_v2.snapshot();
+                let snap = routing.snapshot();
                 if snap.pending == 0 && snap.pipes == 0 {
                     return;
                 }
@@ -1029,7 +1029,7 @@ mod tests {
 
         // The pipe id is non-reusable regardless — invariant from step
         // 1 — and the routable pool stays empty too (no hook fired).
-        assert_eq!(routing_v2.snapshot().routable, 0);
+        assert_eq!(routing.snapshot().routable, 0);
         let _ = pipe_id; // just a reference for future debugging
     }
 
@@ -1037,7 +1037,7 @@ mod tests {
     async fn shadow_routing_mints_and_evicts_around_pipe_lifetime() {
         // Step 1 invariant: every StartDataPipe produces exactly one
         // shadow-routing pipe registration, and pipe teardown evicts it.
-        // This is the end-to-end version of the routing_v2 unit tests —
+        // This is the end-to-end version of the routing unit tests —
         // drives the registration via the real Driver code path so that
         // future refactors of the spawn site can't silently drop the
         // mint/evict symmetry.
@@ -1046,7 +1046,7 @@ mod tests {
         let iface = Arc::new(MockBleInterface::new());
         let (tx, mut rx) = mpsc::channel(16);
         let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
-        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
+        let routing = Arc::new(crate::transport::routing::Routing::new());
         let driver = Driver::new(
             iface,
             tx,
@@ -1055,10 +1055,10 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::clone(&routing_v2),
+            Arc::clone(&routing),
         );
 
-        assert_eq!(routing_v2.snapshot().pipes, 0);
+        assert_eq!(routing.snapshot().pipes, 0);
 
         driver
             .execute(PeerAction::StartDataPipe {
@@ -1073,7 +1073,7 @@ mod tests {
         // Mint is synchronous inside execute(), so the count should be 1
         // before the DataPipeReady command arrives.
         assert_eq!(
-            routing_v2.snapshot().pipes,
+            routing.snapshot().pipes,
             1,
             "StartDataPipe must register exactly one shadow pipe"
         );
@@ -1101,7 +1101,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                if routing_v2.snapshot().pipes == 0 {
+                if routing.snapshot().pipes == 0 {
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1114,12 +1114,12 @@ mod tests {
     #[tokio::test]
     async fn shadow_routing_tracks_direction_from_role() {
         use crate::transport::peer::{ConnectPath, ConnectRole};
-        use crate::transport::routing_v2::Direction;
+        use crate::transport::routing::Direction;
 
         let iface = Arc::new(MockBleInterface::new());
         let (tx, mut rx) = mpsc::channel(16);
         let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
-        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
+        let routing = Arc::new(crate::transport::routing::Routing::new());
         let driver = Driver::new(
             iface,
             tx,
@@ -1128,7 +1128,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::clone(&routing_v2),
+            Arc::clone(&routing),
         );
 
         driver
@@ -1150,7 +1150,7 @@ mod tests {
             })
             .await;
 
-        let mut pipes = routing_v2.pipes_for_debug();
+        let mut pipes = routing.pipes_for_debug();
         pipes.sort_by_key(|p| p.device_id.to_string());
         assert_eq!(pipes.len(), 2);
         // "central-peer" < "peripheral-peer" lexicographically.
@@ -1192,7 +1192,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing_v2::Routing::new()),
+            Arc::new(crate::transport::routing::Routing::new()),
         );
 
         driver
@@ -1226,7 +1226,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing_v2::Routing::new()),
+            Arc::new(crate::transport::routing::Routing::new()),
         );
 
         let (swap_tx, mut swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
@@ -1259,7 +1259,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing_v2::Routing::new()),
+            Arc::new(crate::transport::routing::Routing::new()),
         );
         let device_id = blew::DeviceId::from("x");
         driver
@@ -1300,7 +1300,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing_v2::Routing::new()),
+            Arc::new(crate::transport::routing::Routing::new()),
         );
         let device_id = blew::DeviceId::from("hangs");
         driver

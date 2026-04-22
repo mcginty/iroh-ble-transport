@@ -11,7 +11,7 @@
 //! registry "the pipe for this device looks dead to iroh; please
 //! drain." The registry's normal `Stalled` path does the rest (drain,
 //! close channel, which causes the pipe worker to exit, which evicts
-//! routing_v2 state).
+//! routing state).
 //!
 //! See `.claude/plans/2026-04-21-connection-system-study.md` §9.6 for
 //! the full rationale.
@@ -24,7 +24,7 @@ use iroh_base::EndpointId;
 use tokio::sync::mpsc;
 
 use crate::transport::peer::PeerCommand;
-use crate::transport::routing_v2::Routing;
+use crate::transport::routing::Routing;
 
 /// Default poll cadence. Five seconds is well under the chat app's
 /// 15 s `max_idle_timeout` so we catch idle-timeouts promptly without
@@ -70,14 +70,14 @@ impl PipeWatchdogEndpoint for iroh::Endpoint {
 /// from racing iroh's post-handshake setup.
 pub fn spawn<E: PipeWatchdogEndpoint>(
     endpoint: Arc<E>,
-    routing_v2: Arc<Routing>,
+    routing: Arc<Routing>,
     registry_inbox: mpsc::Sender<PeerCommand>,
     poll_interval: Duration,
     grace_period: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run(
         endpoint,
-        routing_v2,
+        routing,
         registry_inbox,
         poll_interval,
         grace_period,
@@ -86,7 +86,7 @@ pub fn spawn<E: PipeWatchdogEndpoint>(
 
 async fn run<E: PipeWatchdogEndpoint>(
     endpoint: Arc<E>,
-    routing_v2: Arc<Routing>,
+    routing: Arc<Routing>,
     registry_inbox: mpsc::Sender<PeerCommand>,
     poll_interval: Duration,
     grace_period: Duration,
@@ -98,7 +98,7 @@ async fn run<E: PipeWatchdogEndpoint>(
     loop {
         tick(
             endpoint.as_ref(),
-            &routing_v2,
+            &routing,
             &registry_inbox,
             grace_period,
             Instant::now(),
@@ -115,12 +115,12 @@ async fn run<E: PipeWatchdogEndpoint>(
 /// the rule deterministically without waiting for the sleep.
 pub(crate) async fn tick<E: PipeWatchdogEndpoint>(
     endpoint: &E,
-    routing_v2: &Routing,
+    routing: &Routing,
     registry_inbox: &mpsc::Sender<PeerCommand>,
     grace_period: Duration,
     now: Instant,
 ) {
-    let entries = routing_v2.routable_entries();
+    let entries = routing.routable_entries();
     for entry in entries {
         // Skip freshly-promoted entries so iroh has time to exchange
         // initial traffic before we declare the path dead.
@@ -139,12 +139,12 @@ pub(crate) async fn tick<E: PipeWatchdogEndpoint>(
         // Synchronously evict from the routable pool so subsequent
         // `poll_send` for this endpoint fails fast. The pending pool
         // is uncommon but safe to clean up as well.
-        if routing_v2.evict_routable(&entry.endpoint_id).is_some() {
-            routing_v2.evict_pipe_state(entry.stable_id);
+        if routing.evict_routable(&entry.endpoint_id).is_some() {
+            routing.evict_pipe_state(entry.stable_id);
         }
         // Ask the registry to drain the BLE pipe — this fires
         // `CloseChannel`, which ends the pipe worker, which in turn
-        // evicts the pipe record from `routing_v2.pipes`.
+        // evicts the pipe record from `routing.pipes`.
         if registry_inbox
             .send(PeerCommand::Stalled {
                 device_id: entry.device_id,
@@ -161,7 +161,7 @@ pub(crate) async fn tick<E: PipeWatchdogEndpoint>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::routing_v2::{Dialer, Direction, StableConnId};
+    use crate::transport::routing::{Dialer, Direction, StableConnId};
     use std::collections::HashSet;
     use std::sync::Mutex;
 
