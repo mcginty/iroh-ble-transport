@@ -589,6 +589,15 @@ impl CustomEndpoint for BleEndpoint {
         NonZeroUsize::MIN
     }
 
+    // TODO(#4): when a peer restarts mid-session, the new inbound
+    // handshake can stall on the server side for tens of seconds to
+    // a few minutes before `after_handshake` fires, even though the
+    // BLE pipe is up and the client side has already completed. The
+    // pipe's inbound bytes flow through here on the way into iroh;
+    // if the bug is on our side of the boundary, this is where the
+    // instrumentation (per-stable-id byte counter, last-delivered
+    // timestamp) would go to prove the packets arrive vs. sit in
+    // iroh. See https://github.com/mcginty/iroh-ble-transport/issues/4.
     fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
