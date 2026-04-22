@@ -1441,13 +1441,16 @@ impl Registry {
 
     fn handle_l2cap_handover_timeout(
         &mut self,
-        actions: &mut Vec<PeerAction>,
+        _actions: &mut Vec<PeerAction>,
         device_id: DeviceId,
     ) {
+        // Both-paths-alive model: when the pipe supervisor evicts a
+        // wedged L2CAP worker, GATT is still alive underneath. We
+        // just flip the telemetry/policy flag here — no
+        // `RevertToGattPipe` action needed, because the pipe never
+        // left GATT in the first place.
         if let Some(entry) = self.peers.get_mut(&device_id) {
             entry.l2cap_upgrade_failed = true;
-            let role = entry.role;
-            let tx_gen = entry.tx_gen;
             if let PeerPhase::Connected {
                 channel, upgrading, ..
             } = &mut entry.phase
@@ -1456,13 +1459,8 @@ impl Registry {
                 *upgrading = false;
                 tracing::warn!(
                     device = %device_id,
-                    "L2CAP pipe handover timed out; reverting to GATT for this connection"
+                    "L2CAP path evicted from pipe; continuing on GATT (both-paths-alive)"
                 );
-                actions.push(PeerAction::RevertToGattPipe {
-                    device_id,
-                    tx_gen,
-                    role,
-                });
             }
         }
     }
@@ -5882,7 +5880,14 @@ mod tests {
     }
 
     #[test]
-    fn l2cap_handover_timeout_reverts_and_marks_failed() {
+    fn l2cap_handover_timeout_marks_failed_and_demotes_path_telemetry() {
+        // Both-paths-alive model: `L2capHandoverTimeout` arrives when
+        // the pipe supervisor evicted its wedged L2CAP worker. GATT
+        // was never torn down, so the registry just flips the
+        // `l2cap_upgrade_failed` policy flag and updates the
+        // telemetry `channel.path` to Gatt — NO `RevertToGattPipe`
+        // action, which is now semantically wrong (there's no pipe
+        // to revert; GATT is still there).
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
 
         let my_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
@@ -5906,15 +5911,13 @@ mod tests {
             device_id: dev.clone(),
         });
 
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PeerAction::RevertToGattPipe {
-                device_id,
-                role,
-                ..
-            }
-            if device_id == &dev && role == &ConnectRole::Central
-        )));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::RevertToGattPipe { .. })),
+            "RevertToGattPipe is obsolete in the both-paths-alive design; \
+             got {actions:?}"
+        );
         let e = &reg.peers[&dev];
         assert!(e.l2cap_upgrade_failed);
         match &e.phase {
