@@ -1,16 +1,20 @@
-//! Shadow routing table v2 — step 1 of the connection-system redesign.
+//! Authoritative routing table. Built out across the step 1-6 redesign
+//! (see `.claude/plans/2026-04-21-connection-system-study.md`) and now
+//! the single source of truth for every piece of connection-system
+//! state that isn't the per-peer lifecycle machine in `registry.rs`:
 //!
-//! See `.claude/plans/2026-04-21-connection-system-study.md` for the full
-//! design. In this step the module is *pure instrumentation*: it observes
-//! every BLE pipe the driver opens and closes, stamps each with a
-//! `StableConnId`, and exposes a snapshot for telemetry. It does not yet
-//! participate in routing decisions — the v1 `TransportRouting` +
-//! `Registry` continue to own all outbound/inbound address handling.
-//!
-//! Later steps will graduate `Routing` into the authoritative state by
-//! adding pending/routable pools and plumbing `CustomAddr`s through it.
-//! The API here is intentionally minimal so subsequent steps can extend
-//! it without rewriting.
+//! - `pipes`: live BLE pipes, each stamped with a monotonic
+//!   [`StableConnId`] that iroh carries in its `CustomAddr`.
+//! - `scan_hint`: `KeyPrefix → DeviceId` from scan advertising.
+//!   Hint-only; never an authority against a live pipe.
+//! - `pending`: pipes whose iroh-TLS handshake hasn't completed yet.
+//! - `routable`: pipes bound to an authenticated `EndpointId`. This
+//!   is the authority for "where to send to this peer."
+//! - `reservations`: resolver-minted `StableConnId`s that have been
+//!   handed to iroh but don't yet correspond to a pipe (driver
+//!   consumes at pipe-open).
+//! - `endpoint_wakers`: parked resolvers waiting for a
+//!   routable / pending / reservation entry to land.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -180,6 +184,27 @@ struct RoutingInner {
     endpoint_wakers: HashMap<EndpointId, Vec<Waker>>,
 }
 
+/// Outcome of `Routing::note_scan_hint`, telling the caller whether
+/// the hint changed and what the old mapping was. Callers use
+/// `Replaced` to forget per-device state the evicted DeviceId
+/// accumulated; `ActivelyBound` signals "this prefix has a live
+/// pipe to a different DeviceId — ignore the advertisement" so the
+/// caller doesn't try to dial a peer we're already connected to
+/// under a different physical address (typically Android MAC
+/// randomization).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanHintUpdate {
+    /// Prefix was unmapped; now mapped to the new device.
+    New,
+    /// Prefix already mapped to this exact device.
+    Unchanged,
+    /// Prefix mapped to a different device previously.
+    Replaced { previous: DeviceId },
+    /// A routable pipe already binds this prefix to a DeviceId that
+    /// doesn't match the scan; the hint was not updated.
+    ActivelyBound { bound: DeviceId },
+}
+
 /// A reservation: the resolver promised iroh a `CustomAddr(stable_id)`
 /// would eventually route somewhere, and is waiting for a pipe to
 /// that promise's target. When the driver opens a pipe to any device
@@ -270,31 +295,61 @@ impl Routing {
     // ---------- scan_hint: KeyPrefix → DeviceId (dial-hint only) ----------
 
     /// Record that `prefix` was last seen advertising from `device`.
-    /// Overwrites any prior mapping. Hint-only; never an authority for
-    /// routing — use pinned/routable state for that.
+    /// Hint-only; never an authority for routing. Authoritative
+    /// "where to send to this peer" is the `routable` pool.
     ///
-    /// Returns the `DeviceId` previously mapped to this prefix (if any),
-    /// so callers can forget stale routing state in `routing_v1`.
-    pub fn note_scan_hint(&self, prefix: KeyPrefix, device: DeviceId) -> Option<DeviceId> {
-        let previous = {
+    /// The returned [`ScanHintUpdate`] tells the caller whether the
+    /// hint actually changed and what the old mapping was, so the
+    /// scan-event pump can forget stale per-device state
+    /// (`PeerCommand::Forget` for the evicted DeviceId).
+    ///
+    /// Anti-MAC-rotation guard: if a routable pipe already exists
+    /// for this prefix at a specific `DeviceId`, scan updates that
+    /// would remap the prefix to a *different* device are ignored
+    /// (`ScanHintUpdate::ActivelyBound`). The live pipe is the
+    /// authority for that prefix; scan is subordinate to it. This
+    /// replaces the v1 `pinned` mechanism and the registry-side
+    /// `publish_active_prefixes` plumbing.
+    pub fn note_scan_hint(&self, prefix: KeyPrefix, device: DeviceId) -> ScanHintUpdate {
+        let update = {
             let mut inner = self.inner.lock();
-            let previous = inner.scan_hint.insert(prefix, device.clone());
-            if previous.as_ref() != Some(&device) {
+            // Anti-MAC-rotation: if any routable pipe's endpoint maps
+            // to this prefix, and its device_id differs from the new
+            // scan, reject the update.
+            let bound_device = inner
+                .routable
+                .values()
+                .find(|r| crate::transport::routing::prefix_from_endpoint(&r.endpoint_id) == prefix)
+                .and_then(|r| inner.pipes.get(&r.pipe).map(|p| p.device_id.clone()));
+            if let Some(bound) = bound_device
+                && bound != device
+            {
                 tracing::trace!(
                     ?prefix,
-                    device = %device,
-                    previous = ?previous,
-                    "routing_v2: scan_hint updated"
+                    scan_device = %device,
+                    bound_device = %bound,
+                    "routing_v2: scan_hint ignored — prefix is actively bound to a different DeviceId"
                 );
+                return ScanHintUpdate::ActivelyBound { bound };
             }
-            previous
+            match inner.scan_hint.insert(prefix, device.clone()) {
+                None => ScanHintUpdate::New,
+                Some(prev) if prev == device => ScanHintUpdate::Unchanged,
+                Some(prev) => ScanHintUpdate::Replaced { previous: prev },
+            }
         };
-        // A fresh scan_hint for a prefix means any resolver parked on
-        // an endpoint with this prefix can now make progress. Wake
-        // them by iterating the endpoint_wakers map and matching on
-        // prefix.
-        self.wake_endpoint_waiters_for_prefix(&prefix);
-        previous
+        if !matches!(update, ScanHintUpdate::Unchanged) {
+            tracing::trace!(
+                ?prefix,
+                device = %device,
+                ?update,
+                "routing_v2: scan_hint updated"
+            );
+            // A fresh scan_hint for a prefix means any resolver parked
+            // on an endpoint with this prefix can now make progress.
+            self.wake_endpoint_waiters_for_prefix(&prefix);
+        }
+        update
     }
 
     fn wake_endpoint_waiters_for_prefix(&self, prefix: &KeyPrefix) {
@@ -328,6 +383,37 @@ impl Routing {
     #[must_use]
     pub fn scan_hint_for_prefix(&self, prefix: &KeyPrefix) -> Option<DeviceId> {
         self.inner.lock().scan_hint.get(prefix).cloned()
+    }
+
+    /// Reverse-lookup: which prefix has this `DeviceId` been seen
+    /// advertising under, if any? Used by the peripheral event pump
+    /// to stamp an inbound peripheral-role connection with the
+    /// scanned identity (so registry-level dedup can collapse the
+    /// central-role and peripheral-role entries for one peer).
+    #[must_use]
+    pub fn prefix_for_device(&self, device: &DeviceId) -> Option<KeyPrefix> {
+        let inner = self.inner.lock();
+        inner
+            .scan_hint
+            .iter()
+            .find_map(|(p, d)| (d == device).then_some(*p))
+    }
+
+    /// Resolve an endpoint to the `DeviceId` we'd route to it via.
+    /// Prefers the routable pipe's `DeviceId` (authoritative post-
+    /// handshake), falling back to `scan_hint` for peers we've only
+    /// seen advertising. Used by the chat app's UI to correlate
+    /// peers across scan + gossip.
+    #[must_use]
+    pub fn device_for_endpoint(&self, endpoint_id: &EndpointId) -> Option<DeviceId> {
+        let inner = self.inner.lock();
+        if let Some(routable) = inner.routable.get(endpoint_id)
+            && let Some(pipe) = inner.pipes.get(&routable.pipe)
+        {
+            return Some(pipe.device_id.clone());
+        }
+        let prefix = crate::transport::routing::prefix_from_endpoint(endpoint_id);
+        inner.scan_hint.get(&prefix).cloned()
     }
 
     // ---------- pending / routable pool bookkeeping (step 4a) ----------
@@ -815,7 +901,7 @@ pub struct RoutableSnapshot {
     pub verified_at: Instant,
 }
 
-/// Counts-only view of the shadow routing state. Does not leak any
+/// Counts-only view of the routing state. Does not leak any
 /// identifiers; callers that need identifiers take the explicit
 /// `pipes_for_debug` path. Includes `reservations` so the chat app's
 /// debug panel can show outstanding resolver promises to iroh.
@@ -903,29 +989,113 @@ mod tests {
     }
 
     #[test]
-    fn note_scan_hint_is_idempotent_and_returns_previous() {
+    fn note_scan_hint_reports_new_unchanged_and_replaced() {
         let r = Routing::new();
         let prefix: KeyPrefix = [10u8; 12];
         let d1 = dev("mac-aa");
         let d2 = dev("mac-bb");
 
-        assert_eq!(r.note_scan_hint(prefix, d1.clone()), None);
+        assert_eq!(r.note_scan_hint(prefix, d1.clone()), ScanHintUpdate::New);
         assert_eq!(r.scan_hint_for_prefix(&prefix).as_ref(), Some(&d1));
         assert_eq!(r.snapshot().scan_hints, 1);
 
-        // Same device — no-op, returns the same device as "previous"
-        // so callers can detect the unchanged case if they need to.
         assert_eq!(
             r.note_scan_hint(prefix, d1.clone()),
-            Some(d1.clone()),
-            "re-noting the same device returns it as the previous mapping"
+            ScanHintUpdate::Unchanged
         );
         assert_eq!(r.snapshot().scan_hints, 1);
 
-        // Different device → replace, return old.
-        assert_eq!(r.note_scan_hint(prefix, d2.clone()), Some(d1));
+        assert_eq!(
+            r.note_scan_hint(prefix, d2.clone()),
+            ScanHintUpdate::Replaced { previous: d1 }
+        );
         assert_eq!(r.scan_hint_for_prefix(&prefix).as_ref(), Some(&d2));
         assert_eq!(r.snapshot().scan_hints, 1);
+    }
+
+    #[test]
+    fn note_scan_hint_respects_active_routable_binding() {
+        // Anti-MAC-rotation: a routable pipe for an endpoint whose
+        // prefix matches the scan update wins over scan. The scan
+        // hint is NOT updated, and the caller sees ActivelyBound.
+        let r = Routing::new();
+        let ep = test_endpoint(77);
+        let prefix = prefix_of(&ep);
+        let bound_device = dev("live-connection");
+        let spurious_scan_device = dev("rotated-mac");
+
+        // Set up a routable pipe for the endpoint on bound_device.
+        let id = r.register_pipe(bound_device.clone(), Direction::Outbound);
+        r.insert_routable(ep, id, Dialer::Low);
+        // Scan previously saw the same (correct) device.
+        r.note_scan_hint(prefix, bound_device.clone());
+
+        // A later scan tries to remap the prefix to a different
+        // device — must be refused.
+        let update = r.note_scan_hint(prefix, spurious_scan_device.clone());
+        match update {
+            ScanHintUpdate::ActivelyBound { bound } => {
+                assert_eq!(bound, bound_device);
+            }
+            other => panic!("expected ActivelyBound, got {other:?}"),
+        }
+        assert_eq!(
+            r.scan_hint_for_prefix(&prefix).as_ref(),
+            Some(&bound_device),
+            "scan_hint must NOT be overwritten while a routable pipe is live"
+        );
+    }
+
+    #[test]
+    fn note_scan_hint_allows_same_device_while_actively_bound() {
+        // Re-noting the same device while pinned is Unchanged, not
+        // ActivelyBound. This models the common case of a peer
+        // advertising periodically while already connected.
+        let r = Routing::new();
+        let ep = test_endpoint(78);
+        let prefix = prefix_of(&ep);
+        let d = dev("peer");
+        let id = r.register_pipe(d.clone(), Direction::Outbound);
+        r.insert_routable(ep, id, Dialer::Low);
+        r.note_scan_hint(prefix, d.clone());
+
+        assert_eq!(
+            r.note_scan_hint(prefix, d.clone()),
+            ScanHintUpdate::Unchanged
+        );
+    }
+
+    #[test]
+    fn prefix_for_device_reverse_lookup() {
+        let r = Routing::new();
+        let prefix: KeyPrefix = [15u8; 12];
+        let d = dev("peer");
+        assert!(r.prefix_for_device(&d).is_none());
+        r.note_scan_hint(prefix, d.clone());
+        assert_eq!(r.prefix_for_device(&d), Some(prefix));
+    }
+
+    #[test]
+    fn device_for_endpoint_prefers_routable_over_scan_hint() {
+        let r = Routing::new();
+        let ep = test_endpoint(80);
+        let scan_device = dev("scan-seen");
+        let routable_device = dev("routable-pipe");
+
+        // Only scan_hint → falls back to scan.
+        r.note_scan_hint(prefix_of(&ep), scan_device.clone());
+        assert_eq!(r.device_for_endpoint(&ep), Some(scan_device.clone()));
+
+        // Add a routable pipe with a different DeviceId — preference flips.
+        let id = r.register_pipe(routable_device.clone(), Direction::Outbound);
+        r.insert_routable(ep, id, Dialer::Low);
+        assert_eq!(r.device_for_endpoint(&ep), Some(routable_device));
+    }
+
+    #[test]
+    fn device_for_endpoint_none_when_unknown() {
+        let r = Routing::new();
+        assert!(r.device_for_endpoint(&test_endpoint(81)).is_none());
     }
 
     #[test]

@@ -30,7 +30,7 @@ use crate::transport::events::{
 use crate::transport::hook::VerifiedEndpointEvent;
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
-use crate::transport::routing::{TOKEN_LEN, TransportRouting, parse_token_addr, token_custom_addr};
+use crate::transport::routing::{TOKEN_LEN, parse_token_addr, token_custom_addr};
 use crate::transport::store::{InMemoryPeerStore, PeerStore};
 use crate::transport::watchdog::run_watchdog;
 
@@ -176,11 +176,11 @@ pub struct BleMetricsSnapshot {
 pub struct BleTransport {
     handle: RegistryHandle,
     incoming_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingPacket>>>,
-    routing: Arc<TransportRouting>,
-    /// Shadow routing table (step 1 of the connection-system redesign).
-    /// Observes every pipe open/close; not yet consulted for routing.
-    /// Exposed via `routing_v2_snapshot()` so integration tests and
-    /// telemetry can confirm mint/evict pairs balance correctly.
+    /// Authoritative routing table. Tracks scan hints, pending
+    /// pipes, routable (post-handshake) pipes, outbound reservations,
+    /// and the per-endpoint waker set. Exposed via
+    /// `routing_v2_snapshot()` for telemetry and
+    /// `routing_v2_handle()` for the dedup hook.
     routing_v2: Arc<crate::transport::routing_v2::Routing>,
     tx_bytes: Arc<AtomicU64>,
     rx_bytes: Arc<AtomicU64>,
@@ -253,7 +253,6 @@ impl BleTransport {
         let (inbox_tx, inbox_rx) = mpsc::channel::<PeerCommand>(256);
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(256);
         let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-        let routing = Arc::new(TransportRouting::new());
 
         let tx_bytes = Arc::new(AtomicU64::new(0));
         let rx_bytes = Arc::new(AtomicU64::new(0));
@@ -278,7 +277,6 @@ impl BleTransport {
             Arc::clone(&empty_frames),
             Arc::clone(&config.store),
             Arc::clone(&routing_v2),
-            Arc::clone(&routing),
         );
 
         let mut psm = None;
@@ -298,7 +296,7 @@ impl BleTransport {
         let registry = Registry::new(config.l2cap_policy, local_id);
         let snap_for_actor = Arc::clone(&snapshots);
         let wakers_for_actor = Arc::clone(&inbox_capacity_wakers);
-        let routing_for_actor = Arc::clone(&routing);
+        let routing_v2_for_actor = Arc::clone(&routing_v2);
         tokio::spawn(async move {
             registry
                 .run(
@@ -306,7 +304,7 @@ impl BleTransport {
                     driver,
                     snap_for_actor,
                     wakers_for_actor,
-                    routing_for_actor,
+                    routing_v2_for_actor,
                 )
                 .await;
         });
@@ -331,13 +329,12 @@ impl BleTransport {
 
         tokio::spawn(run_central_events(
             Arc::clone(&central),
-            Arc::clone(&routing),
             Arc::clone(&routing_v2),
             inbox_tx.clone(),
         ));
         tokio::spawn(run_peripheral_state_events(
             Arc::clone(&peripheral),
-            Arc::clone(&routing),
+            Arc::clone(&routing_v2),
             inbox_tx.clone(),
         ));
         tokio::spawn(run_peripheral_requests(
@@ -353,7 +350,6 @@ impl BleTransport {
                 snapshots,
             },
             incoming_rx: tokio::sync::Mutex::new(Some(incoming_rx)),
-            routing,
             routing_v2,
             tx_bytes,
             rx_bytes,
@@ -365,19 +361,19 @@ impl BleTransport {
         })
     }
 
-    /// Snapshot of the shadow routing table (step 1 of the redesign —
-    /// pipe count only). Counts-only view; callers that need detail use
-    /// `routing_v2_pipes_for_debug`.
+    /// Counts-only snapshot of the routing table (pipes / scan hints /
+    /// pending / routable / reservations). Callers that need identifier
+    /// detail use `routing_v2_pipes_for_debug`.
     #[must_use]
     pub fn routing_v2_snapshot(&self) -> crate::transport::routing_v2::RoutingSnapshot {
         self.routing_v2.snapshot()
     }
 
-    /// Shared handle to the shadow routing table, for plumbing into
-    /// the `BleDedupHook` (which runs the promotion rule at TLS
-    /// handshake completion). Cloning the returned `Arc` is cheap.
-    /// Exposed only because the hook must hold a reference and the
-    /// hook's construction site can't access private transport fields.
+    /// Shared handle to the routing table, for plumbing into the
+    /// `BleDedupHook` (which runs the promotion rule at TLS handshake
+    /// completion). Cloning the returned `Arc` is cheap. Exposed only
+    /// because the hook must hold a reference and the hook's
+    /// construction site can't access private transport fields.
     #[must_use]
     pub fn routing_v2_handle(&self) -> Arc<crate::transport::routing_v2::Routing> {
         Arc::clone(&self.routing_v2)
@@ -441,7 +437,7 @@ impl BleTransport {
 
     #[must_use]
     pub fn device_for_endpoint(&self, endpoint_id: &EndpointId) -> Option<blew::DeviceId> {
-        self.routing.device_for_endpoint(endpoint_id)
+        self.routing_v2.device_for_endpoint(endpoint_id)
     }
 
     /// Returns `true` if the local scan has recently surfaced this
@@ -622,14 +618,13 @@ impl CustomEndpoint for BleEndpoint {
                         );
                         continue;
                     }
-                    // Step 2 of the connection-system redesign: stamp
-                    // inbound packets with the pipe's `StableConnId`
-                    // (minted by the driver at pipe-open time). This id
-                    // is installed in v1's routing as a device-keyed
-                    // token when the pipe opens, so `poll_send` can
-                    // resolve the `CustomAddr` iroh now carries on the
-                    // inbound connection. Stable across GATT→L2CAP
-                    // swap (same id throughout the pipe's lifetime).
+                    // Stamp inbound packets with the pipe's
+                    // `StableConnId` (minted by the driver at
+                    // pipe-open time). `poll_send` resolves that id
+                    // back to the pipe via `routing_v2.device_for_pipe`.
+                    // Stable across the pipe's full lifetime, so
+                    // iroh's Connection keeps routing to the correct
+                    // per-peer pipe regardless of L2CAP add/drop.
                     let token = packet.stable_conn_id.as_u64();
                     tracing::trace!(
                         device = %packet.device_id,

@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::transport::peer::{KEY_PREFIX_LEN, KeyPrefix, PeerCommand};
-use crate::transport::routing::{DiscoveryUpdate, TransportRouting};
+use crate::transport::routing_v2::{Routing, ScanHintUpdate};
 
 /// Extract the 12-byte key prefix from a list of advertised service UUIDs.
 ///
@@ -34,8 +34,7 @@ pub fn extract_prefix_from_services(services: &[Uuid]) -> Option<KeyPrefix> {
 /// closed.
 pub async fn run_central_events(
     central: Arc<Central>,
-    routing: Arc<TransportRouting>,
-    routing_v2: Arc<crate::transport::routing_v2::Routing>,
+    routing_v2: Arc<Routing>,
     inbox: mpsc::Sender<PeerCommand>,
 ) {
     use tokio_stream::StreamExt as _;
@@ -47,21 +46,17 @@ pub async fn run_central_events(
                     continue;
                 };
                 let rssi = device.rssi;
-                match routing.note_discovery(prefix, device.id.clone()) {
-                    DiscoveryUpdate::Unchanged => {}
-                    DiscoveryUpdate::New => {
+                match routing_v2.note_scan_hint(prefix, device.id.clone()) {
+                    ScanHintUpdate::Unchanged => {}
+                    ScanHintUpdate::New => {
                         tracing::debug!(
                             device = %device.id,
                             ?prefix,
                             rssi,
                             "central DeviceDiscovered (iroh peer)"
                         );
-                        // Shadow routing_v2: keep scan_hint in sync with v1.
-                        // Step 3 of the redesign — preparation for step 4's
-                        // resolver rewrite, which consumes `scan_hint`.
-                        routing_v2.note_scan_hint(prefix, device.id.clone());
                     }
-                    DiscoveryUpdate::Replaced { previous } => {
+                    ScanHintUpdate::Replaced { previous } => {
                         tracing::debug!(
                             device = %device.id,
                             previous = %previous,
@@ -69,8 +64,6 @@ pub async fn run_central_events(
                             rssi,
                             "central DeviceDiscovered: prefix flipped to new DeviceId, evicting previous"
                         );
-                        routing.forget_device(&previous);
-                        routing_v2.note_scan_hint(prefix, device.id.clone());
                         if inbox
                             .send(PeerCommand::Forget {
                                 device_id: previous,
@@ -84,12 +77,13 @@ pub async fn run_central_events(
                             break;
                         }
                     }
-                    DiscoveryUpdate::ActivelyPinned => {
+                    ScanHintUpdate::ActivelyBound { bound } => {
                         tracing::trace!(
                             device = %device.id,
+                            bound = %bound,
                             ?prefix,
                             rssi,
-                            "ignoring scan: prefix is actively pinned to a different DeviceId"
+                            "ignoring scan: prefix is bound to a different DeviceId via a live routable pipe"
                         );
                         continue;
                     }
@@ -140,7 +134,7 @@ pub async fn run_central_events(
 /// Returns when the stream ends or `inbox` is closed.
 pub async fn run_peripheral_state_events(
     peripheral: Arc<Peripheral>,
-    routing: Arc<TransportRouting>,
+    routing_v2: Arc<Routing>,
     inbox: mpsc::Sender<PeerCommand>,
 ) {
     use tokio_stream::StreamExt as _;
@@ -162,7 +156,7 @@ pub async fn run_peripheral_state_events(
                     "peripheral SubscriptionChanged"
                 );
                 if subscribed {
-                    let prefix = routing.prefix_for_device(&client_id);
+                    let prefix = routing_v2.prefix_for_device(&client_id);
                     PeerCommand::PeripheralClientSubscribed {
                         client_id,
                         char_uuid,

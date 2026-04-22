@@ -1685,7 +1685,7 @@ impl Registry {
         driver: Driver<I>,
         snapshots: Arc<ArcSwap<SnapshotMaps>>,
         inbox_capacity_wakers: Arc<parking_lot::Mutex<Vec<Waker>>>,
-        routing: Arc<crate::transport::routing::TransportRouting>,
+        routing_v2: Arc<crate::transport::routing_v2::Routing>,
     ) {
         while let Some(cmd) = rx.recv().await {
             // Wake BleSender::poll_send callers waiting on backpressure — we
@@ -1700,17 +1700,34 @@ impl Registry {
                 PeerCommand::VerifiedEndpoint { endpoint_id, token } => {
                     let mut actions = Vec::new();
                     let now = std::time::Instant::now();
-                    let exact_device_id = token.and_then(|token| routing.device_for_token(token));
+                    // The token (when present) is a StableConnId minted
+                    // by routing_v2 — resolve it to the pipe's DeviceId
+                    // so the handler stamps the exact live connection
+                    // with the verified identity (peripheral-role case:
+                    // scan may have seen a different MAC for this peer,
+                    // but the handshake landed on the inbound DeviceId).
+                    // Also refresh scan_hint so a later resolve for this
+                    // endpoint prefers the now-authoritative device.
+                    let exact_device_id = token.and_then(|t| {
+                        let stable = crate::transport::routing_v2::StableConnId::from_raw(t);
+                        routing_v2.device_for_pipe(stable)
+                    });
                     if let Some(device_id) = exact_device_id.as_ref() {
                         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
-                        let previous = match routing.note_discovery(prefix, device_id.clone()) {
-                            crate::transport::routing::DiscoveryUpdate::Replaced { previous } => {
-                                Some(previous)
-                            }
-                            _ => None,
-                        };
-                        if let Some(previous) = previous.as_ref() {
-                            routing.forget_device(previous);
+                        // A verified endpoint is the authoritative
+                        // binding for this prefix; override any stale
+                        // scan_hint mapping (scan may have seen the
+                        // peer under a different MAC earlier in this
+                        // session). If the previous mapping pointed
+                        // at a different DeviceId, also forget its
+                        // registry entry so we don't dial a ghost.
+                        if let crate::transport::routing_v2::ScanHintUpdate::Replaced { previous } =
+                            routing_v2.note_scan_hint(prefix, device_id.clone())
+                        {
+                            let forget_actions = self.handle(PeerCommand::Forget {
+                                device_id: previous,
+                            });
+                            actions.extend(forget_actions);
                         }
                     }
                     self.handle_verified_endpoint(&mut actions, now, endpoint_id, exact_device_id);
@@ -1722,27 +1739,10 @@ impl Registry {
                 driver.execute(action).await;
             }
             self.publish_snapshot(&snapshots);
-            routing.publish_active_prefixes(self.active_prefix_bindings());
             if shutdown {
                 break;
             }
         }
-    }
-
-    /// Current set of prefix→DeviceId bindings for peers that hold a live
-    /// connection. Used by `run` to tell routing which prefixes must be
-    /// protected from scan-driven eviction.
-    fn active_prefix_bindings(&self) -> HashMap<crate::transport::peer::KeyPrefix, DeviceId> {
-        self.peers
-            .iter()
-            .filter_map(|(did, e)| {
-                if matches!(e.phase, PeerPhase::Connected { .. }) {
-                    e.prefix.map(|p| (p, did.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 }
 
@@ -3449,59 +3449,6 @@ mod tests {
         assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
     }
 
-    #[test]
-    fn active_prefix_bindings_include_only_connected_peers_with_prefix() {
-        use crate::transport::peer::{ChannelHandle, ConnectPath, KEY_PREFIX_LEN, PeerPhase};
-
-        let mut reg = Registry::new_for_test();
-        let now = std::time::Instant::now();
-
-        // Peer A: Connected with prefix → must appear.
-        let a_prefix: [u8; KEY_PREFIX_LEN] = [1u8; KEY_PREFIX_LEN];
-        let a_dev = DeviceId::from("A");
-        let mut a_entry = PeerEntry::new(a_dev.clone());
-        a_entry.prefix = Some(a_prefix);
-        a_entry.phase = PeerPhase::Connected {
-            since: now,
-            channel: ChannelHandle {
-                id: 1,
-                path: ConnectPath::Gatt,
-            },
-            tx_gen: 1,
-            upgrading: false,
-        };
-        reg.peers.insert(a_dev.clone(), a_entry);
-
-        // Peer B: Connecting (not yet Connected) → must NOT appear.
-        let b_dev = DeviceId::from("B");
-        let mut b_entry = PeerEntry::new(b_dev.clone());
-        b_entry.prefix = Some([2u8; KEY_PREFIX_LEN]);
-        b_entry.phase = PeerPhase::Connecting {
-            attempt: 0,
-            started: now,
-            path: ConnectPath::Gatt,
-        };
-        reg.peers.insert(b_dev, b_entry);
-
-        // Peer C: Connected but prefix=None (inbound-before-scan) → must NOT appear.
-        let c_dev = DeviceId::from("C");
-        let mut c_entry = PeerEntry::new(c_dev.clone());
-        c_entry.phase = PeerPhase::Connected {
-            since: now,
-            channel: ChannelHandle {
-                id: 2,
-                path: ConnectPath::Gatt,
-            },
-            tx_gen: 1,
-            upgrading: false,
-        };
-        reg.peers.insert(c_dev, c_entry);
-
-        let bindings = reg.active_prefix_bindings();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings.get(&a_prefix), Some(&a_dev));
-    }
-
     #[tokio::test]
     async fn inbound_fragment_fast_path_pushes_to_inbound_tx() {
         use crate::transport::peer::{ChannelHandle, ConnectPath, FragmentSource, PipeHandles};
@@ -4789,7 +4736,7 @@ mod tests {
         use crate::transport::driver::Driver;
         use crate::transport::interface::BleInterface;
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
-        use crate::transport::routing::{DiscoveryUpdate, TransportRouting, prefix_from_endpoint};
+        use crate::transport::routing_v2::{Direction, Routing, StableConnId};
         use crate::transport::store::InMemoryPeerStore;
 
         struct DummyIface;
@@ -4852,16 +4799,19 @@ mod tests {
 
         let my_ep = iroh_base::SecretKey::from_bytes(&[0x11u8; 32]).public();
         let peer_ep = iroh_base::SecretKey::from_bytes(&[0x22u8; 32]).public();
-        let peer_prefix = prefix_from_endpoint(&peer_ep);
+        let peer_prefix = crate::transport::routing::prefix_from_endpoint(&peer_ep);
         let live_dev = DeviceId::from("live-peripheral");
         let stale_scan_dev = DeviceId::from("stale-scan");
 
-        let routing = Arc::new(TransportRouting::new());
-        assert_eq!(
-            routing.note_discovery(peer_prefix, stale_scan_dev.clone()),
-            DiscoveryUpdate::New
-        );
-        let token = routing.mint_token_for_device(&live_dev);
+        // Simulate: scan saw the peer at `stale_scan_dev`, then a
+        // peripheral-role inbound connection landed at `live_dev`.
+        // The pipe is registered in routing_v2 against `live_dev`,
+        // and the VerifiedEndpoint command carries that pipe's
+        // stable_id so the registry can resolve token → DeviceId.
+        let routing_v2 = Arc::new(Routing::new());
+        routing_v2.note_scan_hint(peer_prefix, stale_scan_dev.clone());
+        let stable_id = routing_v2.register_pipe(live_dev.clone(), Direction::Inbound);
+        let token = stable_id.as_u64();
 
         let mut reg = Registry::new_for_test_with_endpoint(my_ep);
         reg.peers
@@ -4892,12 +4842,11 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(InMemoryPeerStore::new()),
-            Arc::new(crate::transport::routing_v2::Routing::new()),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
+            Arc::clone(&routing_v2),
         );
 
         let snapshots_for_actor = Arc::clone(&snapshots);
-        let routing_for_actor = Arc::clone(&routing);
+        let routing_for_actor = Arc::clone(&routing_v2);
         let wakers_for_actor = Arc::clone(&wakers);
         let actor = tokio::spawn(async move {
             reg.run(
@@ -4919,9 +4868,13 @@ mod tests {
             .unwrap();
         inbox_tx.send(PeerCommand::Shutdown).await.unwrap();
         actor.await.unwrap();
+        let _ = StableConnId::for_test(0); // keep import live
 
+        // VerifiedEndpoint's token resolved to `live_dev` via routing_v2's
+        // pipe map, so the scan_hint gets updated to bind the prefix to
+        // the live peripheral-role DeviceId — no more stale scan.
         assert_eq!(
-            routing.device_for_endpoint(&peer_ep),
+            routing_v2.device_for_endpoint(&peer_ep),
             Some(live_dev.clone()),
             "verified peer must route back to the exact live peripheral client, not the stale scan id"
         );

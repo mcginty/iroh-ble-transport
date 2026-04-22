@@ -13,11 +13,10 @@ use crate::transport::store::PeerStore;
 
 /// A fully-reassembled datagram delivered up to iroh.
 ///
-/// `stable_conn_id` is the shadow-routing handle for the pipe that
-/// delivered this packet. Step 2 of the connection-system redesign:
-/// `poll_recv` stamps iroh-facing `CustomAddr`s with this id, so
-/// replies from iroh route back to the exact pipe the bytes came in
-/// on (rather than whatever `discovered[prefix]` currently points at).
+/// `stable_conn_id` is the `routing_v2` handle for the pipe that
+/// delivered this packet. `poll_recv` stamps iroh-facing
+/// `CustomAddr`s with this id, so replies from iroh route back to
+/// the exact pipe the bytes came in on.
 pub struct IncomingPacket {
     pub device_id: blew::DeviceId,
     pub stable_conn_id: crate::transport::routing_v2::StableConnId,
@@ -31,7 +30,7 @@ pub struct IncomingPacket {
 const READ_PSM_BACKOFFS_MS: [u64; 3] = [0, 150, 400];
 
 /// Translate the registry's role (`Central` = we dialed, `Peripheral` =
-/// they dialed) into the shadow routing's observer-local `Direction`.
+/// they dialed) into `routing_v2`'s observer-local `Direction`.
 fn direction_for_role(
     role: crate::transport::peer::ConnectRole,
 ) -> crate::transport::routing_v2::Direction {
@@ -125,17 +124,10 @@ pub struct Driver<I: BleInterface> {
     truncation_counter: Arc<AtomicU64>,
     empty_frames_counter: Arc<AtomicU64>,
     store: Arc<dyn PeerStore>,
-    /// Shadow routing table. Step 1 of the redesign — mints a
-    /// `StableConnId` on every pipe open and evicts on pipe close.
-    /// Step 2 stamps inbound packets with that id so iroh-facing
-    /// `CustomAddr`s are stable across L2CAP-upgrade swaps.
-    /// See `crate::transport::routing_v2` and the study doc.
+    /// Authoritative routing table. Mints a `StableConnId` on every
+    /// pipe open (or reuses a reservation's id) and evicts on pipe
+    /// close. `poll_send` and `poll_recv` both resolve via this.
     routing_v2: Arc<crate::transport::routing_v2::Routing>,
-    /// v1 routing table. Step 2: the driver installs each pipe's
-    /// `StableConnId` as a device-keyed token here so `poll_send` can
-    /// resolve the id `poll_recv` stamped onto inbound `CustomAddr`s.
-    /// Ownership stays with `BleTransport`; this Arc is shared.
-    routing_v1: Arc<crate::transport::routing::TransportRouting>,
 }
 
 impl<I: BleInterface> Driver<I> {
@@ -149,7 +141,6 @@ impl<I: BleInterface> Driver<I> {
         empty_frames_counter: Arc<AtomicU64>,
         store: Arc<dyn PeerStore>,
         routing_v2: Arc<crate::transport::routing_v2::Routing>,
-        routing_v1: Arc<crate::transport::routing::TransportRouting>,
     ) -> Self {
         Self {
             iface,
@@ -160,7 +151,6 @@ impl<I: BleInterface> Driver<I> {
             empty_frames_counter,
             store,
             routing_v2,
-            routing_v1,
         }
     }
 
@@ -305,22 +295,14 @@ impl<I: BleInterface> Driver<I> {
                 let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
                 let pipe_last_rx_at = last_rx_at.clone();
-                // Shadow registration (step 1): mint a StableConnId the
-                // moment the pipe task is spawned; evict when it exits.
-                //
-                // Step 2: every IncomingPacket from this pipe is stamped
-                // with this id so poll_recv can hand iroh a CustomAddr
-                // that's stable across L2CAP-upgrade swaps. Outbound still
-                // routes through v1's TransportRouting — transitional.
+                // Register the pipe with routing_v2 and enter the
+                // pending pool. If the resolver previously minted a
+                // reservation for this peer's prefix, reuse that id
+                // so iroh's outstanding `CustomAddr` stays valid
+                // across the dial — only outbound pipes match
+                // reservations (inbound accepts have no resolver).
                 let routing_v2 = Arc::clone(&self.routing_v2);
-                let routing_v1 = Arc::clone(&self.routing_v1);
                 let direction = direction_for_role(role);
-                // Step 4c: if the resolver previously minted a reservation
-                // for this peer's prefix, bind this pipe to that reserved
-                // `StableConnId` rather than minting a fresh one. Keeps
-                // iroh's outstanding `CustomAddr` valid across the dial.
-                // Only outbound pipes can match — inbound accepts don't
-                // have a resolver-side reservation (we didn't dial).
                 let (stable_id, reservation_endpoint) =
                     match routing_v2.consume_reservation_for_device(&device_id) {
                         Some(reservation) => {
@@ -329,10 +311,6 @@ impl<I: BleInterface> Driver<I> {
                                 device_id.clone(),
                                 direction,
                             );
-                            // Info: confirms the resolver→dial→pipe
-                            // round-trip completed successfully for
-                            // an outbound peer. One per successful
-                            // outbound dial — good testing signal.
                             tracing::info!(
                                 device = %device_id,
                                 stable_id = %reservation.stable_id,
@@ -343,16 +321,7 @@ impl<I: BleInterface> Driver<I> {
                         }
                         None => (routing_v2.register_pipe(device_id.clone(), direction), None),
                     };
-                // Step 4a: enter the pending pool. `target_endpoint` is
-                // the endpoint the resolver dialed for if we consumed a
-                // reservation; `None` for inbound accepts and for
-                // outbounds that didn't go through the resolver.
                 routing_v2.register_pending(stable_id, reservation_endpoint);
-                // Install the StableConnId as a device-keyed token so
-                // poll_send can resolve the CustomAddr that poll_recv
-                // will stamp on inbound packets from this pipe.
-                routing_v1.install_stable_conn_token(stable_id.as_u64(), device_id.clone());
-                let token_for_uninstall = stable_id.as_u64();
                 tokio::spawn(async move {
                     run_data_pipe(
                         iface,
@@ -372,14 +341,10 @@ impl<I: BleInterface> Driver<I> {
                         pipe_last_rx_at,
                     )
                     .await;
-                    // Order matters: drop the pool entry before the
-                    // pipe itself so the pool never references a
-                    // non-existent pipe, and uninstall the v1 token
-                    // last so inbound packets that raced the exit
-                    // still have a valid resolution during teardown.
+                    // Drop the pool entry before the pipe itself so
+                    // the pool never references a non-existent pipe.
                     routing_v2.evict_pipe_state(stable_id);
                     routing_v2.evict_pipe(stable_id);
-                    routing_v1.uninstall_stable_conn_token(token_for_uninstall);
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
@@ -426,19 +391,13 @@ impl<I: BleInterface> Driver<I> {
                 let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
                 let pipe_last_rx_at = last_rx_at.clone();
-                // Shadow registration: same accounting as StartDataPipe —
-                // reverting to GATT is a fresh pipe lifecycle from the
-                // shadow's perspective, so fresh StableConnId too.
+                // Reverting to GATT is a fresh pipe lifecycle; mint
+                // a new StableConnId. The old pipe's pool entry was
+                // already evicted on its own exit.
                 let routing_v2 = Arc::clone(&self.routing_v2);
-                let routing_v1 = Arc::clone(&self.routing_v1);
                 let direction = direction_for_role(role);
                 let stable_id = routing_v2.register_pipe(device_id.clone(), direction);
-                // Same pool accounting as StartDataPipe — reverting to
-                // GATT starts a fresh pending entry (the old pipe's
-                // pending/routable was evicted on its exit).
                 routing_v2.register_pending(stable_id, None);
-                routing_v1.install_stable_conn_token(stable_id.as_u64(), device_id.clone());
-                let token_for_uninstall = stable_id.as_u64();
                 tokio::spawn(async move {
                     run_data_pipe(
                         iface,
@@ -460,7 +419,6 @@ impl<I: BleInterface> Driver<I> {
                     .await;
                     routing_v2.evict_pipe_state(stable_id);
                     routing_v2.evict_pipe(stable_id);
-                    routing_v1.uninstall_stable_conn_token(token_for_uninstall);
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
@@ -875,7 +833,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::new(crate::transport::routing_v2::Routing::new()),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         driver
@@ -919,7 +876,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::new(crate::transport::routing_v2::Routing::new()),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         driver
@@ -969,7 +925,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::clone(&routing_v2),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         // Pre-seed: scan_hint maps the peer's prefix → device_id, and
@@ -1009,82 +964,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn start_data_pipe_installs_stable_conn_token_in_v1_routing() {
-        // Step 2 contract: the driver installs the minted StableConnId
-        // as a device-keyed token in v1 routing so poll_send on the
-        // inbound-stamped CustomAddr routes back to the correct pipe
-        // DeviceId. Install at pipe-open, uninstall at pipe-close.
-        use crate::transport::peer::{ConnectPath, ConnectRole};
-
-        let iface = Arc::new(MockBleInterface::new());
-        let (tx, mut rx) = mpsc::channel(16);
-        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
-        let routing_v2 = Arc::new(crate::transport::routing_v2::Routing::new());
-        let routing_v1 = Arc::new(crate::transport::routing::TransportRouting::new());
-        let driver = Driver::new(
-            iface,
-            tx,
-            incoming_tx,
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(AtomicU64::new(0)),
-            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
-            Arc::clone(&routing_v2),
-            Arc::clone(&routing_v1),
-        );
-
-        let device_id = blew::DeviceId::from("installed-peer");
-        driver
-            .execute(PeerAction::StartDataPipe {
-                device_id: device_id.clone(),
-                tx_gen: 1,
-                role: ConnectRole::Central,
-                path: ConnectPath::Gatt,
-                l2cap_channel: None,
-            })
-            .await;
-
-        // Grab the StableConnId the driver minted.
-        let pipes = routing_v2.pipes_for_debug();
-        assert_eq!(pipes.len(), 1);
-        let stable_id = pipes[0].id.as_u64();
-
-        // v1 routing must resolve it back to the pipe's DeviceId.
-        assert_eq!(
-            routing_v1.device_for_token(stable_id).as_ref(),
-            Some(&device_id),
-            "install_stable_conn_token must make the id device_for_token-resolvable"
-        );
-
-        // Tear the pipe down and confirm uninstall.
-        let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        let (outbound_tx, inbound_tx) = match cmd {
-            PeerCommand::DataPipeReady {
-                outbound_tx,
-                inbound_tx,
-                ..
-            } => (outbound_tx, inbound_tx),
-            other => panic!("expected DataPipeReady, got {other:?}"),
-        };
-        drop(outbound_tx);
-        drop(inbound_tx);
-
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if routing_v1.device_for_token(stable_id).is_none() {
-                    return;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("v1 routing must uninstall the token when the pipe worker exits");
-    }
-
-    #[tokio::test]
     async fn start_data_pipe_registers_pending_and_evicts_on_close() {
         // Step 4a contract: StartDataPipe adds the new pipe to the
         // pending pool with target_endpoint=None; pipe close evicts
@@ -1106,7 +985,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::clone(&routing_v2),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         assert_eq!(routing_v2.snapshot().pending, 0);
@@ -1187,7 +1065,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::clone(&routing_v2),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         assert_eq!(routing_v2.snapshot().pipes, 0);
@@ -1261,7 +1138,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::clone(&routing_v2),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         driver
@@ -1326,7 +1202,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::new(crate::transport::routing_v2::Routing::new()),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         driver
@@ -1361,7 +1236,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::new(crate::transport::routing_v2::Routing::new()),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         let (swap_tx, mut swap_rx) = mpsc::channel::<blew::L2capChannel>(1);
@@ -1395,7 +1269,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::new(crate::transport::routing_v2::Routing::new()),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
 
         driver
@@ -1435,7 +1308,6 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(crate::transport::store::InMemoryPeerStore::new()),
             Arc::new(crate::transport::routing_v2::Routing::new()),
-            Arc::new(crate::transport::routing::TransportRouting::new()),
         );
         let device_id = blew::DeviceId::from("x");
         driver
