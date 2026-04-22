@@ -779,23 +779,35 @@ impl std::fmt::Debug for BleAddressLookup {
     }
 }
 
-/// Long-lived resolver stream for an endpoint. Yields a single
-/// `CustomAddr(StableConnId)` once routing_v2 can answer "how would
-/// I send to this endpoint?" — either because a routable pipe
-/// exists, a pending pipe targets it, a reservation is already in
-/// flight, or scan has surfaced the peer's prefix (in which case we
-/// make the reservation now and yield it).
+/// Long-lived resolver stream for an endpoint. Emits a
+/// `CustomAddr(StableConnId)` whenever routing_v2's authoritative
+/// answer for "how would I send to this endpoint?" changes to a new
+/// `StableConnId`. Stays alive across the endpoint's lifetime so
+/// that — after a pipe dies and is re-dialed — a fresh CustomAddr
+/// can flow to iroh's `address_lookup_stream`, giving iroh's
+/// RemoteState a new path candidate for future `Endpoint::connect`
+/// calls. (iroh doesn't auto-migrate existing Connections to the
+/// new path: the stale Connection still idles on its own schedule.
+/// But keeping the stream alive means reconnect attempts at the
+/// app layer — `join_peers`, `Endpoint::connect` — find the fresh
+/// pipe immediately, without re-triggering AddressLookup.)
 ///
-/// iroh 0.98 tolerates per-service `Err(_)` items without poisoning
-/// sibling resolvers (n0-computer/iroh#4130), so this stream parks
-/// `Pending` until one of those conditions is true. Once emitted,
-/// the `StableConnId` is stable — it either points at a live pipe
-/// or at a reservation that `poll_send` translates into a dial via
-/// the registry's existing flow.
+/// The answer is the first non-empty of:
+///   1. routable pipe for this endpoint (authoritative post-handshake)
+///   2. pending pipe whose target is this endpoint
+///   3. existing outbound reservation for this prefix
+///   4. scan_hint for this prefix → mint a fresh reservation
+///
+/// Emission rules:
+///   - `Poll::Pending` when there's no answer yet OR when the answer
+///     matches the last emitted `StableConnId`.
+///   - `Poll::Ready(Some(Ok(Item)))` when the answer differs from
+///     `last_emitted` (or this is the first emission).
+///   - Never `Poll::Ready(None)`: the stream only ends when dropped.
 struct EndpointResolveStream {
     routing_v2: Arc<crate::transport::routing_v2::Routing>,
     endpoint_id: EndpointId,
-    emitted: bool,
+    last_emitted: Option<crate::transport::routing_v2::StableConnId>,
 }
 
 impl n0_future::Stream for EndpointResolveStream {
@@ -803,10 +815,6 @@ impl n0_future::Stream for EndpointResolveStream {
 
     fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.emitted {
-            return Poll::Ready(None);
-        }
-
         let endpoint_id = this.endpoint_id;
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
 
@@ -815,53 +823,69 @@ impl n0_future::Stream for EndpointResolveStream {
         this.routing_v2
             .register_endpoint_waker(endpoint_id, cx.waker());
 
-        // 1. Already routable → yield the routable pipe's id.
-        if let Some(stable_id) = this.routing_v2.routable_pipe_for(&endpoint_id) {
-            return yield_stable(this, stable_id, "routable");
-        }
-        // 2. A pending pipe targets this endpoint → yield its id.
-        if let Some(stable_id) = this.routing_v2.pending_pipe_for(&endpoint_id) {
-            return yield_stable(this, stable_id, "pending");
-        }
-        // 3. A reservation already exists for this prefix → yield it.
-        if let Some(reservation) = this.routing_v2.reservation_for_prefix(&prefix) {
-            return yield_stable(this, reservation.stable_id, "reservation_existing");
-        }
-        // 4. Scan has surfaced this prefix → make a reservation and
-        //    yield it. `poll_send` on this id will trigger the dial
-        //    via the registry's SendDatagram flow the first time
-        //    iroh sends anything.
-        if this.routing_v2.scan_hint_for_prefix(&prefix).is_some() {
-            let stable_id = this.routing_v2.reserve_outbound(endpoint_id);
-            return yield_stable(this, stable_id, "reservation_new");
-        }
+        let current = {
+            // 1. Already routable → yield the routable pipe's id.
+            if let Some(stable_id) = this.routing_v2.routable_pipe_for(&endpoint_id) {
+                Some((stable_id, "routable"))
+            }
+            // 2. A pending pipe targets this endpoint → yield its id.
+            else if let Some(stable_id) = this.routing_v2.pending_pipe_for(&endpoint_id) {
+                Some((stable_id, "pending"))
+            }
+            // 3. A reservation already exists for this prefix → yield it.
+            else if let Some(reservation) = this.routing_v2.reservation_for_prefix(&prefix) {
+                Some((reservation.stable_id, "reservation_existing"))
+            }
+            // 4. Scan has surfaced this prefix → make a reservation and
+            //    yield it. `poll_send` on this id will trigger the dial
+            //    via the registry's SendDatagram flow the first time
+            //    iroh sends anything.
+            else if this.routing_v2.scan_hint_for_prefix(&prefix).is_some() {
+                let stable_id = this.routing_v2.reserve_outbound(endpoint_id);
+                Some((stable_id, "reservation_new"))
+            } else {
+                None
+            }
+        };
 
-        // Nothing yet — the scan hasn't seen this peer, no pipe exists.
-        // Wait. `note_scan_hint` and `register_pending` both wake this
-        // waker when relevant state arrives.
-        Poll::Pending
+        match current {
+            Some((stable_id, _)) if Some(stable_id) == this.last_emitted => {
+                // Answer unchanged; stay parked. A future state change
+                // (new routable, new reservation, …) will wake us.
+                Poll::Pending
+            }
+            Some((stable_id, source)) => {
+                this.last_emitted = Some(stable_id);
+                emit_stable(endpoint_id, stable_id, source)
+            }
+            None => {
+                // Nothing yet — the scan hasn't seen this peer, no pipe
+                // exists. Wait. `note_scan_hint` and `register_pending`
+                // both wake this waker when relevant state arrives.
+                Poll::Pending
+            }
+        }
     }
 }
 
-fn yield_stable(
-    this: &mut EndpointResolveStream,
+fn emit_stable(
+    endpoint_id: EndpointId,
     stable_id: crate::transport::routing_v2::StableConnId,
     source: &'static str,
 ) -> Poll<Option<Result<Item, address_lookup::Error>>> {
-    this.emitted = true;
     let token = stable_id.as_u64();
     // Debug level: fires on every `Endpoint::connect` / `gossip.join_peers`
     // resolve, which is per-peer, per-reconnect-tick. Not lifecycle
     // enough to warrant info. The downstream "bound pipe to resolver
     // reservation" log in driver.rs carries the actual outcome.
     tracing::debug!(
-        endpoint_id = %this.endpoint_id,
+        %endpoint_id,
         %stable_id,
         source,
         "BleAddressLookup yielding stable-id token"
     );
     let info = EndpointInfo {
-        endpoint_id: this.endpoint_id,
+        endpoint_id,
         data: EndpointData::new(vec![TransportAddr::Custom(token_custom_addr(token))]),
     };
     Poll::Ready(Some(Ok(Item::new(info, "iroh-ble", None))))
@@ -875,7 +899,7 @@ impl AddressLookup for BleAddressLookup {
         Some(Box::pin(EndpointResolveStream {
             routing_v2: Arc::clone(&self.routing_v2),
             endpoint_id,
-            emitted: false,
+            last_emitted: None,
         }))
     }
 }
@@ -978,9 +1002,13 @@ mod tests {
         assert_eq!(got_ep, endpoint_id);
         assert_eq!(got_prefix, prefix);
 
+        // After first emission, the stream stays alive and parks
+        // until the answer changes. Re-polling the same state
+        // yields Pending — iroh keeps the CustomAddr we just handed
+        // it instead of seeing a spurious new Item every poll.
         assert!(matches!(
             Pin::new(&mut stream).poll_next(&mut cx),
-            Poll::Ready(None)
+            Poll::Pending
         ));
     }
 
@@ -1120,6 +1148,80 @@ mod tests {
         let (_c, w) = counting_waker();
         let mut cx = Context::from_waker(&w);
         let _ = extract_token(&mut s2, &mut cx);
+    }
+
+    // ---------- Test #5b: stream re-emits when routable pipe changes ----------
+
+    #[test]
+    fn resolver_stream_reemits_when_routable_pipe_changes() {
+        // F2 recovery path: a pipe dies, gets re-dialed, and the
+        // routable entry flips to a new StableConnId. The long-lived
+        // resolver stream must emit the *new* CustomAddr so iroh's
+        // address_lookup_stream gets the updated path candidate —
+        // otherwise iroh only knows the dead CustomAddr and future
+        // reconnect attempts resolve against stale state.
+        let routing_v2 = Arc::new(Routing::new());
+        let lookup = BleAddressLookup {
+            routing_v2: Arc::clone(&routing_v2),
+        };
+        let endpoint_id = endpoint_id_with_first_byte(0xF2);
+
+        // First pipe promoted → first routable.
+        let id1 = routing_v2.register_pipe(blew::DeviceId::from("mac-1"), Direction::Outbound);
+        routing_v2.insert_routable(endpoint_id, id1, crate::transport::routing_v2::Dialer::Low);
+
+        let mut stream = lookup.resolve(endpoint_id).expect("Some");
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let t1 = extract_token(&mut stream, &mut cx);
+        assert_eq!(t1, id1.as_u64(), "first emission is the first pipe's id");
+        // Re-poll without state change → Pending.
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+
+        // Pipe 1 dies; pipe 2 takes its place. This is what happens
+        // when the peer restarts: evict_pipe_state clears routable,
+        // and a fresh promote (from a new handshake) installs a new
+        // StableConnId. Eviction alone wakes the resolver so it can
+        // re-poll and (if still nothing routable) park for the next
+        // state change.
+        routing_v2.evict_pipe_state(id1);
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) >= 1,
+            "evict_pipe_state must wake the parked resolver"
+        );
+        // Re-poll: nothing routable (evicted), no pending, no
+        // reservation, no scan_hint. Stream parks and registers a
+        // fresh waker (the previous one was drained by wake_endpoint_waiters).
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+        let wakes_before_reinsert = counter.0.load(AtomicOrdering::SeqCst);
+
+        let id2 = routing_v2.register_pipe(blew::DeviceId::from("mac-2"), Direction::Outbound);
+        routing_v2.insert_routable(endpoint_id, id2, crate::transport::routing_v2::Dialer::Low);
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) > wakes_before_reinsert,
+            "insert_routable must wake the parked resolver"
+        );
+
+        let t2 = extract_token(&mut stream, &mut cx);
+        assert_eq!(
+            t2,
+            id2.as_u64(),
+            "stream emits the new routable pipe's id after routable flips"
+        );
+        assert_ne!(t1, t2, "the new id differs from the old one");
+
+        // Re-poll with unchanged routable → Pending again.
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
     }
 
     // ---------- Test #6: inbox-capacity wakers — every parked sender wakes ----------

@@ -472,30 +472,48 @@ impl Routing {
     }
 
     /// Remove the routable entry for an endpoint, if any. Returns the
-    /// removed entry so the caller can cascade-evict the pipe.
+    /// removed entry so the caller can cascade-evict the pipe. Wakes
+    /// any resolver parked on this endpoint so it re-polls the next
+    /// authoritative answer (e.g., a fresh reservation minted from
+    /// scan_hint).
     pub fn evict_routable(&self, endpoint_id: &EndpointId) -> Option<Routable> {
-        self.inner.lock().routable.remove(endpoint_id)
+        let removed = self.inner.lock().routable.remove(endpoint_id);
+        if removed.is_some() {
+            self.wake_endpoint_waiters(endpoint_id);
+        }
+        removed
     }
 
     /// Evict whichever pool (if any) holds `pipe`. Called from the
     /// driver's pipe-close path — the pipe is about to disappear, so
     /// clean up both pools uniformly. Returns `true` if an entry was
-    /// removed.
+    /// removed. If a routable entry was removed, wakes any resolver
+    /// parked on that endpoint so it re-polls (e.g., emitting a
+    /// `reservation_new` for the next dial attempt).
     pub fn evict_pipe_state(&self, pipe: StableConnId) -> bool {
-        let mut inner = self.inner.lock();
-        let pending_removed = inner.pending.remove(&pipe).is_some();
-        // Routable is keyed on EndpointId; reverse-lookup by pipe.
-        let routable_endpoint = inner
-            .routable
-            .iter()
-            .find(|(_, r)| r.pipe == pipe)
-            .map(|(k, _)| *k);
-        let routable_removed = if let Some(ep) = routable_endpoint {
-            inner.routable.remove(&ep).is_some()
-        } else {
-            false
+        let (pending_removed, routable_endpoint) = {
+            let mut inner = self.inner.lock();
+            let pending_removed = inner.pending.remove(&pipe).is_some();
+            // Routable is keyed on EndpointId; reverse-lookup by pipe.
+            let routable_endpoint = inner
+                .routable
+                .iter()
+                .find(|(_, r)| r.pipe == pipe)
+                .map(|(k, _)| *k);
+            let routable_removed = if let Some(ep) = routable_endpoint {
+                inner.routable.remove(&ep).is_some()
+            } else {
+                false
+            };
+            (
+                pending_removed,
+                routable_endpoint.filter(|_| routable_removed),
+            )
         };
-        pending_removed || routable_removed
+        if let Some(ep) = routable_endpoint {
+            self.wake_endpoint_waiters(&ep);
+        }
+        pending_removed || routable_endpoint.is_some()
     }
 
     /// Look up the pipe currently authoritatively routable for an
