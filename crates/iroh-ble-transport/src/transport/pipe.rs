@@ -731,7 +731,9 @@ mod tests {
     use super::*;
     use crate::transport::peer::PendingSend;
     use crate::transport::test_util::{CallKind, MockBleInterface};
+    use std::sync::atomic::AtomicBool;
     use std::task::{RawWaker, RawWakerVTable, Waker};
+    use tokio::sync::Notify;
 
     fn noop_waker() -> Waker {
         fn no_op(_: *const ()) {}
@@ -740,6 +742,50 @@ mod tests {
         }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
         unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn make_blocked_l2cap_worker() -> (L2capWorker, Arc<Notify>, Arc<AtomicBool>) {
+        let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(1);
+        outbound_fwd_tx
+            .try_send(PendingSend {
+                tx_gen: 0,
+                datagram: Bytes::from_static(b"occupied"),
+                waker: noop_waker(),
+            })
+            .expect("seed the queue so send_timeout hits the full branch");
+
+        let release = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let teardown_flag = Arc::new(AtomicBool::new(false));
+
+        let release_c = Arc::clone(&release);
+        let released_c = Arc::clone(&released);
+        let teardown_c = Arc::clone(&teardown_flag);
+        let handle = tokio::spawn(async move {
+            let _keep_receiver_alive = outbound_fwd_rx;
+            loop {
+                if teardown_c.load(Ordering::Relaxed) {
+                    return;
+                }
+                tokio::select! {
+                    _ = release_c.notified() => {
+                        released_c.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        });
+
+        (
+            L2capWorker {
+                outbound_fwd_tx,
+                teardown_flag,
+                handle,
+            },
+            release,
+            released,
+        )
     }
 
     #[tokio::test]
@@ -951,6 +997,51 @@ mod tests {
             empty_frames.load(Ordering::Relaxed),
             1,
             "outbound empty must be counted exactly once"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn l2cap_timeout_path_stops_worker_before_dropping_it() {
+        let (registry_tx, mut registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (worker, release, released) = make_blocked_l2cap_worker();
+        let device_id = blew::DeviceId::from("l2cap-timeout");
+
+        let mut task = tokio::spawn(async move {
+            let mut workers = WorkerSet {
+                gatt: None,
+                l2cap: Some(worker),
+            };
+            forward_outbound(
+                &mut workers,
+                PendingSend {
+                    tx_gen: 1,
+                    datagram: Bytes::from_static(b"timeout-me"),
+                    waker: noop_waker(),
+                },
+                &device_id,
+                &registry_tx,
+            )
+            .await;
+            workers
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(L2CAP_HANDOVER_TIMEOUT + Duration::from_millis(1)).await;
+        let workers = (&mut task).await.expect("forward_outbound should complete");
+
+        assert!(workers.l2cap.is_none(), "timed-out L2CAP worker must be evicted");
+        match registry_rx.recv().await.expect("timeout metric command") {
+            PeerCommand::L2capHandoverTimeout { device_id: got } => {
+                assert_eq!(got, blew::DeviceId::from("l2cap-timeout"));
+            }
+            other => panic!("expected L2capHandoverTimeout, got {other:?}"),
+        }
+
+        release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "timed-out L2CAP worker must have been stopped before it was dropped"
         );
     }
 }

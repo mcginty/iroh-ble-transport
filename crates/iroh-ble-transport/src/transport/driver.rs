@@ -910,6 +910,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_data_pipe_consumes_reservation_after_scan_hint_flip() {
+        use crate::transport::peer::{ConnectPath, ConnectRole};
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let routing = Arc::new(crate::transport::routing::Routing::new());
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::clone(&routing),
+        );
+
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x58u8; 32]).public();
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint);
+        let old_device = blew::DeviceId::from("reserved-peer-old");
+        let new_device = blew::DeviceId::from("reserved-peer-new");
+        routing.note_scan_hint(prefix, old_device.clone());
+        let reserved_id = routing.reserve_outbound(endpoint);
+
+        routing.note_scan_hint(prefix, new_device);
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: old_device,
+                tx_gen: 3,
+                role: ConnectRole::Central,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+
+        let pipes = routing.pipes_for_debug();
+        assert_eq!(pipes.len(), 1);
+        assert_eq!(
+            pipes[0].id, reserved_id,
+            "StartDataPipe must keep the reserved StableConnId even if scan_hint flipped"
+        );
+        assert_eq!(routing.reservation_len(), 0);
+        assert_eq!(routing.pending_pipe_for(&endpoint), Some(reserved_id));
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await;
+    }
+
+    #[tokio::test]
     async fn start_data_pipe_registers_pending_and_evicts_on_close() {
         // StartDataPipe adds the new pipe to the pending pool with
         // target_endpoint=None; pipe close evicts from whichever pool

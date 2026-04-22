@@ -1229,6 +1229,64 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn resolver_stream_reemits_when_promote_replaces_routable() {
+        let routing = Arc::new(Routing::new());
+        let lookup = BleAddressLookup {
+            routing: Arc::clone(&routing),
+        };
+        let self_endpoint = endpoint_id_with_first_byte(0x10);
+        let remote_endpoint = endpoint_id_with_first_byte(0xF3);
+
+        let old_id = routing.register_pipe(blew::DeviceId::from("mac-old"), Direction::Outbound);
+        routing.insert_routable(
+            remote_endpoint,
+            old_id,
+            crate::transport::routing::Dialer::Low,
+        );
+
+        let mut stream = lookup.resolve(remote_endpoint).expect("Some");
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let first = extract_token(&mut stream, &mut cx);
+        assert_eq!(first, old_id.as_u64());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+
+        let new_id = routing.register_pipe(blew::DeviceId::from("mac-new"), Direction::Outbound);
+        routing.register_pending(new_id, Some(remote_endpoint));
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) >= 1,
+            "register_pending must wake the parked resolver"
+        );
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+        let wakes_before_promote = counter.0.load(AtomicOrdering::SeqCst);
+
+        match routing.promote(new_id, &self_endpoint, remote_endpoint) {
+            crate::transport::routing::PromoteOutcome::Accepted { evicted } => {
+                assert_eq!(evicted, vec![old_id]);
+            }
+            crate::transport::routing::PromoteOutcome::Rejected => {
+                panic!("promote should accept the replacement pipe");
+            }
+        }
+
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) > wakes_before_promote,
+            "promote must wake the resolver when the routable pipe changes"
+        );
+
+        let second = extract_token(&mut stream, &mut cx);
+        assert_eq!(second, new_id.as_u64());
+        assert_ne!(first, second);
+    }
+
     // ---------- Test #6: inbox-capacity wakers — every parked sender wakes ----------
 
     #[test]

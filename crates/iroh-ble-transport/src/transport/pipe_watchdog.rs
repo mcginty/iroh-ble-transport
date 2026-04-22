@@ -161,6 +161,7 @@ mod tests {
     use crate::transport::routing::{Dialer, Direction, StableConnId};
     use std::collections::HashSet;
     use std::sync::Mutex;
+    use tokio::sync::Notify;
 
     struct MockEndpoint {
         active: Mutex<HashSet<EndpointId>>,
@@ -186,6 +187,39 @@ mod tests {
     #[async_trait]
     impl PipeWatchdogEndpoint for MockEndpoint {
         async fn has_active_path(&self, endpoint_id: EndpointId) -> bool {
+            self.active.lock().unwrap().contains(&endpoint_id)
+        }
+    }
+
+    struct BlockingEndpoint {
+        active: Mutex<HashSet<EndpointId>>,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl BlockingEndpoint {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                active: Mutex::new(HashSet::new()),
+                entered: Notify::new(),
+                release: Notify::new(),
+            })
+        }
+
+        async fn wait_until_queried(&self) {
+            self.entered.notified().await;
+        }
+
+        fn release(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    #[async_trait]
+    impl PipeWatchdogEndpoint for BlockingEndpoint {
+        async fn has_active_path(&self, endpoint_id: EndpointId) -> bool {
+            self.entered.notify_one();
+            self.release.notified().await;
             self.active.lock().unwrap().contains(&endpoint_id)
         }
     }
@@ -283,6 +317,59 @@ mod tests {
             "entry inside grace window must not be evicted"
         );
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_evict_if_routable_changed_since_snapshot() {
+        let routing = Arc::new(Routing::new());
+        let ep = test_endpoint(8);
+        let old_id = routing.register_pipe(dev("stale-old"), Direction::Outbound);
+        routing.insert_routable(ep, old_id, Dialer::Low);
+
+        let endpoint = BlockingEndpoint::new();
+        let (tx, mut rx) = mpsc::channel::<PeerCommand>(4);
+
+        let tick_task = {
+            let routing = Arc::clone(&routing);
+            let endpoint = Arc::clone(&endpoint);
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                tick(
+                    endpoint.as_ref(),
+                    &routing,
+                    &tx,
+                    Duration::from_secs(10),
+                    Instant::now() + Duration::from_secs(3600),
+                )
+                .await;
+            })
+        };
+
+        endpoint.wait_until_queried().await;
+
+        let new_id = routing.register_pipe(dev("fresh-new"), Direction::Outbound);
+        routing.insert_routable(ep, new_id, Dialer::High);
+
+        endpoint.release();
+        tick_task.await.expect("tick task should not panic");
+
+        assert_eq!(
+            routing.routable_pipe_for(&ep),
+            Some(new_id),
+            "watchdog must not evict a newer routable pipe from a stale snapshot"
+        );
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                PeerCommand::Stalled { device_id } => {
+                    assert_ne!(
+                        device_id,
+                        dev("fresh-new"),
+                        "watchdog must not stall the replacement pipe"
+                    );
+                }
+                other => panic!("unexpected command {other:?}"),
+            }
+        }
     }
 
     #[tokio::test]
