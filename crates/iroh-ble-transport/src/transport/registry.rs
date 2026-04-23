@@ -1912,6 +1912,10 @@ mod tests {
         unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
     }
 
+    fn endpoint_from_seed(seed: u8) -> iroh_base::EndpointId {
+        iroh_base::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
     fn assert_start_data_pipe_target(
         actions: &[PeerAction],
         device_id: &DeviceId,
@@ -1972,6 +1976,43 @@ mod tests {
             Just(TargetLifecycleCommand::Tick),
             Just(TargetLifecycleCommand::DataPipeReady),
             Just(TargetLifecycleCommand::Forget),
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    enum MultiPeerCommand {
+        Advertise { device_idx: u8, endpoint_seed: u8 },
+        SendReserved { device_idx: u8, endpoint_seed: u8 },
+        ConnectSucceeded { device_idx: u8 },
+        ConnectFailed { device_idx: u8 },
+        CentralDisconnectedTimeout { device_idx: u8 },
+        VerifiedEndpoint { endpoint_seed: u8 },
+        DataPipeReady { device_idx: u8 },
+        Forget { device_idx: u8 },
+    }
+
+    fn multi_peer_command_strategy() -> impl Strategy<Value = MultiPeerCommand> {
+        prop_oneof![
+            (0u8..3, any::<u8>()).prop_map(|(device_idx, endpoint_seed)| {
+                MultiPeerCommand::Advertise {
+                    device_idx,
+                    endpoint_seed,
+                }
+            }),
+            (0u8..3, any::<u8>()).prop_map(|(device_idx, endpoint_seed)| {
+                MultiPeerCommand::SendReserved {
+                    device_idx,
+                    endpoint_seed,
+                }
+            }),
+            (0u8..3).prop_map(|device_idx| MultiPeerCommand::ConnectSucceeded { device_idx }),
+            (0u8..3).prop_map(|device_idx| MultiPeerCommand::ConnectFailed { device_idx }),
+            (0u8..3)
+                .prop_map(|device_idx| MultiPeerCommand::CentralDisconnectedTimeout { device_idx }),
+            any::<u8>()
+                .prop_map(|endpoint_seed| MultiPeerCommand::VerifiedEndpoint { endpoint_seed }),
+            (0u8..3).prop_map(|device_idx| MultiPeerCommand::DataPipeReady { device_idx }),
+            (0u8..3).prop_map(|device_idx| MultiPeerCommand::Forget { device_idx }),
         ]
     }
 
@@ -2109,6 +2150,183 @@ mod tests {
                         expected_target = None;
                         last_seen_tx_gen = None;
                     }
+                }
+            }
+        }
+
+        #[test]
+        fn verified_prefixes_keep_one_connected_winner_and_target_endpoints_do_not_leak_across_peers(
+            commands in prop::collection::vec(multi_peer_command_strategy(), 1..120)
+        ) {
+            let mut reg = Registry::new_for_test();
+            let device_ids = [
+                blew::DeviceId::from("prop-multi-peer-0"),
+                blew::DeviceId::from("prop-multi-peer-1"),
+                blew::DeviceId::from("prop-multi-peer-2"),
+            ];
+            let mut expected_targets = std::collections::HashMap::from([
+                (device_ids[0].clone(), None),
+                (device_ids[1].clone(), None),
+                (device_ids[2].clone(), None),
+            ]);
+            let mut last_seen_tx_gens: std::collections::HashMap<blew::DeviceId, u64> =
+                std::collections::HashMap::new();
+            let mut verified_endpoints = std::collections::HashSet::new();
+
+            for command in commands {
+                let (_device_id, phase_before, current_tx_gen) = match command {
+                    MultiPeerCommand::Advertise { device_idx, .. }
+                    | MultiPeerCommand::SendReserved { device_idx, .. }
+                    | MultiPeerCommand::ConnectSucceeded { device_idx }
+                    | MultiPeerCommand::ConnectFailed { device_idx }
+                    | MultiPeerCommand::CentralDisconnectedTimeout { device_idx }
+                    | MultiPeerCommand::DataPipeReady { device_idx }
+                    | MultiPeerCommand::Forget { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        let phase_before = reg.peer(&device_id).map(|entry| PhaseKind::from(&entry.phase));
+                        let current_tx_gen = reg.peer(&device_id).map_or(0, |entry| entry.tx_gen);
+                        (Some(device_id), phase_before, current_tx_gen)
+                    }
+                    MultiPeerCommand::VerifiedEndpoint { .. } => (None, None, 0),
+                };
+
+                let actions = match command {
+                    MultiPeerCommand::Advertise { device_idx, endpoint_seed } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        let endpoint = endpoint_from_seed(endpoint_seed);
+                        reg.handle(PeerCommand::Advertised {
+                            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+                            device: blew::BleDevice {
+                                id: device_id,
+                                name: None,
+                                rssi: None,
+                                services: vec![],
+                            },
+                            rssi: None,
+                        })
+                    }
+                    MultiPeerCommand::SendReserved { device_idx, endpoint_seed } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        let endpoint = endpoint_from_seed(endpoint_seed);
+                        if !matches!(
+                            phase_before,
+                            Some(PhaseKind::Connected) | Some(PhaseKind::Draining) | Some(PhaseKind::Dead)
+                        ) {
+                            expected_targets.insert(device_id.clone(), Some(endpoint));
+                        }
+                        reg.handle(PeerCommand::SendDatagram {
+                            device_id,
+                            target_endpoint: Some(endpoint),
+                            tx_gen: current_tx_gen,
+                            datagram: bytes::Bytes::from_static(b"hello"),
+                            waker: noop_waker(),
+                        })
+                    }
+                    MultiPeerCommand::ConnectSucceeded { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        reg.handle(PeerCommand::ConnectSucceeded {
+                            device_id,
+                            channel: crate::transport::peer::ChannelHandle {
+                                id: u64::from(device_idx) + 1,
+                                path: crate::transport::peer::ConnectPath::Gatt,
+                            },
+                        })
+                    }
+                    MultiPeerCommand::ConnectFailed { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        reg.handle(PeerCommand::ConnectFailed {
+                            device_id,
+                            error: "timeout".into(),
+                        })
+                    }
+                    MultiPeerCommand::CentralDisconnectedTimeout { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        reg.handle(PeerCommand::CentralDisconnected {
+                            device_id,
+                            cause: blew::DisconnectCause::Timeout,
+                        })
+                    }
+                    MultiPeerCommand::VerifiedEndpoint { endpoint_seed } => {
+                        let endpoint = endpoint_from_seed(endpoint_seed);
+                        verified_endpoints.insert(endpoint);
+                        reg.handle(PeerCommand::VerifiedEndpoint {
+                            endpoint_id: endpoint,
+                            token: None,
+                        })
+                    }
+                    MultiPeerCommand::DataPipeReady { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        if matches!(phase_before, Some(PhaseKind::Connected)) {
+                            expected_targets.insert(device_id.clone(), None);
+                            mark_data_pipe_ready(&mut reg, &device_id);
+                        }
+                        Vec::new()
+                    }
+                    MultiPeerCommand::Forget { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        expected_targets.insert(device_id.clone(), None);
+                        reg.handle(PeerCommand::Forget { device_id })
+                    }
+                };
+
+                for action in &actions {
+                    if let PeerAction::StartDataPipe {
+                        device_id: start_device,
+                        target_endpoint,
+                        ..
+                    } = action
+                    {
+                        prop_assert_eq!(
+                            *target_endpoint,
+                            expected_targets.get(start_device).copied().unwrap_or(None),
+                            "StartDataPipe target_endpoint must stay scoped to its own peer"
+                        );
+                    }
+                }
+
+                for device_id in &device_ids {
+                    match reg.peer(device_id) {
+                        Some(entry) => {
+                            if matches!(entry.phase, PeerPhase::Dead { .. }) {
+                                expected_targets.insert(device_id.clone(), None);
+                            }
+                            prop_assert_eq!(
+                                entry.target_endpoint,
+                                expected_targets.get(device_id).copied().unwrap_or(None),
+                                "target_endpoint must remain isolated per peer"
+                            );
+                            if let Some(prev_tx_gen) = last_seen_tx_gens.get(device_id) {
+                                prop_assert!(
+                                    entry.tx_gen >= *prev_tx_gen,
+                                    "tx_gen must stay monotonic for each peer"
+                                );
+                            }
+                            last_seen_tx_gens.insert(device_id.clone(), entry.tx_gen);
+                            if let PeerPhase::Connected { tx_gen, .. } = &entry.phase {
+                                prop_assert_eq!(entry.tx_gen, *tx_gen);
+                            }
+                        }
+                        None => {
+                            expected_targets.insert(device_id.clone(), None);
+                            last_seen_tx_gens.remove(device_id);
+                        }
+                    }
+                }
+
+                for endpoint in &verified_endpoints {
+                    let prefix = crate::transport::routing::prefix_from_endpoint(endpoint);
+                    let connected_count = reg
+                        .peers
+                        .values()
+                        .filter(|entry| {
+                            entry.prefix == Some(prefix)
+                                && matches!(entry.phase, PeerPhase::Connected { .. })
+                        })
+                        .count();
+                    prop_assert!(
+                        connected_count <= 1,
+                        "verified prefix {prefix:?} must not retain multiple connected peers"
+                    );
                 }
             }
         }

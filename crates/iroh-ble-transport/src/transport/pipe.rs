@@ -804,6 +804,43 @@ mod tests {
         )
     }
 
+    fn make_closed_l2cap_worker() -> (L2capWorker, Arc<Notify>, Arc<AtomicBool>) {
+        let (outbound_fwd_tx, outbound_fwd_rx) = mpsc::channel::<PendingSend>(1);
+
+        let release = Arc::new(Notify::new());
+        let released = Arc::new(AtomicBool::new(false));
+        let teardown_flag = Arc::new(AtomicBool::new(false));
+
+        let release_c = Arc::clone(&release);
+        let released_c = Arc::clone(&released);
+        let teardown_c = Arc::clone(&teardown_flag);
+        let handle = tokio::spawn(async move {
+            drop(outbound_fwd_rx);
+            loop {
+                if teardown_c.load(Ordering::Relaxed) {
+                    return;
+                }
+                tokio::select! {
+                    _ = release_c.notified() => {
+                        released_c.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+        });
+
+        (
+            L2capWorker {
+                outbound_fwd_tx,
+                teardown_flag,
+                handle,
+            },
+            release,
+            released,
+        )
+    }
+
     #[tokio::test]
     async fn outbound_datagram_reaches_iface_write_c2p() {
         let iface = Arc::new(MockBleInterface::new());
@@ -1061,6 +1098,54 @@ mod tests {
         assert!(
             !released.load(Ordering::SeqCst),
             "timed-out L2CAP worker must have been stopped before it was dropped"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn l2cap_closed_path_stops_worker_before_dropping_it() {
+        let (registry_tx, mut registry_rx) = mpsc::channel::<PeerCommand>(4);
+        let (worker, release, released) = make_closed_l2cap_worker();
+        let device_id = blew::DeviceId::from("l2cap-closed");
+
+        let mut task = tokio::spawn(async move {
+            let mut workers = WorkerSet {
+                gatt: None,
+                l2cap: Some(worker),
+            };
+            forward_outbound(
+                &mut workers,
+                PendingSend {
+                    tx_gen: 1,
+                    datagram: Bytes::from_static(b"closed-me"),
+                    waker: noop_waker(),
+                },
+                &device_id,
+                &registry_tx,
+            )
+            .await;
+            workers
+        });
+
+        let workers = tokio::time::timeout(Duration::from_secs(1), &mut task)
+            .await
+            .expect("forward_outbound should complete promptly on closed L2CAP")
+            .expect("forward_outbound task should not panic");
+
+        assert!(
+            workers.l2cap.is_none(),
+            "closed L2CAP worker must be evicted"
+        );
+        let got = registry_rx.try_recv();
+        assert!(
+            got.is_err(),
+            "closed L2CAP path must not emit a timeout metric; got {got:?}"
+        );
+
+        release.notify_one();
+        tokio::task::yield_now().await;
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "closed L2CAP worker must have been stopped before it was dropped"
         );
     }
 }
