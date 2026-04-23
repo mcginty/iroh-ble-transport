@@ -338,6 +338,12 @@ async fn forward_outbound(
 /// fragment is dropped — there's no `ReliableChannel` alive to
 /// reassemble into, and QUIC will retransmit via L2CAP if the data
 /// matters.
+///
+/// Edge case: if the pipe was created fresh with an L2CAP path and
+/// never had a GATT worker (e.g. an inbound L2CAP accept that
+/// preceded any GATT session), late GATT fragments are silently
+/// dropped here. In practice this is rare because GATT handshaking
+/// normally precedes L2CAP; if it happens, QUIC retransmit covers it.
 fn forward_inbound_gatt(workers: &mut WorkerSet, bytes: Bytes, device_id: &blew::DeviceId) {
     let Some(gatt) = workers.gatt.as_ref() else {
         tracing::trace!(

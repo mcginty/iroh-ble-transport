@@ -1,11 +1,12 @@
 //! Action executor. Translates `PeerAction` into `BleInterface` calls and follow-up `PeerCommand`s on success/failure.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
+use crate::transport::events::run_l2cap_accept;
 use crate::transport::interface::BleInterface;
 use crate::transport::peer::{PeerAction, PeerCommand};
 use crate::transport::pipe::run_data_pipe;
@@ -441,7 +442,6 @@ impl<I: BleInterface> Driver<I> {
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use blew::central::ScanFilter;
@@ -468,6 +468,11 @@ pub struct BlewDriver {
     /// after an adapter-off/on cycle wipes platform state.
     services: Vec<GattService>,
     advertising_config: AdvertisingConfig,
+    /// Shared PSM value, updated when the L2CAP listener is (re)started.
+    /// Zero means "no PSM advertised yet".
+    psm: Arc<AtomicU16>,
+    /// Inbox for spawning `run_l2cap_accept` after a listener restart.
+    inbox: mpsc::Sender<PeerCommand>,
 }
 
 impl BlewDriver {
@@ -476,6 +481,8 @@ impl BlewDriver {
         peripheral: Arc<Peripheral>,
         services: Vec<GattService>,
         advertising_config: AdvertisingConfig,
+        psm: Arc<AtomicU16>,
+        inbox: mpsc::Sender<PeerCommand>,
     ) -> Self {
         Self {
             central,
@@ -484,6 +491,8 @@ impl BlewDriver {
             channels_by_device: Mutex::new(HashMap::new()),
             services,
             advertising_config,
+            psm,
+            inbox,
         }
     }
 }
@@ -639,13 +648,25 @@ impl BleInterface for BlewDriver {
     }
 
     async fn restart_l2cap_listener(&self) -> crate::error::BleResult<Option<u16>> {
-        // Re-opening requires plumbing the fresh listener stream back to the
-        // accept supervisor and publishing the new PSM to the peripheral read
-        // responder; neither is wired yet. Log for now.
-        tracing::info!(
-            "adapter restarted without rebuilding L2CAP listener; inbound L2CAP upgrades remain disabled until transport restart"
-        );
-        Ok(None)
+        match self.peripheral.l2cap_listener().await {
+            Ok((psm, listener)) => {
+                let psm_val = psm.value();
+                self.psm.store(psm_val, Ordering::Relaxed);
+                tracing::info!(
+                    psm = psm_val,
+                    "L2CAP listener restarted after adapter cycle"
+                );
+                tokio::spawn(run_l2cap_accept(listener, self.inbox.clone()));
+                Ok(Some(psm_val))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "L2CAP listener restart failed after adapter cycle; inbound L2CAP upgrades disabled"
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn is_powered(&self) -> bool {

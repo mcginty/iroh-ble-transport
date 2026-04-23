@@ -363,10 +363,20 @@ impl Registry {
         // currently on L2CAP this subscribe is a stronger signal that the
         // remote central has started a fresh GATT session and the stale L2CAP
         // worker must be displaced.
-        if let PeerPhase::Connected { channel, .. } = &entry.phase
-            && entry.role == crate::transport::peer::ConnectRole::Peripheral
-            && channel.path == crate::transport::peer::ConnectPath::Gatt
-        {
+        //
+        // If the peer is still mid-handshake (Connecting / Handshaking) we
+        // must NOT restart — doing so would abort the in-flight connect or
+        // L2CAP upgrade and bump tx_gen, stranding the dialing side's
+        // queued datagrams.
+        if matches!(
+            &entry.phase,
+            PeerPhase::Connected { channel, .. }
+                if entry.role == crate::transport::peer::ConnectRole::Peripheral
+                    && channel.path == crate::transport::peer::ConnectPath::Gatt
+        ) || matches!(
+            &entry.phase,
+            PeerPhase::Connecting { .. } | PeerPhase::Handshaking { .. }
+        ) {
             return;
         }
         Self::restart_peripheral_gatt_pipe(entry, actions, now, client_id, None, Some(char_uuid));
@@ -973,6 +983,11 @@ impl Registry {
         first_fragment: Option<bytes::Bytes>,
         subscribed_char: Option<uuid::Uuid>,
     ) {
+        // Dropping `entry.pipe` closes the old supervisor's forwarding
+        // channels (outbound_tx, inbound_tx, swap_tx). The supervisor's
+        // `tokio::select!` loop breaks on channel closure, its workers
+        // receive teardown signals, and the old task exits. This is the
+        // intended teardown mechanism — do not add explicit aborts here.
         entry.pipe = None;
         entry.role = crate::transport::peer::ConnectRole::Peripheral;
         entry.subscribed_chars.clear();

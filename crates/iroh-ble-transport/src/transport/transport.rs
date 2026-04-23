@@ -4,7 +4,7 @@
 use std::io;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use arc_swap::ArcSwap;
@@ -261,11 +261,14 @@ impl BleTransport {
         let empty_frames = Arc::new(AtomicU64::new(0));
         let inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>> = Arc::new(Mutex::new(Vec::new()));
 
+        let psm_atomic = Arc::new(AtomicU16::new(0));
         let iface = Arc::new(BlewDriver::new(
             Arc::clone(&central),
             Arc::clone(&peripheral),
             services,
             advertising_config,
+            Arc::clone(&psm_atomic),
+            inbox_tx.clone(),
         ));
         let routing = Arc::new(crate::transport::routing::Routing::new());
         let driver = Driver::new(
@@ -279,12 +282,12 @@ impl BleTransport {
             Arc::clone(&routing),
         );
 
-        let mut psm = None;
         if config.l2cap_policy == L2capPolicy::PreferL2cap {
             match peripheral.l2cap_listener().await {
                 Ok((assigned_psm, listener)) => {
-                    info!(psm = assigned_psm.value(), "L2CAP listener started");
-                    psm = Some(assigned_psm.value());
+                    let val = assigned_psm.value();
+                    info!(psm = val, "L2CAP listener started");
+                    psm_atomic.store(val, Ordering::Relaxed);
                     tokio::spawn(run_l2cap_accept(listener, inbox_tx.clone()));
                 }
                 Err(e) => {
@@ -355,7 +358,7 @@ impl BleTransport {
         tokio::spawn(run_peripheral_requests(
             Arc::clone(&peripheral),
             inbox_tx.clone(),
-            psm,
+            psm_atomic,
         ));
         tokio::spawn(run_watchdog(inbox_tx.clone()));
 
