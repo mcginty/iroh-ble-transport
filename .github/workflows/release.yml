@@ -125,7 +125,12 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security find-identity -v -p codesigning "$KEYCHAIN"
 
-      - name: Install iOS provisioning profile
+      # Optional fallback. When no ios-appstore.mobileprovision.age is present in
+      # .github/secrets/, this step is skipped and xcodebuild relies on
+      # `-allowProvisioningUpdates` + the App Store Connect API key to fetch or
+      # create the profile at build time (same path Xcode Cloud uses).
+      - name: Install iOS provisioning profile (optional fallback)
+        if: env.SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION != ''
         run: |
           set -eu
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"

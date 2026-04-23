@@ -124,20 +124,28 @@ scripts/secrets.sh encrypt path/to/secrets.env
 
 ### Apple
 
-| File                                     | Source                                                 |
-| ---------------------------------------- | ------------------------------------------------------ |
-| `apple-api-key.p8.age`                   | App Store Connect API key (.p8 downloaded from ASC).   |
-| `ios-dist.p12.age`                       | iOS Distribution cert (.p12 with private key).         |
-| `ios-appstore.mobileprovision.age`       | iOS App Store provisioning profile (bundle id matches).|
-| `mas-app.p12.age`                        | 3rd Party Mac Developer Application cert (.p12).       |
-| `mas-installer.p12.age`                  | 3rd Party Mac Developer Installer cert (.p12).         |
-| `mas-appstore.provisionprofile.age`      | Mac App Store provisioning profile.                    |
-| `developer-id.p12.age`                   | Developer ID Application cert (.p12).                  |
+| File                                     | Required? | Source                                                 |
+| ---------------------------------------- | --------- | ------------------------------------------------------ |
+| `apple-api-key.p8.age`                   | required  | App Store Connect API key (.p8 downloaded from ASC).   |
+| `ios-dist.p12.age`                       | required  | iOS Distribution cert (.p12 with private key).         |
+| `ios-appstore.mobileprovision.age`       | optional  | iOS App Store provisioning profile (fallback only — see below). |
+| `mas-app.p12.age`                        | required  | 3rd Party Mac Developer Application cert (.p12).       |
+| `mas-installer.p12.age`                  | required  | 3rd Party Mac Developer Installer cert (.p12).         |
+| `mas-appstore.provisionprofile.age`      | required  | Mac App Store provisioning profile.                    |
+| `developer-id.p12.age`                   | required  | Developer ID Application cert (.p12).                  |
 
-Get the API key from [App Store Connect → Users and Access → Integrations](https://appstoreconnect.apple.com/access/integrations/api)
-with role Developer or App Manager. Export `.p12` certs from Keychain Access
-(Export → "Personal Information Exchange (.p12)"). Provisioning profiles come from the
+Get the API key from [App Store Connect → Users and Access → Integrations](https://appstoreconnect.apple.com/access/integrations/api).
+Role must be **App Manager** (or higher) so xcodebuild can create/update provisioning
+profiles via the API. Export `.p12` certs from Keychain Access (Export → "Personal
+Information Exchange (.p12)"). Provisioning profiles come from the
 [Apple Developer portal](https://developer.apple.com/account/resources/profiles/list).
+
+**iOS provisioning profile is optional.** With an App Manager-scope API key and
+`--export-method app-store-connect`, `xcodebuild -allowProvisioningUpdates` will
+create or fetch the profile at build time (same flow Xcode Cloud uses). Only
+supply `ios-appstore.mobileprovision.age` if automatic signing fails — for
+example, if your API key is capped at the Developer role, or the Apple Developer
+portal rate-limits profile creation.
 
 Sandbox entitlements for MAS live in [src-tauri/Entitlements.mas.plist](src-tauri/Entitlements.mas.plist);
 the MAS bundle overlay is [src-tauri/tauri.mas.conf.json](src-tauri/tauri.mas.conf.json).
