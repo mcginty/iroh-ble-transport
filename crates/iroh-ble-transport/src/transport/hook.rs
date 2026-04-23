@@ -80,9 +80,14 @@ impl BleDedupHook {
 impl EndpointHooks for BleDedupHook {
     async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
         let remote_endpoint = conn.remote_id();
+        // Iterate every path rather than just `selected_path()`: if iroh ever
+        // picks a non-BLE path as selected while a BLE path is also present,
+        // the token we need to promote would be missed.
         let token = conn
-            .selected_path()
-            .and_then(|path| match path.remote_addr() {
+            .paths()
+            .into_iter()
+            .filter(|path| !path.is_closed())
+            .find_map(|path| match path.remote_addr() {
                 TransportAddr::Custom(addr) if addr.id() == BLE_TRANSPORT_ID => {
                     parse_token_addr(addr).ok()
                 }
