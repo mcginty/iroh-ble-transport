@@ -52,8 +52,8 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
-        CFBundleShortVersionString: 0.1.0
-        CFBundleVersion: "0.1.0"
+        CFBundleShortVersionString: 0.2.0
+        CFBundleVersion: "136"
         CFBundleDisplayName: "BlewChat"
         NSLocalNetworkUsageDescription: "This app connects to a local development server and to nearby peers over BLE."
         NSBonjourServices:
