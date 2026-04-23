@@ -427,13 +427,24 @@ jobs:
           NDK_VERSION: 27.2.12479018
         run: |
           set -eu
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
-          [ -x "$SDKMANAGER" ] || { echo "sdkmanager not found at $SDKMANAGER" >&2; exit 1; }
+          # mise.toml declares `android-sdk = "latest"` which makes mise-action
+          # point ANDROID_HOME at an empty mise install dir. Override to the
+          # system Android SDK that ubuntu-latest actually ships with.
+          SDK="/usr/local/lib/android/sdk"
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMANAGER" ]; then
+            echo "sdkmanager not found at $SDKMANAGER" >&2
+            echo "Available android tooling under /usr/local/lib/android:" >&2
+            ls -la /usr/local/lib/android 2>&1 || true
+            exit 1
+          fi
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" --install "ndk;$NDK_VERSION" > /dev/null
-          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          NDK="$SDK/ndk/$NDK_VERSION"
           [ -d "$NDK" ] || { echo "NDK not present at $NDK after install" >&2; exit 1; }
           echo "Installed NDK at $NDK"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
