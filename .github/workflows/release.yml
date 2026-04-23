@@ -425,13 +425,21 @@ jobs:
       - name: Set up Android NDK environment
         run: |
           set -eu
-          if [ -z "${ANDROID_NDK_ROOT:-}" ]; then
-            NDK_DIR=$(ls -1d "$ANDROID_HOME"/ndk/*/ | sort -V | tail -n1 | sed 's:/$::')
-            echo "ANDROID_NDK_ROOT=$NDK_DIR" >> "$GITHUB_ENV"
-            echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-            echo "NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
-            echo "Using NDK at $NDK_DIR"
+          # Tauri looks for NDK_HOME specifically; the runner pre-sets
+          # ANDROID_NDK_ROOT but not NDK_HOME, so we always re-export.
+          NDK="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-}}"
+          if [ -z "$NDK" ] && [ -d "${ANDROID_HOME:-}/ndk" ]; then
+            NDK=$(ls -1d "$ANDROID_HOME"/ndk/*/ | sort -V | tail -n1 | sed 's:/$::')
           fi
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            echo "No Android NDK found (ANDROID_HOME=$ANDROID_HOME)" >&2
+            ls -la "${ANDROID_HOME:-/opt/android-sdk}/ndk" 2>&1 || true
+            exit 1
+          fi
+          echo "Using NDK at $NDK"
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
       - name: Install frontend dependencies
         working-directory: ${{ env.CHAT_DIR }}
