@@ -18,7 +18,7 @@ use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{ConnectRole, PeerCommand},
     registry::{PhaseKind, Registry, SnapshotMaps},
-    routing::{TransportRouting, prefix_from_endpoint},
+    routing::prefix_from_endpoint,
     store::InMemoryPeerStore,
     test_util::{CallKind, MockBleInterface},
     transport::L2capPolicy,
@@ -82,6 +82,7 @@ fn spawn_node_with_endpoint(
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let (retransmits, truncations, empty_frames) = zero_counters();
 
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         Arc::clone(&iface),
         inbox_tx.clone(),
@@ -90,13 +91,15 @@ fn spawn_node_with_endpoint(
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let registry = Registry::new_for_test_with_policy_and_endpoint(policy, endpoint);
     let snap = snapshots.clone();
-    let routing = Arc::new(TransportRouting::new());
     let wakers = Arc::new(Mutex::new(Vec::<Waker>::new()));
     tokio::spawn(async move {
-        registry.run(inbox_rx, driver, snap, wakers, routing).await;
+        registry
+            .run(inbox_rx, driver, snap, wakers, routing_local)
+            .await;
     });
 
     TestNode {
@@ -134,7 +137,7 @@ async fn wait_both_connected(a: &TestNode, b: &TestNode, timeout: Duration) {
     .expect("timed out waiting for both nodes to reach Connected");
 }
 
-// ─── Task 19 ─────────────────────────────────────────────────────────────────
+// ─── symmetric dial ──────────────────────────────────────────────────────────
 
 /// Two nodes discover each other. Node A (higher EndpointId) dials as Central;
 /// after both reach Connected and receive VerifiedEndpoint for their peer,
@@ -222,6 +225,7 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     a.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: dev_b.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: Bytes::from_static(b"hello-from-a"),
             waker,
@@ -330,7 +334,7 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     );
 }
 
-// ─── Task 20 ─────────────────────────────────────────────────────────────────
+// ─── verified-live suppresses redundant dials ────────────────────────────────
 
 /// After a peer is verified (VerifiedEndpoint received), repeated
 /// advertisements from that peer must NOT trigger new StartConnect actions.
@@ -388,6 +392,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
     a.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: dev_b.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: Bytes::from_static(b"initial"),
             waker,
@@ -475,12 +480,15 @@ async fn advertising_flood_does_not_redial_after_verified() {
     );
 }
 
-// ─── Task 21 ─────────────────────────────────────────────────────────────────
+// ─── L2CAP handover timeout ──────────────────────────────────────────────────
 
 /// With L2capPolicy::PreferL2cap, a VerifiedEndpoint triggers UpgradeToL2cap.
 /// When the L2CAP channel is accepted but the peer never reads (buffer fills),
-/// the pipe supervisor fires L2capHandoverTimeout → registry sets
-/// l2cap_upgrade_failed=true and emits RevertToGattPipe.
+/// the pipe supervisor evicts the wedged L2CAP worker and fires
+/// L2capHandoverTimeout. Under the both-paths-alive model this is pure
+/// bookkeeping: the registry sets `l2cap_upgrade_failed=true` and flips the
+/// `channel.path` telemetry to Gatt while the underlying GATT worker keeps
+/// running (no pipe respawn — no RevertToGattPipe).
 #[tokio::test(flavor = "multi_thread")]
 async fn l2cap_handover_timeout_reverts_to_gatt() {
     use iroh_ble_transport::transport::peer::ChannelHandle;
@@ -543,6 +551,7 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
     node.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: dev_peer.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: Bytes::from_static(b"initial"),
             waker,
@@ -613,6 +622,7 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
             let _ = sender
                 .send(PeerCommand::SendDatagram {
                     device_id: dev_peer_clone.clone(),
+                    target_endpoint: None,
                     tx_gen: live_tx_gen,
                     datagram: Bytes::from(vec![0xAB; 64]),
                     waker,

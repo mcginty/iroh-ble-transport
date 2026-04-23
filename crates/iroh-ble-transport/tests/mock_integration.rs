@@ -12,7 +12,6 @@ use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{ChannelHandle, ConnectPath, KEY_PREFIX_LEN, KeyPrefix, PeerCommand},
     registry::{Registry, SnapshotMaps},
-    routing::TransportRouting,
     store::InMemoryPeerStore,
     test_util::{CallKind, MockBleInterface},
     transport::L2capPolicy,
@@ -21,10 +20,6 @@ use tokio::sync::mpsc;
 
 fn test_wakers() -> Arc<Mutex<Vec<Waker>>> {
     Arc::new(Mutex::new(Vec::new()))
-}
-
-fn test_routing() -> Arc<TransportRouting> {
-    Arc::new(TransportRouting::new())
 }
 
 fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
@@ -69,6 +64,7 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
@@ -77,12 +73,19 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
-            .await;
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
     });
     tokio::spawn(iroh_ble_transport::transport::watchdog::run_watchdog(
         tx.clone(),
@@ -106,6 +109,7 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
     let waker = waker_from_channel(waker_tx);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"ping"),
         waker,
@@ -177,6 +181,7 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
@@ -185,12 +190,19 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
-            .await;
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
     });
     tokio::spawn(iroh_ble_transport::transport::watchdog::run_watchdog(
         tx.clone(),
@@ -215,6 +227,7 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
         tx.send(PeerCommand::SendDatagram {
             device_id,
+            target_endpoint: None,
             tx_gen: 0,
             datagram: bytes::Bytes::from_static(b"x"),
             waker: waker_from_channel(waker_tx),
@@ -247,6 +260,7 @@ async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
@@ -255,12 +269,19 @@ async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
-            .await;
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
     });
 
     tx.send(PeerCommand::AdapterStateChanged { powered: false })
@@ -313,6 +334,7 @@ async fn version_mismatch_deads_peer_and_closes_channel() {
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(8);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
@@ -321,12 +343,19 @@ async fn version_mismatch_deads_peer_and_closes_channel() {
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
-            .await;
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
     });
 
     let prefix: KeyPrefix = [0x77; KEY_PREFIX_LEN];
@@ -345,6 +374,7 @@ async fn version_mismatch_deads_peer_and_closes_channel() {
     let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"x"),
         waker: waker_from_channel(waker_tx),
@@ -402,6 +432,7 @@ async fn version_match_lets_data_pipe_start() {
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(8);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
@@ -410,12 +441,19 @@ async fn version_match_lets_data_pipe_start() {
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
-            .await;
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
     });
 
     let prefix: KeyPrefix = [0x78; KEY_PREFIX_LEN];
@@ -434,6 +472,7 @@ async fn version_match_lets_data_pipe_start() {
     let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"x"),
         waker: waker_from_channel(waker_tx),
@@ -477,6 +516,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         c_truncations,
         c_empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::new(iroh_ble_transport::transport::routing::Routing::new()),
     );
     let peripheral_driver = Driver::new(
         fabric.peripheral.clone(),
@@ -486,6 +526,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
         p_truncations,
         p_empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::new(iroh_ble_transport::transport::routing::Routing::new()),
     );
 
     let central_reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
@@ -499,7 +540,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
                 central_driver,
                 cs,
                 test_wakers(),
-                test_routing(),
+                Arc::new(iroh_ble_transport::transport::routing::Routing::new()),
             )
             .await;
     });
@@ -510,7 +551,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
                 peripheral_driver,
                 ps,
                 test_wakers(),
-                test_routing(),
+                Arc::new(iroh_ble_transport::transport::routing::Routing::new()),
             )
             .await;
     });
@@ -535,6 +576,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
     central_inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: fabric.peripheral_as_device.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: bytes::Bytes::from_static(b"c->p"),
             waker: waker_from_channel(waker_tx),
@@ -578,6 +620,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
     peripheral_inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: peripheral_peer_device,
+            target_endpoint: None,
             tx_gen: peripheral_tx_gen,
             datagram: bytes::Bytes::from_static(b"p->c"),
             waker: waker_from_channel(waker_tx2),
@@ -632,6 +675,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
@@ -640,12 +684,19 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
-            .await;
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
     });
 
     // First lifecycle: advertise, send, wait for connect.
@@ -665,6 +716,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     let (waker_tx, _waker_rx) = mpsc::channel::<()>(1);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"first"),
         waker: waker_from_channel(waker_tx),
@@ -715,6 +767,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     let (waker_tx2, _waker_rx2) = mpsc::channel::<()>(1);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"second"),
         waker: waker_from_channel(waker_tx2),
@@ -748,6 +801,7 @@ async fn connect_failure_retries_on_next_tick() {
     let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
     let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
     let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface.clone(),
         tx.clone(),
@@ -756,12 +810,19 @@ async fn connect_failure_retries_on_next_tick() {
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
     let snap_for_actor = snapshots.clone();
     tokio::spawn(async move {
-        reg.run(rx, driver, snap_for_actor, test_wakers(), test_routing())
-            .await;
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
     });
 
     let prefix: KeyPrefix = [9u8; KEY_PREFIX_LEN];
@@ -782,6 +843,7 @@ async fn connect_failure_retries_on_next_tick() {
     let waker = waker_from_channel(waker_tx);
     tx.send(PeerCommand::SendDatagram {
         device_id: device_id.clone(),
+        target_endpoint: None,
         tx_gen: 0,
         datagram: bytes::Bytes::from_static(b"retry-ping"),
         waker,

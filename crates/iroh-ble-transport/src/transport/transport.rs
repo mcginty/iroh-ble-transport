@@ -30,7 +30,7 @@ use crate::transport::events::{
 use crate::transport::hook::VerifiedEndpointEvent;
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
-use crate::transport::routing::{TOKEN_LEN, TransportRouting, parse_token_addr, token_custom_addr};
+use crate::transport::routing::{TOKEN_LEN, parse_token_addr, token_custom_addr};
 use crate::transport::store::{InMemoryPeerStore, PeerStore};
 use crate::transport::watchdog::run_watchdog;
 
@@ -176,7 +176,12 @@ pub struct BleMetricsSnapshot {
 pub struct BleTransport {
     handle: RegistryHandle,
     incoming_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingPacket>>>,
-    routing: Arc<TransportRouting>,
+    /// Authoritative routing table. Tracks scan hints, pending
+    /// pipes, routable (post-handshake) pipes, outbound reservations,
+    /// and the per-endpoint waker set. Exposed via
+    /// `routing_snapshot()` for telemetry and
+    /// `routing_handle()` for the dedup hook.
+    routing: Arc<crate::transport::routing::Routing>,
     tx_bytes: Arc<AtomicU64>,
     rx_bytes: Arc<AtomicU64>,
     retransmits: Arc<AtomicU64>,
@@ -248,7 +253,6 @@ impl BleTransport {
         let (inbox_tx, inbox_rx) = mpsc::channel::<PeerCommand>(256);
         let (incoming_tx, incoming_rx) = mpsc::channel::<IncomingPacket>(256);
         let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
-        let routing = Arc::new(TransportRouting::new());
 
         let tx_bytes = Arc::new(AtomicU64::new(0));
         let rx_bytes = Arc::new(AtomicU64::new(0));
@@ -263,6 +267,7 @@ impl BleTransport {
             services,
             advertising_config,
         ));
+        let routing = Arc::new(crate::transport::routing::Routing::new());
         let driver = Driver::new(
             iface,
             inbox_tx.clone(),
@@ -271,6 +276,7 @@ impl BleTransport {
             Arc::clone(&truncations),
             Arc::clone(&empty_frames),
             Arc::clone(&config.store),
+            Arc::clone(&routing),
         );
 
         let mut psm = None;
@@ -307,6 +313,21 @@ impl BleTransport {
             let inbox = inbox_tx.clone();
             tokio::spawn(async move {
                 while let Some(verified) = verified_rx.recv().await {
+                    // Fire teardown for any pipes the promote rule
+                    // evicted to make room for this handshake. Each
+                    // `Stalled` causes the registry to drain the
+                    // device's pipe and close its BLE channel; the
+                    // pipe worker then exits, which evicts the
+                    // lingering routing pipe record.
+                    for device_id in verified.evicted_devices {
+                        if inbox
+                            .send(PeerCommand::Stalled { device_id })
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
                     if inbox
                         .send(PeerCommand::VerifiedEndpoint {
                             endpoint_id: verified.endpoint_id,
@@ -355,6 +376,55 @@ impl BleTransport {
         })
     }
 
+    /// Counts-only snapshot of the routing table (pipes / scan hints /
+    /// pending / routable / reservations). Callers that need identifier
+    /// detail use `routing_pipes_for_debug`.
+    #[must_use]
+    pub fn routing_snapshot(&self) -> crate::transport::routing::RoutingSnapshot {
+        self.routing.snapshot()
+    }
+
+    /// Shared handle to the routing table, for plumbing into the
+    /// `BleDedupHook` (which runs the promotion rule at TLS handshake
+    /// completion). Cloning the returned `Arc` is cheap. Exposed only
+    /// because the hook must hold a reference and the hook's
+    /// construction site can't access private transport fields.
+    #[must_use]
+    pub fn routing_handle(&self) -> Arc<crate::transport::routing::Routing> {
+        Arc::clone(&self.routing)
+    }
+
+    /// Spawn the pipe-lifetime watchdog. Polls
+    /// `endpoint.remote_info` for every routable entry and, when iroh
+    /// reports no active path, tells the registry to drain the
+    /// corresponding BLE pipe. See
+    /// [`crate::transport::pipe_watchdog`] for the full contract.
+    ///
+    /// Must be called after the iroh `Endpoint` is bound. Caller owns
+    /// the returned `JoinHandle` — abort it on teardown if you want
+    /// the loop to stop before the transport shuts down.
+    #[must_use]
+    pub fn spawn_pipe_watchdog(
+        &self,
+        endpoint: Arc<iroh::Endpoint>,
+    ) -> tokio::task::JoinHandle<()> {
+        crate::transport::pipe_watchdog::spawn(
+            endpoint,
+            Arc::clone(&self.routing),
+            self.handle.inbox.clone(),
+            crate::transport::pipe_watchdog::DEFAULT_POLL_INTERVAL,
+            crate::transport::pipe_watchdog::DEFAULT_GRACE_PERIOD,
+        )
+    }
+
+    /// Debug-only: list the pipes currently tracked by the shadow
+    /// routing table. Integration tests use this to verify mint/evict
+    /// balance; not intended for production use.
+    #[must_use]
+    pub fn routing_pipes_for_debug(&self) -> Vec<crate::transport::routing::Pipe> {
+        self.routing.pipes_for_debug()
+    }
+
     #[must_use]
     pub fn metrics(&self) -> BleMetricsSnapshot {
         BleMetricsSnapshot {
@@ -383,6 +453,18 @@ impl BleTransport {
     #[must_use]
     pub fn device_for_endpoint(&self, endpoint_id: &EndpointId) -> Option<blew::DeviceId> {
         self.routing.device_for_endpoint(endpoint_id)
+    }
+
+    /// Returns `true` if the local scan has recently surfaced this
+    /// peer's key prefix. Step 8 of the redesign: callers gate
+    /// `join_peers`-style reconnect nudges on this so we don't pin
+    /// cached peers that aren't currently in range. Surfaces only
+    /// what `routing`'s scan_hint holds; no authority claim beyond
+    /// "advertisement seen at some point this session."
+    #[must_use]
+    pub fn has_scan_hint_for_endpoint(&self, endpoint_id: &EndpointId) -> bool {
+        let prefix = crate::transport::routing::prefix_from_endpoint(endpoint_id);
+        self.routing.scan_hint_for_prefix(&prefix).is_some()
     }
 
     /// Public-facing peer snapshot. Filters out `Unknown` (pre-state internal
@@ -474,7 +556,6 @@ impl CustomTransport for BleTransport {
             receiver: incoming_rx,
             watchable,
             sender,
-            routing: Arc::clone(&self.routing),
             rx_bytes: Arc::clone(&self.rx_bytes),
             empty_frames: Arc::clone(&self.empty_frames),
         }))
@@ -485,7 +566,6 @@ struct BleEndpoint {
     receiver: mpsc::Receiver<IncomingPacket>,
     watchable: Watchable<Vec<CustomAddr>>,
     sender: Arc<BleSender>,
-    routing: Arc<TransportRouting>,
     rx_bytes: Arc<AtomicU64>,
     empty_frames: Arc<AtomicU64>,
 }
@@ -509,6 +589,15 @@ impl CustomEndpoint for BleEndpoint {
         NonZeroUsize::MIN
     }
 
+    // TODO(#4): when a peer restarts mid-session, the new inbound
+    // handshake can stall on the server side for tens of seconds to
+    // a few minutes before `after_handshake` fires, even though the
+    // BLE pipe is up and the client side has already completed. The
+    // pipe's inbound bytes flow through here on the way into iroh;
+    // if the bug is on our side of the boundary, this is where the
+    // instrumentation (per-stable-id byte counter, last-delivered
+    // timestamp) would go to prove the packets arrive vs. sit in
+    // iroh. See https://github.com/mcginty/iroh-ble-transport/issues/4.
     fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
@@ -553,9 +642,17 @@ impl CustomEndpoint for BleEndpoint {
                         );
                         continue;
                     }
-                    let token = self.routing.mint_token_for_source(&packet.device_id);
+                    // Stamp inbound packets with the pipe's
+                    // `StableConnId` (minted by the driver at
+                    // pipe-open time). `poll_send` resolves that id
+                    // back to the pipe via `routing.device_for_pipe`.
+                    // Stable across the pipe's full lifetime, so
+                    // iroh's Connection keeps routing to the correct
+                    // per-peer pipe regardless of L2CAP add/drop.
+                    let token = packet.stable_conn_id.as_u64();
                     tracing::trace!(
                         device = %packet.device_id,
+                        stable_conn_id = %packet.stable_conn_id,
                         token,
                         len = packet.data.len(),
                         "BleEndpoint::poll_recv delivering packet"
@@ -581,7 +678,7 @@ impl CustomEndpoint for BleEndpoint {
 pub struct BleSender {
     inbox: mpsc::Sender<PeerCommand>,
     snapshots: Arc<ArcSwap<SnapshotMaps>>,
-    routing: Arc<TransportRouting>,
+    routing: Arc<crate::transport::routing::Routing>,
     tx_bytes: Arc<AtomicU64>,
     inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>>,
 }
@@ -607,27 +704,47 @@ impl CustomSender for BleSender {
             Ok(t) => t,
             Err(e) => return Poll::Ready(Err(e)),
         };
-        // `BleAddressLookup::resolve` only emits a token after the prefix has
-        // a discovery mapping, and `discovered` entries are never removed —
-        // so `device_for_token` on a token iroh hands us must succeed.
-        // If it doesn't, iroh fabricated or outlived a token we don't know
-        // about; refuse the write.
-        let device_id = match self.routing.device_for_token(token) {
-            Some(d) => d,
-            None => {
-                return Poll::Ready(Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "unknown BLE peer token",
-                )));
+        // The token iroh hands us is a `StableConnId` minted by routing
+        // — either the id of a live pipe (registered via `register_pipe` /
+        // `register_pipe_with_id`) or a reservation waiting for the
+        // driver to open a pipe to the peer. Translate both into a
+        // `DeviceId` the registry actor can route on.
+        let stable_id = crate::transport::routing::StableConnId::from_raw(token);
+        let (device_id, target_endpoint) = if let Some(d) = self.routing.device_for_pipe(stable_id)
+        {
+            (d, None)
+        } else if let Some((endpoint, prefix)) = self.routing.reservation_target(stable_id) {
+            // Reservation path: poll_send is iroh's *trigger* to start
+            // the dial. scan_hint tells us which `DeviceId` is nearby
+            // under this prefix right now; hand that to the registry
+            // as a `SendDatagram`, which transitions the peer from
+            // Discovered → Connecting and buffers the datagram until
+            // the pipe opens. The driver consumes the reservation at
+            // pipe-open time so iroh's outstanding `CustomAddr`
+            // resolves to the new pipe's `StableConnId`.
+            match self.routing.scan_hint_for_prefix(&prefix) {
+                Some(d) => (d, Some(endpoint)),
+                None => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "BLE peer reservation has no live scan hint",
+                    )));
+                }
             }
+        } else {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "unknown BLE stable-conn token",
+            )));
         };
         let snap = self.snapshots.load();
         let state = snap.peer_states.get(&device_id);
         let tx_gen = state.map_or(0, |s| s.tx_gen);
         let len = transmit.contents.len();
-        tracing::trace!(device = %device_id, len, "BleSender::poll_send");
+        tracing::trace!(device = %device_id, %stable_id, len, "BleSender::poll_send");
         let cmd = PeerCommand::SendDatagram {
             device_id,
+            target_endpoint,
             tx_gen,
             datagram: Bytes::copy_from_slice(transmit.contents),
             waker: cx.waker().clone(),
@@ -664,7 +781,7 @@ impl CustomSender for BleSender {
 
 #[derive(Clone)]
 pub struct BleAddressLookup {
-    routing: Arc<TransportRouting>,
+    routing: Arc<crate::transport::routing::Routing>,
 }
 
 impl std::fmt::Debug for BleAddressLookup {
@@ -673,50 +790,116 @@ impl std::fmt::Debug for BleAddressLookup {
     }
 }
 
-/// Long-lived resolver stream that parks until `prefix` appears in the
-/// routing table's `discovered` map, then yields a single prefix-keyed
-/// token wrapped in an `Item` and ends.
+/// Long-lived resolver stream for an endpoint. Emits a
+/// `CustomAddr(StableConnId)` whenever routing's authoritative
+/// answer for "how would I send to this endpoint?" changes to a new
+/// `StableConnId`. Stays alive across the endpoint's lifetime so
+/// that — after a pipe dies and is re-dialed — a fresh CustomAddr
+/// can flow to iroh's `address_lookup_stream`, giving iroh's
+/// RemoteState a new path candidate for future `Endpoint::connect`
+/// calls. (iroh doesn't auto-migrate existing Connections to the
+/// new path: the stale Connection still idles on its own schedule.
+/// But keeping the stream alive means reconnect attempts at the
+/// app layer — `join_peers`, `Endpoint::connect` — find the fresh
+/// pipe immediately, without re-triggering AddressLookup.)
 ///
-/// iroh 0.98 tolerates per-service `Err(_)` items without poisoning sibling
-/// resolvers (n0-computer/iroh#4130), so this stream can honour the natural
-/// "subscription" shape of `Stream<Result<Item>>` — we simply stay `Pending`
-/// until discovery lands. Once a prefix-keyed token is minted, its routing
-/// entry is stable for the lifetime of the `TransportRouting`, so
-/// `BleSender::poll_send` can trust `device_for_token` to return `Some`.
-struct PrefixResolveStream {
-    routing: Arc<TransportRouting>,
-    prefix: crate::transport::peer::KeyPrefix,
+/// The answer is the first non-empty of:
+///   1. routable pipe for this endpoint (authoritative post-handshake)
+///   2. pending pipe whose target is this endpoint
+///   3. existing outbound reservation for this prefix
+///   4. scan_hint for this prefix → mint a fresh reservation
+///
+/// Emission rules:
+///   - `Poll::Pending` when there's no answer yet OR when the answer
+///     matches the last emitted `StableConnId`.
+///   - `Poll::Ready(Some(Ok(Item)))` when the answer differs from
+///     `last_emitted` (or this is the first emission).
+///   - Never `Poll::Ready(None)`: the stream only ends when dropped.
+struct EndpointResolveStream {
+    routing: Arc<crate::transport::routing::Routing>,
     endpoint_id: EndpointId,
-    emitted: bool,
+    last_emitted: Option<crate::transport::routing::StableConnId>,
 }
 
-impl n0_future::Stream for PrefixResolveStream {
+impl n0_future::Stream for EndpointResolveStream {
     type Item = Result<Item, address_lookup::Error>;
 
     fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.emitted {
-            return Poll::Ready(None);
-        }
-        // Register before checking so a `note_discovery` racing the check
-        // cannot be missed.
-        this.routing.register_discovery_waker(cx.waker());
-        if this.routing.device_for_prefix(&this.prefix).is_none() {
-            return Poll::Pending;
-        }
-        let token = this.routing.mint_token_for_prefix(this.prefix);
-        this.emitted = true;
-        tracing::info!(
-            endpoint_id = %this.endpoint_id,
-            token,
-            "BleAddressLookup yielding prefix-keyed token after discovery"
-        );
-        let info = EndpointInfo {
-            endpoint_id: this.endpoint_id,
-            data: EndpointData::new(vec![TransportAddr::Custom(token_custom_addr(token))]),
+        let endpoint_id = this.endpoint_id;
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
+
+        // Park the waker first so a state change racing the below
+        // checks doesn't slip past us.
+        this.routing
+            .register_endpoint_waker(endpoint_id, cx.waker());
+
+        let current = {
+            // 1. Already routable → yield the routable pipe's id.
+            if let Some(stable_id) = this.routing.routable_pipe_for(&endpoint_id) {
+                Some((stable_id, "routable"))
+            }
+            // 2. A pending pipe targets this endpoint → yield its id.
+            else if let Some(stable_id) = this.routing.pending_pipe_for(&endpoint_id) {
+                Some((stable_id, "pending"))
+            }
+            // 3. A reservation already exists for this prefix → yield it.
+            else if let Some(reservation) = this.routing.reservation_for_prefix(&prefix) {
+                Some((reservation.stable_id, "reservation_existing"))
+            }
+            // 4. Scan has surfaced this prefix → make a reservation and
+            //    yield it. `poll_send` on this id will trigger the dial
+            //    via the registry's SendDatagram flow the first time
+            //    iroh sends anything.
+            else if this.routing.scan_hint_for_prefix(&prefix).is_some() {
+                let stable_id = this.routing.reserve_outbound(endpoint_id);
+                Some((stable_id, "reservation_new"))
+            } else {
+                None
+            }
         };
-        Poll::Ready(Some(Ok(Item::new(info, "iroh-ble", None))))
+
+        match current {
+            Some((stable_id, _)) if Some(stable_id) == this.last_emitted => {
+                // Answer unchanged; stay parked. A future state change
+                // (new routable, new reservation, …) will wake us.
+                Poll::Pending
+            }
+            Some((stable_id, source)) => {
+                this.last_emitted = Some(stable_id);
+                emit_stable(endpoint_id, stable_id, source)
+            }
+            None => {
+                // Nothing yet — the scan hasn't seen this peer, no pipe
+                // exists. Wait. `note_scan_hint` and `register_pending`
+                // both wake this waker when relevant state arrives.
+                Poll::Pending
+            }
+        }
     }
+}
+
+fn emit_stable(
+    endpoint_id: EndpointId,
+    stable_id: crate::transport::routing::StableConnId,
+    source: &'static str,
+) -> Poll<Option<Result<Item, address_lookup::Error>>> {
+    let token = stable_id.as_u64();
+    // Debug level: fires on every `Endpoint::connect` / `gossip.join_peers`
+    // resolve, which is per-peer, per-reconnect-tick. Not lifecycle
+    // enough to warrant info. The downstream "bound pipe to resolver
+    // reservation" log in driver.rs carries the actual outcome.
+    tracing::debug!(
+        %endpoint_id,
+        %stable_id,
+        source,
+        "BleAddressLookup yielding stable-id token"
+    );
+    let info = EndpointInfo {
+        endpoint_id,
+        data: EndpointData::new(vec![TransportAddr::Custom(token_custom_addr(token))]),
+    };
+    Poll::Ready(Some(Ok(Item::new(info, "iroh-ble", None))))
 }
 
 impl AddressLookup for BleAddressLookup {
@@ -724,12 +907,10 @@ impl AddressLookup for BleAddressLookup {
         &self,
         endpoint_id: EndpointId,
     ) -> Option<n0_future::stream::Boxed<Result<Item, address_lookup::Error>>> {
-        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
-        Some(Box::pin(PrefixResolveStream {
+        Some(Box::pin(EndpointResolveStream {
             routing: Arc::clone(&self.routing),
-            prefix,
             endpoint_id,
-            emitted: false,
+            last_emitted: None,
         }))
     }
 }
@@ -737,7 +918,7 @@ impl AddressLookup for BleAddressLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::routing::TransportRouting;
+    use crate::transport::routing::{Direction, Routing, StableConnId};
     use n0_future::Stream;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -768,43 +949,12 @@ mod tests {
         secret.public()
     }
 
-    // ---------- Test #1: BleAddressLookup::resolve parks until discovery ----------
-
-    #[test]
-    fn ble_address_lookup_resolve_is_pending_until_discovery() {
-        let routing = Arc::new(TransportRouting::new());
-        let lookup = BleAddressLookup {
-            routing: Arc::clone(&routing),
-        };
-        let endpoint_id = endpoint_id_with_first_byte(0xCD);
-        let mut stream = lookup
-            .resolve(endpoint_id)
-            .expect("resolve must return Some(stream)");
-
-        let (counter, waker) = counting_waker();
-        let mut cx = Context::from_waker(&waker);
-
-        // First poll with no discovery → Pending, waker parked.
-        match Pin::new(&mut stream).poll_next(&mut cx) {
-            Poll::Pending => {}
-            other => panic!("expected Pending before discovery, got {other:?}"),
-        }
-        assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 0);
-
-        // Discovery lands → parked waker fires.
-        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
-        let device = blew::DeviceId::from("dev-late");
-        routing.note_discovery(prefix, device.clone());
-        assert_eq!(
-            counter.0.load(AtomicOrdering::SeqCst),
-            1,
-            "note_discovery must wake the parked resolver stream"
-        );
-
-        // Second poll → Ready(Some(Ok(item))).
-        let token = match Pin::new(&mut stream).poll_next(&mut cx) {
+    fn extract_token(
+        stream: &mut n0_future::stream::Boxed<Result<Item, address_lookup::Error>>,
+        cx: &mut Context<'_>,
+    ) -> u64 {
+        match Pin::new(stream).poll_next(cx) {
             Poll::Ready(Some(Ok(item))) => {
-                assert_eq!(item.endpoint_info().endpoint_id, endpoint_id);
                 let addr = item
                     .endpoint_info()
                     .data
@@ -816,114 +966,124 @@ mod tests {
                     _ => panic!("expected Custom addr"),
                 }
             }
-            other => panic!("expected Ready(Some(Ok(_))) after discovery, got {other:?}"),
-        };
-        assert_eq!(routing.device_for_token(token).as_ref(), Some(&device));
+            other => panic!("expected Ready(Some(Ok(_))), got {other:?}"),
+        }
+    }
 
-        // Third poll → None (stream is finished).
+    // ---------- Test #1: resolve parks until scan or pipe appears ----------
+
+    #[test]
+    fn ble_address_lookup_resolve_parks_until_scan_hint_lands() {
+        // Authority model: without a scan_hint (or a live pipe / pending /
+        // reservation) the resolver can't promise iroh anything. It must
+        // park, then wake when scan finally surfaces the peer's prefix.
+        let routing = Arc::new(Routing::new());
+        let lookup = BleAddressLookup {
+            routing: Arc::clone(&routing),
+        };
+        let endpoint_id = endpoint_id_with_first_byte(0xCD);
+        let mut stream = lookup
+            .resolve(endpoint_id)
+            .expect("resolve must return Some(stream)");
+
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        match Pin::new(&mut stream).poll_next(&mut cx) {
+            Poll::Pending => {}
+            other => panic!("expected Pending before scan_hint, got {other:?}"),
+        }
+        assert_eq!(counter.0.load(AtomicOrdering::SeqCst), 0);
+
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
+        let device = blew::DeviceId::from("dev-late");
+        routing.note_scan_hint(prefix, device.clone());
+        assert_eq!(
+            counter.0.load(AtomicOrdering::SeqCst),
+            1,
+            "scan_hint must wake the parked resolver stream"
+        );
+
+        let token = extract_token(&mut stream, &mut cx);
+        // The token is a reservation (no pipe yet). reservation_target
+        // returns the endpoint we asked about.
+        let (got_ep, got_prefix) = routing
+            .reservation_target(StableConnId::from_raw(token))
+            .expect("reservation minted");
+        assert_eq!(got_ep, endpoint_id);
+        assert_eq!(got_prefix, prefix);
+
+        // After first emission, the stream stays alive and parks
+        // until the answer changes. Re-polling the same state
+        // yields Pending — iroh keeps the CustomAddr we just handed
+        // it instead of seeing a spurious new Item every poll.
         assert!(matches!(
             Pin::new(&mut stream).poll_next(&mut cx),
-            Poll::Ready(None)
+            Poll::Pending
         ));
     }
 
+    // ---------- Test #2: resolve yields pipe id when pipe already exists ----------
+
     #[test]
-    fn ble_address_lookup_resolve_is_ready_when_discovery_already_recorded() {
-        let routing = Arc::new(TransportRouting::new());
+    fn ble_address_lookup_resolve_returns_routable_pipe_id_when_present() {
+        // If a pipe is already routable for this endpoint, the resolver
+        // yields that pipe's StableConnId — not a fresh reservation.
+        // Keeps iroh's CustomAddr stable across multiple resolve calls.
+        let routing = Arc::new(Routing::new());
         let lookup = BleAddressLookup {
             routing: Arc::clone(&routing),
         };
         let endpoint_id = endpoint_id_with_first_byte(0xBB);
-        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
-        let device = blew::DeviceId::from("dev-known");
-        routing.note_discovery(prefix, device.clone());
+        let pipe_id = routing.register_pipe(blew::DeviceId::from("mac-bb"), Direction::Outbound);
+        routing.insert_routable(endpoint_id, pipe_id, crate::transport::routing::Dialer::Low);
 
         let mut stream = lookup.resolve(endpoint_id).expect("Some");
         let (_counter, waker) = counting_waker();
         let mut cx = Context::from_waker(&waker);
-        match Pin::new(&mut stream).poll_next(&mut cx) {
-            Poll::Ready(Some(Ok(item))) => {
-                assert_eq!(item.endpoint_info().endpoint_id, endpoint_id);
-            }
-            other => panic!("expected immediate Ready(Some(Ok(_))), got {other:?}"),
-        }
-        assert!(matches!(
-            Pin::new(&mut stream).poll_next(&mut cx),
-            Poll::Ready(None)
-        ));
+        let token = extract_token(&mut stream, &mut cx);
+        assert_eq!(
+            token,
+            pipe_id.as_u64(),
+            "resolver yields the routable pipe's StableConnId"
+        );
     }
 
-    // ---------- Test #2: resolve idempotence + MAC rotation ----------
+    // ---------- Test #3: resolve is idempotent across repeat calls ----------
 
     #[test]
-    fn ble_address_lookup_resolve_is_idempotent_and_follows_mac_rotation() {
-        let routing = Arc::new(TransportRouting::new());
+    fn ble_address_lookup_resolve_is_idempotent() {
+        let routing = Arc::new(Routing::new());
         let lookup = BleAddressLookup {
             routing: Arc::clone(&routing),
         };
         let endpoint_id = endpoint_id_with_first_byte(0xEE);
-
-        // Discovery must land before the resolver can emit a token.
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
-        let device_a = blew::DeviceId::from("mac-aa");
-        routing.note_discovery(prefix, device_a.clone());
+        routing.note_scan_hint(prefix, blew::DeviceId::from("mac-ee"));
 
-        let extract_token = |stream_opt: Option<
-            n0_future::stream::Boxed<Result<Item, address_lookup::Error>>,
-        >|
-         -> u64 {
-            let mut s = stream_opt.expect("Some");
-            let (_c, w) = counting_waker();
-            let mut cx = Context::from_waker(&w);
-            match Pin::new(&mut s).poll_next(&mut cx) {
-                Poll::Ready(Some(Ok(item))) => {
-                    let addr = item
-                        .endpoint_info()
-                        .data
-                        .addrs()
-                        .next()
-                        .expect("at least one addr");
-                    match addr {
-                        TransportAddr::Custom(c) => parse_token_addr(c).expect("parse"),
-                        _ => panic!("expected Custom addr"),
-                    }
-                }
-                other => panic!("expected Ready(Some(Ok)), got {other:?}"),
-            }
-        };
+        let (_c1, w1) = counting_waker();
+        let mut cx1 = Context::from_waker(&w1);
+        let mut s1 = lookup.resolve(endpoint_id).expect("Some");
+        let t1 = extract_token(&mut s1, &mut cx1);
 
-        let t1 = extract_token(lookup.resolve(endpoint_id));
-        let t2 = extract_token(lookup.resolve(endpoint_id));
-        assert_eq!(t1, t2, "resolve must be idempotent for the same EndpointId");
-        assert_eq!(routing.device_for_token(t1).as_ref(), Some(&device_a));
-
-        // Peer rotates MAC (Android reboot etc.). Same prefix → device_b.
-        // The cached iroh address (token t1) must now route to device_b
-        // *without* iroh re-resolving.
-        let device_b = blew::DeviceId::from("mac-bb");
-        routing.note_discovery(prefix, device_b.clone());
+        let (_c2, w2) = counting_waker();
+        let mut cx2 = Context::from_waker(&w2);
+        let mut s2 = lookup.resolve(endpoint_id).expect("Some");
+        let t2 = extract_token(&mut s2, &mut cx2);
         assert_eq!(
-            routing.device_for_token(t1).as_ref(),
-            Some(&device_b),
-            "prefix-keyed token must follow live discovery rotation"
+            t1, t2,
+            "reserve_outbound is idempotent — second resolve returns same id"
         );
-
-        // And resolve() called *again* after rotation still hands back the
-        // same stable token — iroh's address cache stays valid.
-        let t3 = extract_token(lookup.resolve(endpoint_id));
-        assert_eq!(t1, t3);
     }
 
-    // ---------- Test #3: concurrent resolvers wake-all / re-park correctness ----------
+    // ---------- Test #4: concurrent resolvers only wake on their prefix ----------
 
     #[test]
-    fn concurrent_resolvers_for_different_endpoints_each_resolve_on_their_prefix() {
-        // `note_discovery` drains *every* parked discovery waker and wakes
-        // them all. Each stream must then re-evaluate its *own* prefix: the
-        // stream whose prefix just landed yields; every other stream must
-        // re-park on the next poll. Regression guard against a future
-        // "wake only this stream" optimisation silently dropping wakes.
-        let routing = Arc::new(TransportRouting::new());
+    fn concurrent_resolvers_only_wake_on_their_prefix() {
+        // scan_hint for prefix A must wake ep_A's parked resolver but not
+        // ep_B's (distinct prefixes). Verifies wake_endpoint_waiters_for_prefix
+        // filters correctly, avoiding a "wake-all" regression.
+        let routing = Arc::new(Routing::new());
         let lookup = BleAddressLookup {
             routing: Arc::clone(&routing),
         };
@@ -939,7 +1099,6 @@ mod tests {
         let mut cxa = Context::from_waker(&wa);
         let mut cxb = Context::from_waker(&wb);
 
-        // Both streams park on first poll.
         assert!(matches!(
             Pin::new(&mut sa).poll_next(&mut cxa),
             Poll::Pending
@@ -949,96 +1108,40 @@ mod tests {
             Poll::Pending
         ));
 
-        // Discovery lands for A only. Both wakers fire (shared-waker drain),
-        // but B's re-poll must still be Pending.
-        let device_a = blew::DeviceId::from("dev-a");
-        routing.note_discovery(prefix_a, device_a.clone());
-        assert_eq!(ca.0.load(AtomicOrdering::SeqCst), 1);
-        assert_eq!(cb.0.load(AtomicOrdering::SeqCst), 1);
+        routing.note_scan_hint(prefix_a, blew::DeviceId::from("dev-a"));
+        assert_eq!(
+            ca.0.load(AtomicOrdering::SeqCst),
+            1,
+            "A's waker fires on A's prefix"
+        );
+        assert_eq!(
+            cb.0.load(AtomicOrdering::SeqCst),
+            0,
+            "B's waker must NOT fire on A's prefix"
+        );
 
-        match Pin::new(&mut sa).poll_next(&mut cxa) {
-            Poll::Ready(Some(Ok(item))) => {
-                assert_eq!(item.endpoint_info().endpoint_id, ep_a);
-            }
-            other => panic!("A: expected Ready(Some(Ok(_))) after its prefix lands, got {other:?}"),
-        }
+        let _ = extract_token(&mut sa, &mut cxa);
         assert!(matches!(
             Pin::new(&mut sb).poll_next(&mut cxb),
             Poll::Pending
         ));
 
-        // Now B's prefix lands. Only B is parked (A is finished), so only
-        // B's waker fires.
-        let device_b = blew::DeviceId::from("dev-b");
-        routing.note_discovery(prefix_b, device_b.clone());
-        assert_eq!(cb.0.load(AtomicOrdering::SeqCst), 2);
-
-        match Pin::new(&mut sb).poll_next(&mut cxb) {
-            Poll::Ready(Some(Ok(item))) => {
-                assert_eq!(item.endpoint_info().endpoint_id, ep_b);
-            }
-            other => panic!("B: expected Ready(Some(Ok(_))) after its prefix lands, got {other:?}"),
-        }
+        routing.note_scan_hint(prefix_b, blew::DeviceId::from("dev-b"));
+        assert_eq!(cb.0.load(AtomicOrdering::SeqCst), 1);
+        let _ = extract_token(&mut sb, &mut cxb);
     }
 
-    // ---------- Test #4: symmetric dial/recv token invariant ----------
+    // ---------- Test #5: stream drop leaves future resolves healthy ----------
 
     #[test]
-    fn resolver_token_matches_mint_token_for_source_after_discovery() {
-        // The BLE transport is symmetric: whether a peer is first seen as
-        // the dial-out target (via `BleAddressLookup::resolve`) or as the
-        // inbound source of a recv (via `mint_token_for_source`), iroh must
-        // end up with the same `Token` for that peer. Otherwise the path
-        // table fragments and dedup (central+peripheral roles for one
-        // identity) breaks. Verifies both call sites converge on the
-        // prefix-keyed mint.
-        let routing = Arc::new(TransportRouting::new());
-        let lookup = BleAddressLookup {
-            routing: Arc::clone(&routing),
-        };
-        let endpoint_id = endpoint_id_with_first_byte(0xCD);
-        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
-        let device = blew::DeviceId::from("shared-peer");
-        routing.note_discovery(prefix, device.clone());
-
-        let mut stream = lookup.resolve(endpoint_id).expect("Some");
-        let (_c, w) = counting_waker();
-        let mut cx = Context::from_waker(&w);
-        let dial_token = match Pin::new(&mut stream).poll_next(&mut cx) {
-            Poll::Ready(Some(Ok(item))) => {
-                let addr = item
-                    .endpoint_info()
-                    .data
-                    .addrs()
-                    .next()
-                    .expect("addr present");
-                match addr {
-                    TransportAddr::Custom(c) => parse_token_addr(c).expect("parse"),
-                    _ => panic!("expected Custom addr"),
-                }
-            }
-            other => panic!("expected Ready(Some(Ok(_))), got {other:?}"),
-        };
-
-        let recv_token = routing.mint_token_for_source(&device);
-        assert_eq!(
-            dial_token, recv_token,
-            "dial- and recv-path tokens must match for the same prefix"
-        );
-    }
-
-    // ---------- Test #5: stream drop does not break future resolves ----------
-
-    #[test]
-    fn resolver_stream_drop_before_discovery_does_not_break_later_resolves() {
-        let routing = Arc::new(TransportRouting::new());
+    fn resolver_stream_drop_before_scan_does_not_break_later_resolves() {
+        let routing = Arc::new(Routing::new());
         let lookup = BleAddressLookup {
             routing: Arc::clone(&routing),
         };
         let endpoint_id = endpoint_id_with_first_byte(0xDD);
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
 
-        // Poll once to register a waker, then drop the stream.
         {
             let mut s = lookup.resolve(endpoint_id).expect("Some");
             let (_c, w) = counting_waker();
@@ -1046,21 +1149,144 @@ mod tests {
             assert!(matches!(Pin::new(&mut s).poll_next(&mut cx), Poll::Pending));
         }
 
-        // Discovery after drop must not panic (the stale waker is drained
-        // harmlessly from the routing table's Vec<Waker>).
-        let device = blew::DeviceId::from("late-but-arrived");
-        routing.note_discovery(prefix, device.clone());
+        routing.note_scan_hint(prefix, blew::DeviceId::from("late-but-arrived"));
 
-        // A fresh resolve for the same endpoint still works.
         let mut s2 = lookup.resolve(endpoint_id).expect("Some");
         let (_c, w) = counting_waker();
         let mut cx = Context::from_waker(&w);
-        match Pin::new(&mut s2).poll_next(&mut cx) {
-            Poll::Ready(Some(Ok(item))) => {
-                assert_eq!(item.endpoint_info().endpoint_id, endpoint_id);
+        let _ = extract_token(&mut s2, &mut cx);
+    }
+
+    // ---------- Test #5b: stream re-emits when routable pipe changes ----------
+
+    #[test]
+    fn resolver_stream_reemits_when_routable_pipe_changes() {
+        // F2 recovery path: a pipe dies, gets re-dialed, and the
+        // routable entry flips to a new StableConnId. The long-lived
+        // resolver stream must emit the *new* CustomAddr so iroh's
+        // address_lookup_stream gets the updated path candidate —
+        // otherwise iroh only knows the dead CustomAddr and future
+        // reconnect attempts resolve against stale state.
+        let routing = Arc::new(Routing::new());
+        let lookup = BleAddressLookup {
+            routing: Arc::clone(&routing),
+        };
+        let endpoint_id = endpoint_id_with_first_byte(0xF2);
+
+        // First pipe promoted → first routable.
+        let id1 = routing.register_pipe(blew::DeviceId::from("mac-1"), Direction::Outbound);
+        routing.insert_routable(endpoint_id, id1, crate::transport::routing::Dialer::Low);
+
+        let mut stream = lookup.resolve(endpoint_id).expect("Some");
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let t1 = extract_token(&mut stream, &mut cx);
+        assert_eq!(t1, id1.as_u64(), "first emission is the first pipe's id");
+        // Re-poll without state change → Pending.
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+
+        // Pipe 1 dies; pipe 2 takes its place. This is what happens
+        // when the peer restarts: evict_pipe_state clears routable,
+        // and a fresh promote (from a new handshake) installs a new
+        // StableConnId. Eviction alone wakes the resolver so it can
+        // re-poll and (if still nothing routable) park for the next
+        // state change.
+        routing.evict_pipe_state(id1);
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) >= 1,
+            "evict_pipe_state must wake the parked resolver"
+        );
+        // Re-poll: nothing routable (evicted), no pending, no
+        // reservation, no scan_hint. Stream parks and registers a
+        // fresh waker (the previous one was drained by wake_endpoint_waiters).
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+        let wakes_before_reinsert = counter.0.load(AtomicOrdering::SeqCst);
+
+        let id2 = routing.register_pipe(blew::DeviceId::from("mac-2"), Direction::Outbound);
+        routing.insert_routable(endpoint_id, id2, crate::transport::routing::Dialer::Low);
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) > wakes_before_reinsert,
+            "insert_routable must wake the parked resolver"
+        );
+
+        let t2 = extract_token(&mut stream, &mut cx);
+        assert_eq!(
+            t2,
+            id2.as_u64(),
+            "stream emits the new routable pipe's id after routable flips"
+        );
+        assert_ne!(t1, t2, "the new id differs from the old one");
+
+        // Re-poll with unchanged routable → Pending again.
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+    }
+
+    #[test]
+    fn resolver_stream_reemits_when_promote_replaces_routable() {
+        let routing = Arc::new(Routing::new());
+        let lookup = BleAddressLookup {
+            routing: Arc::clone(&routing),
+        };
+        let self_endpoint = endpoint_id_with_first_byte(0x10);
+        let remote_endpoint = endpoint_id_with_first_byte(0xF3);
+
+        let old_id = routing.register_pipe(blew::DeviceId::from("mac-old"), Direction::Outbound);
+        routing.insert_routable(
+            remote_endpoint,
+            old_id,
+            crate::transport::routing::Dialer::Low,
+        );
+
+        let mut stream = lookup.resolve(remote_endpoint).expect("Some");
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let first = extract_token(&mut stream, &mut cx);
+        assert_eq!(first, old_id.as_u64());
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+
+        let new_id = routing.register_pipe(blew::DeviceId::from("mac-new"), Direction::Outbound);
+        routing.register_pending(new_id, Some(remote_endpoint));
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) >= 1,
+            "register_pending must wake the parked resolver"
+        );
+        assert!(matches!(
+            Pin::new(&mut stream).poll_next(&mut cx),
+            Poll::Pending
+        ));
+        let wakes_before_promote = counter.0.load(AtomicOrdering::SeqCst);
+
+        match routing.promote(new_id, &self_endpoint, remote_endpoint) {
+            crate::transport::routing::PromoteOutcome::Accepted { evicted } => {
+                assert_eq!(evicted, vec![old_id]);
             }
-            other => panic!("expected Ready(Some(Ok(_))) on fresh resolve, got {other:?}"),
+            crate::transport::routing::PromoteOutcome::Rejected => {
+                panic!("promote should accept the replacement pipe");
+            }
         }
+
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) > wakes_before_promote,
+            "promote must wake the resolver when the routable pipe changes"
+        );
+
+        let second = extract_token(&mut stream, &mut cx);
+        assert_eq!(second, new_id.as_u64());
+        assert_ne!(first, second);
     }
 
     // ---------- Test #6: inbox-capacity wakers — every parked sender wakes ----------
@@ -1091,5 +1317,152 @@ mod tests {
         assert_eq!(c2.0.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(c3.0.load(AtomicOrdering::SeqCst), 1);
         assert!(wakers.lock().is_empty(), "drain must clear the list");
+    }
+
+    #[cfg(feature = "testing")]
+    #[tokio::test]
+    async fn resolve_poll_send_and_start_data_pipe_preserve_reserved_token_after_scan_hint_flip() {
+        use crate::transport::driver::{Driver, IncomingPacket};
+        use crate::transport::peer::{ChannelHandle, ConnectPath, PeerAction};
+        use crate::transport::registry::{Registry, SnapshotMaps};
+        use crate::transport::test_util::MockBleInterface;
+
+        fn test_transmit(contents: &[u8]) -> Transmit<'_> {
+            // iroh 0.98.1 keeps `ecn` private but `poll_send` only reads the
+            // public payload fields. Mirror the current layout in tests so the
+            // real `BleSender::poll_send` path can still be exercised.
+            unsafe {
+                std::mem::transmute::<
+                    (Option<noq_udp::EcnCodepoint>, &[u8], Option<usize>),
+                    Transmit<'_>,
+                >((None, contents, None))
+            }
+        }
+
+        let routing = Arc::new(Routing::new());
+        let lookup = BleAddressLookup {
+            routing: Arc::clone(&routing),
+        };
+        let snapshots = Arc::new(ArcSwap::from_pointee(SnapshotMaps::default()));
+        let (inbox_tx, mut inbox_rx) = mpsc::channel(8);
+        let sender = BleSender {
+            inbox: inbox_tx,
+            snapshots,
+            routing: Arc::clone(&routing),
+            tx_bytes: Arc::new(AtomicU64::new(0)),
+            inbox_capacity_wakers: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let endpoint = endpoint_id_with_first_byte(0xC1);
+        let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint);
+        let old_device = blew::DeviceId::from("transport-old-device");
+        let new_device = blew::DeviceId::from("transport-new-device");
+        routing.note_scan_hint(prefix, old_device.clone());
+
+        let mut stream = lookup.resolve(endpoint).expect("Some");
+        let (_counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let token = extract_token(&mut stream, &mut cx);
+        let reserved_id = StableConnId::from_raw(token);
+
+        let transmit = test_transmit(b"hello");
+        assert!(matches!(
+            CustomSender::poll_send(&sender, &mut cx, &token_custom_addr(token), &transmit),
+            Poll::Ready(Ok(()))
+        ));
+
+        let mut reg = Registry::new_for_test();
+        reg.handle(PeerCommand::Advertised {
+            prefix,
+            device: blew::BleDevice {
+                id: old_device.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let send_cmd = inbox_rx.recv().await.expect("SendDatagram queued");
+        let start_actions = reg.handle(send_cmd);
+        assert!(matches!(
+            start_actions.as_slice(),
+            [PeerAction::StartConnect { device_id, .. }] if device_id == &old_device
+        ));
+        assert_eq!(
+            reg.peer(&old_device).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        routing.note_scan_hint(prefix, new_device);
+
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: old_device.clone(),
+            channel: ChannelHandle {
+                id: 9,
+                path: ConnectPath::Gatt,
+            },
+        });
+        let start_pipe = actions
+            .into_iter()
+            .find_map(|action| match action {
+                PeerAction::StartDataPipe {
+                    device_id,
+                    tx_gen,
+                    role,
+                    target_endpoint,
+                    path,
+                    l2cap_channel,
+                } => Some((
+                    device_id,
+                    tx_gen,
+                    role,
+                    target_endpoint,
+                    path,
+                    l2cap_channel,
+                )),
+                _ => None,
+            })
+            .expect("StartDataPipe emitted");
+        assert_eq!(start_pipe.0, old_device);
+        assert_eq!(start_pipe.3, Some(endpoint));
+        assert_eq!(start_pipe.4, ConnectPath::Gatt);
+        assert!(start_pipe.5.is_none());
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (driver_tx, mut driver_rx) = mpsc::channel(8);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let driver = Driver::new(
+            iface,
+            driver_tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::clone(&routing),
+        );
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: start_pipe.0.clone(),
+                tx_gen: start_pipe.1,
+                role: start_pipe.2,
+                target_endpoint: start_pipe.3,
+                path: start_pipe.4,
+                l2cap_channel: start_pipe.5,
+            })
+            .await;
+
+        let pipes = routing.pipes_for_debug();
+        assert_eq!(pipes.len(), 1);
+        assert_eq!(pipes[0].id, reserved_id);
+        assert_eq!(pipes[0].device_id, old_device);
+        assert_eq!(routing.reservation_len(), 0);
+        assert_eq!(routing.pending_pipe_for(&endpoint), Some(reserved_id));
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), driver_rx.recv())
+            .await
+            .unwrap();
     }
 }

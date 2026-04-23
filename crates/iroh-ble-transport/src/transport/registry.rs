@@ -14,7 +14,6 @@ use tokio::sync::mpsc;
 
 use crate::transport::driver::Driver;
 use crate::transport::interface::BleInterface;
-#[allow(unused_imports)]
 use crate::transport::peer::{PeerAction, PeerCommand, PeerEntry, PeerPhase};
 use crate::transport::transport::L2capPolicy;
 
@@ -38,8 +37,9 @@ pub struct Registry {
     peers: HashMap<DeviceId, PeerEntry>,
     l2cap_policy: L2capPolicy,
     /// Prefixes whose identity has been verified by iroh's QUIC handshake.
-    /// Populated by VerifiedEndpoint; consulted by handle_advertised (Task 4)
-    /// and the dedup pass (Task 7).
+    /// Populated by `VerifiedEndpoint`; consulted by `handle_advertised`
+    /// (to suppress redundant redials of a verified peer) and by the
+    /// dedup pass that retires losing duplicate entries.
     verified_prefixes: HashMap<crate::transport::peer::KeyPrefix, iroh_base::EndpointId>,
     my_endpoint: iroh_base::EndpointId,
     my_prefix: crate::transport::peer::KeyPrefix,
@@ -91,10 +91,19 @@ impl Registry {
             } => self.handle_advertised(&mut actions, now, prefix, device, rssi),
             PeerCommand::SendDatagram {
                 device_id,
+                target_endpoint,
                 tx_gen,
                 datagram,
                 waker,
-            } => self.handle_send_datagram(&mut actions, now, device_id, tx_gen, datagram, waker),
+            } => self.handle_send_datagram(
+                &mut actions,
+                now,
+                device_id,
+                target_endpoint,
+                tx_gen,
+                datagram,
+                waker,
+            ),
             PeerCommand::ConnectSucceeded { device_id, channel } => {
                 self.handle_connect_succeeded(&mut actions, now, device_id, channel);
             }
@@ -495,11 +504,13 @@ impl Registry {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_send_datagram(
         &mut self,
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        target_endpoint: Option<iroh_base::EndpointId>,
         tx_gen: u64,
         datagram: bytes::Bytes,
         waker: std::task::Waker,
@@ -551,6 +562,14 @@ impl Registry {
             decision = decision_tag,
             "registry SendDatagram"
         );
+        if let Some(target_endpoint) = target_endpoint
+            && matches!(
+                decision,
+                SendDecision::Buffer | SendDecision::StartAndEnqueue
+            )
+        {
+            entry.target_endpoint = Some(target_endpoint);
+        }
         match decision {
             SendDecision::Enqueue => {
                 if entry.pipe.is_some() && !entry.pending_sends.is_empty() {
@@ -712,6 +731,7 @@ impl Registry {
             device_id: device_id.clone(),
             tx_gen,
             role,
+            target_endpoint: entry.target_endpoint,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
@@ -753,6 +773,7 @@ impl Registry {
         entry.consecutive_failures += 1;
         actions.push(PeerAction::EmitMetric(format!("connect_failed:{error}")));
         if next_attempt >= MAX_CONNECT_ATTEMPTS {
+            entry.target_endpoint = None;
             entry.phase = PeerPhase::Dead {
                 reason: crate::transport::peer::DeadReason::MaxRetries,
                 at: now,
@@ -804,6 +825,7 @@ impl Registry {
                 device_id: device_id.clone(),
                 tx_gen: 1,
                 role: crate::transport::peer::ConnectRole::Peripheral,
+                target_endpoint: entry.target_endpoint,
                 path: crate::transport::peer::ConnectPath::Gatt,
                 l2cap_channel: None,
             });
@@ -833,6 +855,7 @@ impl Registry {
                 device_id: device_id.clone(),
                 tx_gen,
                 role,
+                target_endpoint: entry.target_endpoint,
                 path: crate::transport::peer::ConnectPath::Gatt,
                 l2cap_channel: None,
             });
@@ -936,6 +959,7 @@ impl Registry {
             device_id: device_id.clone(),
             tx_gen: entry.tx_gen,
             role,
+            target_endpoint: entry.target_endpoint,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
@@ -972,6 +996,7 @@ impl Registry {
             device_id,
             tx_gen: entry.tx_gen,
             role: crate::transport::peer::ConnectRole::Peripheral,
+            target_endpoint: entry.target_endpoint,
             path: crate::transport::peer::ConnectPath::Gatt,
             l2cap_channel: None,
         });
@@ -988,6 +1013,43 @@ impl Registry {
             return;
         };
         let reason = crate::transport::peer::DisconnectReason::from(cause);
+        // A DeviceDisconnected for a peer we were in the middle of
+        // dialing IS the connect failure — there is no live pipe to
+        // drain. Historically this arm raced with `ConnectFailed`
+        // from the driver: central-event-pump reached the registry
+        // first, `drain_to_draining` moved us to `Draining`, and by
+        // the time `ConnectFailed` fired the phase no longer matched
+        // `Connecting`, so retry state was never set. Peer then sat
+        // 5s in Draining → Dead → GC, never retried. Fold this case
+        // into the connect-failure retry path so Android GATT 133
+        // (and similar) can back off + retry correctly.
+        if let PeerPhase::Connecting { attempt, .. } = entry.phase {
+            let next_attempt = attempt + 1;
+            entry.consecutive_failures += 1;
+            entry.pending_sends.clear();
+            actions.push(PeerAction::EmitMetric(format!("connect_failed:{reason:?}")));
+            if next_attempt >= MAX_CONNECT_ATTEMPTS {
+                entry.target_endpoint = None;
+                entry.phase = PeerPhase::Dead {
+                    reason: crate::transport::peer::DeadReason::MaxRetries,
+                    at: now,
+                };
+                if let Some(prefix) = entry.prefix {
+                    actions.push(PeerAction::ForgetPeerStore { prefix });
+                }
+                self.prune_verified_prefixes();
+            } else {
+                entry.phase = PeerPhase::Reconnecting {
+                    attempt: next_attempt,
+                    next_at: now + reconnect_backoff(next_attempt),
+                    reason: reason.clone(),
+                };
+            }
+            if matches!(reason, crate::transport::peer::DisconnectReason::Gatt133) {
+                actions.push(PeerAction::Refresh { device_id });
+            }
+            return;
+        }
         let channel = match &entry.phase {
             PeerPhase::Connected { channel, .. } | PeerPhase::Handshaking { channel, .. } => {
                 Some(channel.clone())
@@ -1126,12 +1188,14 @@ impl Registry {
                     // Android MAC randomization on peer restart) or by
                     // iroh issuing a new SendDatagram, not by the
                     // registry's own retry loop.
+                    entry.target_endpoint = None;
                     entry.phase = PeerPhase::Dead {
                         reason: crate::transport::peer::DeadReason::Forgotten,
                         at: tick_now,
                     };
                 }
                 TickAction::RestoringToDead => {
+                    entry.target_endpoint = None;
                     entry.phase = PeerPhase::Dead {
                         reason: crate::transport::peer::DeadReason::Forgotten,
                         at: tick_now,
@@ -1214,6 +1278,7 @@ impl Registry {
             });
         }
         entry.rx_backlog.clear();
+        entry.target_endpoint = None;
         entry.phase = PeerPhase::Dead {
             reason: crate::transport::peer::DeadReason::Forgotten,
             at: now,
@@ -1303,6 +1368,7 @@ impl Registry {
             swap_tx,
             last_rx_at,
         });
+        entry.target_endpoint = None;
     }
 
     fn handle_open_l2cap_succeeded(
@@ -1340,6 +1406,7 @@ impl Registry {
                     device_id: device_id.clone(),
                     tx_gen,
                     role,
+                    target_endpoint: entry.target_endpoint,
                     path: crate::transport::peer::ConnectPath::L2cap,
                     l2cap_channel: entry.l2cap_channel.take(),
                 });
@@ -1419,6 +1486,7 @@ impl Registry {
                     device_id: device_id.clone(),
                     tx_gen,
                     role,
+                    target_endpoint: entry.target_endpoint,
                     path: crate::transport::peer::ConnectPath::Gatt,
                     l2cap_channel: None,
                 });
@@ -1441,13 +1509,16 @@ impl Registry {
 
     fn handle_l2cap_handover_timeout(
         &mut self,
-        actions: &mut Vec<PeerAction>,
+        _actions: &mut Vec<PeerAction>,
         device_id: DeviceId,
     ) {
+        // Both-paths-alive model: when the pipe supervisor evicts a
+        // wedged L2CAP worker, GATT is still alive underneath. We
+        // just flip the telemetry/policy flag here — no
+        // `RevertToGattPipe` action needed, because the pipe never
+        // left GATT in the first place.
         if let Some(entry) = self.peers.get_mut(&device_id) {
             entry.l2cap_upgrade_failed = true;
-            let role = entry.role;
-            let tx_gen = entry.tx_gen;
             if let PeerPhase::Connected {
                 channel, upgrading, ..
             } = &mut entry.phase
@@ -1456,13 +1527,8 @@ impl Registry {
                 *upgrading = false;
                 tracing::warn!(
                     device = %device_id,
-                    "L2CAP pipe handover timed out; reverting to GATT for this connection"
+                    "L2CAP path evicted from pipe; continuing on GATT (both-paths-alive)"
                 );
-                actions.push(PeerAction::RevertToGattPipe {
-                    device_id,
-                    tx_gen,
-                    role,
-                });
             }
         }
     }
@@ -1495,6 +1561,7 @@ impl Registry {
                     device_id: device_id.clone(),
                     tx_gen: 1,
                     role: crate::transport::peer::ConnectRole::Peripheral,
+                    target_endpoint: inserted.target_endpoint,
                     path: crate::transport::peer::ConnectPath::L2cap,
                     l2cap_channel: inserted.l2cap_channel.take(),
                 });
@@ -1573,6 +1640,7 @@ impl Registry {
                         device_id: device_id.clone(),
                         tx_gen,
                         role,
+                        target_endpoint: entry.target_endpoint,
                         path: crate::transport::peer::ConnectPath::L2cap,
                         l2cap_channel: entry.l2cap_channel.take(),
                     });
@@ -1604,6 +1672,7 @@ impl Registry {
             crate::transport::peer::DisconnectReason::ProtocolMismatch,
         );
         actions.extend(broken_pipe_acks);
+        entry.target_endpoint = None;
         entry.phase = PeerPhase::Dead {
             reason: crate::transport::peer::DeadReason::ProtocolMismatch { got, want },
             at: now,
@@ -1687,7 +1756,7 @@ impl Registry {
         driver: Driver<I>,
         snapshots: Arc<ArcSwap<SnapshotMaps>>,
         inbox_capacity_wakers: Arc<parking_lot::Mutex<Vec<Waker>>>,
-        routing: Arc<crate::transport::routing::TransportRouting>,
+        routing: Arc<crate::transport::routing::Routing>,
     ) {
         while let Some(cmd) = rx.recv().await {
             // Wake BleSender::poll_send callers waiting on backpressure — we
@@ -1702,17 +1771,34 @@ impl Registry {
                 PeerCommand::VerifiedEndpoint { endpoint_id, token } => {
                     let mut actions = Vec::new();
                     let now = std::time::Instant::now();
-                    let exact_device_id = token.and_then(|token| routing.device_for_token(token));
+                    // The token (when present) is a StableConnId minted
+                    // by routing — resolve it to the pipe's DeviceId
+                    // so the handler stamps the exact live connection
+                    // with the verified identity (peripheral-role case:
+                    // scan may have seen a different MAC for this peer,
+                    // but the handshake landed on the inbound DeviceId).
+                    // Also refresh scan_hint so a later resolve for this
+                    // endpoint prefers the now-authoritative device.
+                    let exact_device_id = token.and_then(|t| {
+                        let stable = crate::transport::routing::StableConnId::from_raw(t);
+                        routing.device_for_pipe(stable)
+                    });
                     if let Some(device_id) = exact_device_id.as_ref() {
                         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
-                        let previous = match routing.note_discovery(prefix, device_id.clone()) {
-                            crate::transport::routing::DiscoveryUpdate::Replaced { previous } => {
-                                Some(previous)
-                            }
-                            _ => None,
-                        };
-                        if let Some(previous) = previous.as_ref() {
-                            routing.forget_device(previous);
+                        // A verified endpoint is the authoritative
+                        // binding for this prefix; override any stale
+                        // scan_hint mapping (scan may have seen the
+                        // peer under a different MAC earlier in this
+                        // session). If the previous mapping pointed
+                        // at a different DeviceId, also forget its
+                        // registry entry so we don't dial a ghost.
+                        if let crate::transport::routing::ScanHintUpdate::Replaced { previous } =
+                            routing.note_scan_hint(prefix, device_id.clone())
+                        {
+                            let forget_actions = self.handle(PeerCommand::Forget {
+                                device_id: previous,
+                            });
+                            actions.extend(forget_actions);
                         }
                     }
                     self.handle_verified_endpoint(&mut actions, now, endpoint_id, exact_device_id);
@@ -1724,27 +1810,10 @@ impl Registry {
                 driver.execute(action).await;
             }
             self.publish_snapshot(&snapshots);
-            routing.publish_active_prefixes(self.active_prefix_bindings());
             if shutdown {
                 break;
             }
         }
-    }
-
-    /// Current set of prefix→DeviceId bindings for peers that hold a live
-    /// connection. Used by `run` to tell routing which prefixes must be
-    /// protected from scan-driven eviction.
-    fn active_prefix_bindings(&self) -> HashMap<crate::transport::peer::KeyPrefix, DeviceId> {
-        self.peers
-            .iter()
-            .filter_map(|(did, e)| {
-                if matches!(e.phase, PeerPhase::Connected { .. }) {
-                    e.prefix.map(|p| (p, did.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect()
     }
 }
 
@@ -1831,6 +1900,7 @@ pub struct RegistryHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn noop_waker() -> std::task::Waker {
         use std::task::{RawWaker, RawWakerVTable, Waker};
@@ -1840,6 +1910,426 @@ mod tests {
         }
         static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, no_op, no_op, no_op);
         unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) }
+    }
+
+    fn endpoint_from_seed(seed: u8) -> iroh_base::EndpointId {
+        iroh_base::SecretKey::from_bytes(&[seed; 32]).public()
+    }
+
+    fn assert_start_data_pipe_target(
+        actions: &[PeerAction],
+        device_id: &DeviceId,
+        endpoint: iroh_base::EndpointId,
+    ) {
+        assert!(actions.iter().any(|action| {
+            matches!(
+                action,
+                PeerAction::StartDataPipe {
+                    device_id: d,
+                    target_endpoint: Some(target),
+                    ..
+                } if d == device_id && *target == endpoint
+            )
+        }));
+    }
+
+    fn mark_data_pipe_ready(reg: &mut Registry, device_id: &DeviceId) {
+        let (outbound_tx, _outbound_rx) = tokio::sync::mpsc::channel(1);
+        let (inbound_tx, _inbound_rx) = tokio::sync::mpsc::channel(1);
+        let (swap_tx, _swap_rx) = tokio::sync::mpsc::channel(1);
+        let tx_gen = reg.peer(device_id).unwrap().tx_gen;
+        let _ = reg.handle(PeerCommand::DataPipeReady {
+            device_id: device_id.clone(),
+            tx_gen,
+            outbound_tx,
+            inbound_tx,
+            swap_tx,
+            last_rx_at: crate::transport::peer::LivenessClock::new(),
+        });
+    }
+
+    #[derive(Debug, Clone)]
+    enum TargetLifecycleCommand {
+        Advertise { endpoint_seed: u8 },
+        SendReserved { endpoint_seed: u8 },
+        ConnectSucceeded,
+        ConnectFailed,
+        CentralDisconnectedTimeout,
+        AdapterOff,
+        AdapterOn,
+        Tick,
+        DataPipeReady,
+        Forget,
+    }
+
+    fn target_lifecycle_command_strategy() -> impl Strategy<Value = TargetLifecycleCommand> {
+        prop_oneof![
+            any::<u8>()
+                .prop_map(|endpoint_seed| TargetLifecycleCommand::Advertise { endpoint_seed }),
+            any::<u8>()
+                .prop_map(|endpoint_seed| TargetLifecycleCommand::SendReserved { endpoint_seed }),
+            Just(TargetLifecycleCommand::ConnectSucceeded),
+            Just(TargetLifecycleCommand::ConnectFailed),
+            Just(TargetLifecycleCommand::CentralDisconnectedTimeout),
+            Just(TargetLifecycleCommand::AdapterOff),
+            Just(TargetLifecycleCommand::AdapterOn),
+            Just(TargetLifecycleCommand::Tick),
+            Just(TargetLifecycleCommand::DataPipeReady),
+            Just(TargetLifecycleCommand::Forget),
+        ]
+    }
+
+    #[derive(Debug, Clone)]
+    enum MultiPeerCommand {
+        Advertise { device_idx: u8, endpoint_seed: u8 },
+        SendReserved { device_idx: u8, endpoint_seed: u8 },
+        ConnectSucceeded { device_idx: u8 },
+        ConnectFailed { device_idx: u8 },
+        CentralDisconnectedTimeout { device_idx: u8 },
+        VerifiedEndpoint { endpoint_seed: u8 },
+        DataPipeReady { device_idx: u8 },
+        Forget { device_idx: u8 },
+    }
+
+    fn multi_peer_command_strategy() -> impl Strategy<Value = MultiPeerCommand> {
+        prop_oneof![
+            (0u8..3, any::<u8>()).prop_map(|(device_idx, endpoint_seed)| {
+                MultiPeerCommand::Advertise {
+                    device_idx,
+                    endpoint_seed,
+                }
+            }),
+            (0u8..3, any::<u8>()).prop_map(|(device_idx, endpoint_seed)| {
+                MultiPeerCommand::SendReserved {
+                    device_idx,
+                    endpoint_seed,
+                }
+            }),
+            (0u8..3).prop_map(|device_idx| MultiPeerCommand::ConnectSucceeded { device_idx }),
+            (0u8..3).prop_map(|device_idx| MultiPeerCommand::ConnectFailed { device_idx }),
+            (0u8..3)
+                .prop_map(|device_idx| MultiPeerCommand::CentralDisconnectedTimeout { device_idx }),
+            any::<u8>()
+                .prop_map(|endpoint_seed| MultiPeerCommand::VerifiedEndpoint { endpoint_seed }),
+            (0u8..3).prop_map(|device_idx| MultiPeerCommand::DataPipeReady { device_idx }),
+            (0u8..3).prop_map(|device_idx| MultiPeerCommand::Forget { device_idx }),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn target_endpoint_and_tx_gen_invariants_hold_across_random_lifecycle_sequences(
+            commands in prop::collection::vec(target_lifecycle_command_strategy(), 1..80)
+        ) {
+            let mut reg = Registry::new_for_test();
+            let device_id = blew::DeviceId::from("prop-target-peer");
+            let mut expected_target = None;
+            let mut last_seen_tx_gen = None;
+
+            for command in commands {
+                let phase_before = reg.peer(&device_id).map(|entry| &entry.phase);
+                let current_tx_gen = reg.peer(&device_id).map_or(0, |entry| entry.tx_gen);
+
+                let actions = match command {
+                    TargetLifecycleCommand::Advertise { endpoint_seed } => {
+                        let endpoint = iroh_base::SecretKey::from_bytes(&[endpoint_seed; 32]).public();
+                        reg.handle(PeerCommand::Advertised {
+                            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+                            device: blew::BleDevice {
+                                id: device_id.clone(),
+                                name: None,
+                                rssi: None,
+                                services: vec![],
+                            },
+                            rssi: None,
+                        })
+                    }
+                    TargetLifecycleCommand::SendReserved { endpoint_seed } => {
+                        let endpoint = iroh_base::SecretKey::from_bytes(&[endpoint_seed; 32]).public();
+                        if !matches!(
+                            phase_before,
+                            Some(PeerPhase::Connected { .. })
+                                | Some(PeerPhase::Draining { .. })
+                                | Some(PeerPhase::Dead { .. })
+                        ) {
+                            expected_target = Some(endpoint);
+                        }
+                        reg.handle(PeerCommand::SendDatagram {
+                            device_id: device_id.clone(),
+                            target_endpoint: Some(endpoint),
+                            tx_gen: current_tx_gen,
+                            datagram: bytes::Bytes::from_static(b"hello"),
+                            waker: noop_waker(),
+                        })
+                    }
+                    TargetLifecycleCommand::ConnectSucceeded => reg.handle(PeerCommand::ConnectSucceeded {
+                        device_id: device_id.clone(),
+                        channel: crate::transport::peer::ChannelHandle {
+                            id: 1,
+                            path: crate::transport::peer::ConnectPath::Gatt,
+                        },
+                    }),
+                    TargetLifecycleCommand::ConnectFailed => reg.handle(PeerCommand::ConnectFailed {
+                        device_id: device_id.clone(),
+                        error: "timeout".into(),
+                    }),
+                    TargetLifecycleCommand::CentralDisconnectedTimeout => reg.handle(
+                        PeerCommand::CentralDisconnected {
+                            device_id: device_id.clone(),
+                            cause: blew::DisconnectCause::Timeout,
+                        }
+                    ),
+                    TargetLifecycleCommand::AdapterOff => {
+                        reg.handle(PeerCommand::AdapterStateChanged { powered: false })
+                    }
+                    TargetLifecycleCommand::AdapterOn => {
+                        reg.handle(PeerCommand::AdapterStateChanged { powered: true })
+                    }
+                    TargetLifecycleCommand::Tick => reg.handle(PeerCommand::Tick(
+                        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                    )),
+                    TargetLifecycleCommand::DataPipeReady => {
+                        if matches!(phase_before, Some(PeerPhase::Connected { .. })) {
+                            expected_target = None;
+                            mark_data_pipe_ready(&mut reg, &device_id);
+                        }
+                        Vec::new()
+                    }
+                    TargetLifecycleCommand::Forget => {
+                        expected_target = None;
+                        reg.handle(PeerCommand::Forget {
+                            device_id: device_id.clone(),
+                        })
+                    }
+                };
+
+                for action in &actions {
+                    if let PeerAction::StartDataPipe {
+                        device_id: start_device,
+                        target_endpoint,
+                        ..
+                    } = action
+                        && *start_device == device_id
+                    {
+                        prop_assert_eq!(*target_endpoint, expected_target);
+                    }
+                }
+
+                match reg.peer(&device_id) {
+                    Some(entry) => {
+                        if matches!(entry.phase, PeerPhase::Dead { .. }) {
+                            expected_target = None;
+                        }
+                        prop_assert_eq!(entry.target_endpoint, expected_target);
+                        if let Some(prev_tx_gen) = last_seen_tx_gen {
+                            prop_assert!(
+                                entry.tx_gen >= prev_tx_gen,
+                                "tx_gen must be monotonic across lifecycle transitions"
+                            );
+                        }
+                        last_seen_tx_gen = Some(entry.tx_gen);
+                        if let PeerPhase::Connected { tx_gen, .. } = &entry.phase {
+                            prop_assert_eq!(
+                                entry.tx_gen, *tx_gen,
+                                "entry.tx_gen must match the live connected generation"
+                            );
+                        }
+                        if matches!(
+                            entry.phase,
+                            PeerPhase::Dead {
+                                reason: crate::transport::peer::DeadReason::Forgotten,
+                                ..
+                            }
+                        ) {
+                            prop_assert_eq!(entry.target_endpoint, None);
+                        }
+                    }
+                    None => {
+                        expected_target = None;
+                        last_seen_tx_gen = None;
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn verified_prefixes_keep_one_connected_winner_and_target_endpoints_do_not_leak_across_peers(
+            commands in prop::collection::vec(multi_peer_command_strategy(), 1..120)
+        ) {
+            let mut reg = Registry::new_for_test();
+            let device_ids = [
+                blew::DeviceId::from("prop-multi-peer-0"),
+                blew::DeviceId::from("prop-multi-peer-1"),
+                blew::DeviceId::from("prop-multi-peer-2"),
+            ];
+            let mut expected_targets = std::collections::HashMap::from([
+                (device_ids[0].clone(), None),
+                (device_ids[1].clone(), None),
+                (device_ids[2].clone(), None),
+            ]);
+            let mut last_seen_tx_gens: std::collections::HashMap<blew::DeviceId, u64> =
+                std::collections::HashMap::new();
+            let mut verified_endpoints = std::collections::HashSet::new();
+
+            for command in commands {
+                let (_device_id, phase_before, current_tx_gen) = match command {
+                    MultiPeerCommand::Advertise { device_idx, .. }
+                    | MultiPeerCommand::SendReserved { device_idx, .. }
+                    | MultiPeerCommand::ConnectSucceeded { device_idx }
+                    | MultiPeerCommand::ConnectFailed { device_idx }
+                    | MultiPeerCommand::CentralDisconnectedTimeout { device_idx }
+                    | MultiPeerCommand::DataPipeReady { device_idx }
+                    | MultiPeerCommand::Forget { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        let phase_before = reg.peer(&device_id).map(|entry| PhaseKind::from(&entry.phase));
+                        let current_tx_gen = reg.peer(&device_id).map_or(0, |entry| entry.tx_gen);
+                        (Some(device_id), phase_before, current_tx_gen)
+                    }
+                    MultiPeerCommand::VerifiedEndpoint { .. } => (None, None, 0),
+                };
+
+                let actions = match command {
+                    MultiPeerCommand::Advertise { device_idx, endpoint_seed } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        let endpoint = endpoint_from_seed(endpoint_seed);
+                        reg.handle(PeerCommand::Advertised {
+                            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+                            device: blew::BleDevice {
+                                id: device_id,
+                                name: None,
+                                rssi: None,
+                                services: vec![],
+                            },
+                            rssi: None,
+                        })
+                    }
+                    MultiPeerCommand::SendReserved { device_idx, endpoint_seed } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        let endpoint = endpoint_from_seed(endpoint_seed);
+                        if !matches!(
+                            phase_before,
+                            Some(PhaseKind::Connected) | Some(PhaseKind::Draining) | Some(PhaseKind::Dead)
+                        ) {
+                            expected_targets.insert(device_id.clone(), Some(endpoint));
+                        }
+                        reg.handle(PeerCommand::SendDatagram {
+                            device_id,
+                            target_endpoint: Some(endpoint),
+                            tx_gen: current_tx_gen,
+                            datagram: bytes::Bytes::from_static(b"hello"),
+                            waker: noop_waker(),
+                        })
+                    }
+                    MultiPeerCommand::ConnectSucceeded { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        reg.handle(PeerCommand::ConnectSucceeded {
+                            device_id,
+                            channel: crate::transport::peer::ChannelHandle {
+                                id: u64::from(device_idx) + 1,
+                                path: crate::transport::peer::ConnectPath::Gatt,
+                            },
+                        })
+                    }
+                    MultiPeerCommand::ConnectFailed { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        reg.handle(PeerCommand::ConnectFailed {
+                            device_id,
+                            error: "timeout".into(),
+                        })
+                    }
+                    MultiPeerCommand::CentralDisconnectedTimeout { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        reg.handle(PeerCommand::CentralDisconnected {
+                            device_id,
+                            cause: blew::DisconnectCause::Timeout,
+                        })
+                    }
+                    MultiPeerCommand::VerifiedEndpoint { endpoint_seed } => {
+                        let endpoint = endpoint_from_seed(endpoint_seed);
+                        verified_endpoints.insert(endpoint);
+                        reg.handle(PeerCommand::VerifiedEndpoint {
+                            endpoint_id: endpoint,
+                            token: None,
+                        })
+                    }
+                    MultiPeerCommand::DataPipeReady { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        if matches!(phase_before, Some(PhaseKind::Connected)) {
+                            expected_targets.insert(device_id.clone(), None);
+                            mark_data_pipe_ready(&mut reg, &device_id);
+                        }
+                        Vec::new()
+                    }
+                    MultiPeerCommand::Forget { device_idx } => {
+                        let device_id = device_ids[usize::from(device_idx)].clone();
+                        expected_targets.insert(device_id.clone(), None);
+                        reg.handle(PeerCommand::Forget { device_id })
+                    }
+                };
+
+                for action in &actions {
+                    if let PeerAction::StartDataPipe {
+                        device_id: start_device,
+                        target_endpoint,
+                        ..
+                    } = action
+                    {
+                        prop_assert_eq!(
+                            *target_endpoint,
+                            expected_targets.get(start_device).copied().unwrap_or(None),
+                            "StartDataPipe target_endpoint must stay scoped to its own peer"
+                        );
+                    }
+                }
+
+                for device_id in &device_ids {
+                    match reg.peer(device_id) {
+                        Some(entry) => {
+                            if matches!(entry.phase, PeerPhase::Dead { .. }) {
+                                expected_targets.insert(device_id.clone(), None);
+                            }
+                            prop_assert_eq!(
+                                entry.target_endpoint,
+                                expected_targets.get(device_id).copied().unwrap_or(None),
+                                "target_endpoint must remain isolated per peer"
+                            );
+                            if let Some(prev_tx_gen) = last_seen_tx_gens.get(device_id) {
+                                prop_assert!(
+                                    entry.tx_gen >= *prev_tx_gen,
+                                    "tx_gen must stay monotonic for each peer"
+                                );
+                            }
+                            last_seen_tx_gens.insert(device_id.clone(), entry.tx_gen);
+                            if let PeerPhase::Connected { tx_gen, .. } = &entry.phase {
+                                prop_assert_eq!(entry.tx_gen, *tx_gen);
+                            }
+                        }
+                        None => {
+                            expected_targets.insert(device_id.clone(), None);
+                            last_seen_tx_gens.remove(device_id);
+                        }
+                    }
+                }
+
+                for endpoint in &verified_endpoints {
+                    let prefix = crate::transport::routing::prefix_from_endpoint(endpoint);
+                    let connected_count = reg
+                        .peers
+                        .values()
+                        .filter(|entry| {
+                            entry.prefix == Some(prefix)
+                                && matches!(entry.phase, PeerPhase::Connected { .. })
+                        })
+                        .count();
+                    prop_assert!(
+                        connected_count <= 1,
+                        "verified prefix {prefix:?} must not retain multiple connected peers"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2173,6 +2663,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 3,
             datagram: bytes::Bytes::from_static(b"hi"),
             waker: noop_waker(),
@@ -2201,6 +2692,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 4,
             datagram: bytes::Bytes::from_static(b"stale"),
             waker: noop_waker(),
@@ -2285,6 +2777,123 @@ mod tests {
     }
 
     #[test]
+    fn gatt133_during_connecting_schedules_retry_not_draining() {
+        // Regression: the hardware-observed Phone-B failure. When
+        // blew's central event pump fires `DeviceDisconnected`
+        // BEFORE the driver's `ConnectFailed`, the former used to
+        // sweep the Connecting peer into Draining via
+        // `drain_to_draining`, after which the later-arriving
+        // `ConnectFailed` silently returned (phase no longer
+        // Connecting). Peer then sat 5s in Draining → Dead → GC,
+        // never retried. The fix folds the Connecting-phase
+        // disconnect into the retry path here.
+        use crate::transport::peer::ConnectPath;
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-gatt133-dialing");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::Gatt133,
+        });
+
+        // Phase should be Reconnecting (not Draining), with attempt
+        // incremented and a future next_at scheduled.
+        let entry = reg.peer(&device_id).expect("entry still present");
+        match &entry.phase {
+            PeerPhase::Reconnecting {
+                attempt, next_at, ..
+            } => {
+                assert_eq!(*attempt, 1, "attempt must be bumped");
+                assert!(
+                    *next_at > std::time::Instant::now(),
+                    "next_at must be in the future so tick retries with backoff"
+                );
+            }
+            other => panic!("expected Reconnecting, got {other:?}"),
+        }
+        assert_eq!(entry.consecutive_failures, 1);
+
+        // Gatt133 still fires Refresh so the cache gets cleared
+        // before the next attempt.
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::Refresh { .. })),
+            "Gatt133 must fire Refresh on Connecting→retry path too; got {actions:?}"
+        );
+        // But no CloseChannel — there was no channel to close.
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::CloseChannel { .. })),
+            "no CloseChannel when there was no live pipe; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn connect_failed_after_device_disconnect_is_harmless_noop() {
+        // The companion race: after the fast-path DeviceDisconnected
+        // has already moved the peer to Reconnecting, the slow-path
+        // ConnectFailed arrives. It must NOT double-count the
+        // failure or knock the phase back.
+        use crate::transport::peer::ConnectPath;
+
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-race");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: std::time::Instant::now(),
+                path: ConnectPath::Gatt,
+            };
+            e
+        });
+
+        // Fast path first.
+        reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::Gatt133,
+        });
+        let reconnecting_at_after_fast = match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Reconnecting { next_at, .. } => *next_at,
+            other => panic!("expected Reconnecting, got {other:?}"),
+        };
+        assert_eq!(reg.peer(&device_id).unwrap().consecutive_failures, 1);
+
+        // Slow path arrives after the fast one.
+        let actions = reg.handle(PeerCommand::ConnectFailed {
+            device_id: device_id.clone(),
+            error: "gatt 133".into(),
+        });
+        assert!(actions.is_empty(), "ConnectFailed must be a no-op");
+        assert_eq!(
+            reg.peer(&device_id).unwrap().consecutive_failures,
+            1,
+            "failures must NOT double-count"
+        );
+        match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Reconnecting { next_at, .. } => {
+                assert_eq!(
+                    *next_at, reconnecting_at_after_fast,
+                    "next_at must be unchanged"
+                );
+            }
+            other => panic!("phase regressed; got {other:?}"),
+        }
+    }
+
+    #[test]
     fn link_loss_does_not_emit_refresh() {
         let mut reg = Registry::new_for_test();
         let device_id = blew::DeviceId::from("dev-12");
@@ -2363,6 +2972,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: bytes::Bytes::from_static(b"hello"),
             waker: noop_waker(),
@@ -2376,6 +2986,271 @@ mod tests {
             PeerPhase::Connecting { attempt: 0, .. }
         ));
         assert_eq!(reg.peer(&device_id).unwrap().pending_sends.len(), 1);
+    }
+
+    #[test]
+    fn outbound_target_endpoint_flows_into_start_data_pipe_and_clears_on_ready() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x5Au8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        assert!(matches!(
+            actions.as_slice(),
+            [PeerAction::StartConnect { .. }]
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 1,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert_start_data_pipe_target(&actions, &device_id, endpoint);
+
+        mark_data_pipe_ready(&mut reg, &device_id);
+        assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
+    }
+
+    #[test]
+    fn target_endpoint_survives_connect_failed_retry_until_pipe_ready() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target-connect-failed");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x61u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        assert!(matches!(
+            actions.as_slice(),
+            [PeerAction::StartConnect { .. }]
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let _ = reg.handle(PeerCommand::ConnectFailed {
+            device_id: device_id.clone(),
+            error: "timeout".into(),
+        });
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Reconnecting { attempt: 1, .. }
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let actions = reg.handle(PeerCommand::Tick(
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        assert!(matches!(
+            actions.as_slice(),
+            [PeerAction::StartConnect { device_id: d, attempt: 1 }] if d == &device_id
+        ));
+
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 2,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert_start_data_pipe_target(&actions, &device_id, endpoint);
+
+        mark_data_pipe_ready(&mut reg, &device_id);
+        assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
+    }
+
+    #[test]
+    fn target_endpoint_survives_connecting_disconnect_retry_until_pipe_ready() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target-disconnect");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x62u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let _ = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        let actions = reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::Timeout,
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|action| matches!(action, PeerAction::EmitMetric(metric) if metric == "connect_failed:Timeout"))
+        );
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Reconnecting { attempt: 1, .. }
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let _ = reg.handle(PeerCommand::Tick(
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 3,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert_start_data_pipe_target(&actions, &device_id, endpoint);
+
+        mark_data_pipe_ready(&mut reg, &device_id);
+        assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
+    }
+
+    #[test]
+    fn target_endpoint_survives_adapter_cycle_until_pipe_ready() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target-adapter");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x63u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+
+        let _ = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        let _ = reg.handle(PeerCommand::AdapterStateChanged { powered: false });
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Restoring { .. }
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let _ = reg.handle(PeerCommand::AdapterStateChanged { powered: true });
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Reconnecting { attempt: 0, .. }
+        ));
+        assert_eq!(
+            reg.peer(&device_id).unwrap().target_endpoint,
+            Some(endpoint)
+        );
+
+        let _ = reg.handle(PeerCommand::Tick(
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 4,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert_start_data_pipe_target(&actions, &device_id, endpoint);
+
+        mark_data_pipe_ready(&mut reg, &device_id);
+        assert_eq!(reg.peer(&device_id).unwrap().target_endpoint, None);
+    }
+
+    #[test]
+    fn forget_clears_target_endpoint() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-target-forget");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x64u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        });
+        let _ = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+
+        let _ = reg.handle(PeerCommand::Forget {
+            device_id: device_id.clone(),
+        });
+
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(matches!(
+            entry.phase,
+            PeerPhase::Dead {
+                reason: crate::transport::peer::DeadReason::Forgotten,
+                ..
+            }
+        ));
+        assert_eq!(entry.target_endpoint, None);
     }
 
     #[test]
@@ -3063,6 +3938,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 9,
             datagram: bytes::Bytes::from_static(b"fast"),
             waker: noop_waker(),
@@ -3112,6 +3988,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 8,
             datagram: bytes::Bytes::from_static(b"fallback"),
             waker: noop_waker(),
@@ -3164,6 +4041,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 7,
             datagram: bytes::Bytes::from_static(b"closed"),
             waker: noop_waker(),
@@ -3449,59 +4327,6 @@ mod tests {
             "peripheral entry must be stamped so dedup can collapse it"
         );
         assert!(matches!(entry.phase, PeerPhase::Connected { .. }));
-    }
-
-    #[test]
-    fn active_prefix_bindings_include_only_connected_peers_with_prefix() {
-        use crate::transport::peer::{ChannelHandle, ConnectPath, KEY_PREFIX_LEN, PeerPhase};
-
-        let mut reg = Registry::new_for_test();
-        let now = std::time::Instant::now();
-
-        // Peer A: Connected with prefix → must appear.
-        let a_prefix: [u8; KEY_PREFIX_LEN] = [1u8; KEY_PREFIX_LEN];
-        let a_dev = DeviceId::from("A");
-        let mut a_entry = PeerEntry::new(a_dev.clone());
-        a_entry.prefix = Some(a_prefix);
-        a_entry.phase = PeerPhase::Connected {
-            since: now,
-            channel: ChannelHandle {
-                id: 1,
-                path: ConnectPath::Gatt,
-            },
-            tx_gen: 1,
-            upgrading: false,
-        };
-        reg.peers.insert(a_dev.clone(), a_entry);
-
-        // Peer B: Connecting (not yet Connected) → must NOT appear.
-        let b_dev = DeviceId::from("B");
-        let mut b_entry = PeerEntry::new(b_dev.clone());
-        b_entry.prefix = Some([2u8; KEY_PREFIX_LEN]);
-        b_entry.phase = PeerPhase::Connecting {
-            attempt: 0,
-            started: now,
-            path: ConnectPath::Gatt,
-        };
-        reg.peers.insert(b_dev, b_entry);
-
-        // Peer C: Connected but prefix=None (inbound-before-scan) → must NOT appear.
-        let c_dev = DeviceId::from("C");
-        let mut c_entry = PeerEntry::new(c_dev.clone());
-        c_entry.phase = PeerPhase::Connected {
-            since: now,
-            channel: ChannelHandle {
-                id: 2,
-                path: ConnectPath::Gatt,
-            },
-            tx_gen: 1,
-            upgrading: false,
-        };
-        reg.peers.insert(c_dev, c_entry);
-
-        let bindings = reg.active_prefix_bindings();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings.get(&a_prefix), Some(&a_dev));
     }
 
     #[tokio::test]
@@ -4184,6 +5009,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::SendDatagram {
             device_id: device_id.clone(),
+            target_endpoint: None,
             tx_gen: 5,
             datagram: bytes::Bytes::from_static(b"new"),
             waker: noop_waker(),
@@ -4791,7 +5617,7 @@ mod tests {
         use crate::transport::driver::Driver;
         use crate::transport::interface::BleInterface;
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
-        use crate::transport::routing::{DiscoveryUpdate, TransportRouting, prefix_from_endpoint};
+        use crate::transport::routing::{Direction, Routing, StableConnId};
         use crate::transport::store::InMemoryPeerStore;
 
         struct DummyIface;
@@ -4854,16 +5680,19 @@ mod tests {
 
         let my_ep = iroh_base::SecretKey::from_bytes(&[0x11u8; 32]).public();
         let peer_ep = iroh_base::SecretKey::from_bytes(&[0x22u8; 32]).public();
-        let peer_prefix = prefix_from_endpoint(&peer_ep);
+        let peer_prefix = crate::transport::routing::prefix_from_endpoint(&peer_ep);
         let live_dev = DeviceId::from("live-peripheral");
         let stale_scan_dev = DeviceId::from("stale-scan");
 
-        let routing = Arc::new(TransportRouting::new());
-        assert_eq!(
-            routing.note_discovery(peer_prefix, stale_scan_dev.clone()),
-            DiscoveryUpdate::New
-        );
-        let token = routing.mint_token_for_device(&live_dev);
+        // Simulate: scan saw the peer at `stale_scan_dev`, then a
+        // peripheral-role inbound connection landed at `live_dev`.
+        // The pipe is registered in routing against `live_dev`,
+        // and the VerifiedEndpoint command carries that pipe's
+        // stable_id so the registry can resolve token → DeviceId.
+        let routing = Arc::new(Routing::new());
+        routing.note_scan_hint(peer_prefix, stale_scan_dev.clone());
+        let stable_id = routing.register_pipe(live_dev.clone(), Direction::Inbound);
+        let token = stable_id.as_u64();
 
         let mut reg = Registry::new_for_test_with_endpoint(my_ep);
         reg.peers
@@ -4894,6 +5723,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
             Arc::new(InMemoryPeerStore::new()),
+            Arc::clone(&routing),
         );
 
         let snapshots_for_actor = Arc::clone(&snapshots);
@@ -4919,7 +5749,11 @@ mod tests {
             .unwrap();
         inbox_tx.send(PeerCommand::Shutdown).await.unwrap();
         actor.await.unwrap();
+        let _ = StableConnId::for_test(0); // keep import live
 
+        // VerifiedEndpoint's token resolved to `live_dev` via routing's
+        // pipe map, so the scan_hint gets updated to bind the prefix to
+        // the live peripheral-role DeviceId — no more stale scan.
         assert_eq!(
             routing.device_for_endpoint(&peer_ep),
             Some(live_dev.clone()),
@@ -5880,7 +6714,16 @@ mod tests {
     }
 
     #[test]
-    fn l2cap_handover_timeout_reverts_and_marks_failed() {
+    fn l2cap_handover_timeout_marks_failed_and_demotes_path_telemetry() {
+        // Both-paths-alive model: `L2capHandoverTimeout` arrives when
+        // the pipe supervisor evicted its wedged L2CAP worker. GATT
+        // was never torn down, so the registry's only job is
+        // bookkeeping — flip the `l2cap_upgrade_failed` policy flag so
+        // we stop re-proposing L2CAP to this peer for the rest of the
+        // session, and demote the `channel.path` telemetry to Gatt
+        // so the snapshot matches what the supervisor is actually
+        // running on. No pipe-lifecycle actions: the GATT pipe was
+        // never evicted, so there is nothing to respawn.
         use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole, PeerPhase};
 
         let my_ep = iroh_base::SecretKey::from_bytes(&[0xFFu8; 32]).public();
@@ -5904,15 +6747,11 @@ mod tests {
             device_id: dev.clone(),
         });
 
-        assert!(actions.iter().any(|a| matches!(
-            a,
-            PeerAction::RevertToGattPipe {
-                device_id,
-                role,
-                ..
-            }
-            if device_id == &dev && role == &ConnectRole::Central
-        )));
+        assert!(
+            actions.is_empty(),
+            "L2capHandoverTimeout is pure bookkeeping under both-paths-alive; \
+             got {actions:?}"
+        );
         let e = &reg.peers[&dev];
         assert!(e.l2cap_upgrade_failed);
         match &e.phase {

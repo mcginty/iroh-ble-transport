@@ -18,7 +18,6 @@ use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{KEY_PREFIX_LEN, KeyPrefix, PeerCommand},
     registry::{Registry, SnapshotMaps},
-    routing::TransportRouting,
     store::InMemoryPeerStore,
     test_util::MockFabric,
     transport::L2capPolicy,
@@ -71,6 +70,7 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
     let iface = fabric.add_node(device_id.clone(), inbox_tx.clone());
     let (retransmits, truncations, empty_frames) = zero_counters();
 
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
     let driver = Driver::new(
         iface,
         inbox_tx.clone(),
@@ -79,13 +79,15 @@ fn spawn_node(fabric: &MockFabric, device_id: DeviceId, policy: L2capPolicy) -> 
         truncations,
         empty_frames,
         Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
     );
     let registry = Registry::new_for_test_with_policy(policy);
     let snap = snapshots.clone();
-    let routing = Arc::new(TransportRouting::new());
     let wakers = Arc::new(Mutex::new(Vec::<Waker>::new()));
     tokio::spawn(async move {
-        registry.run(inbox_rx, driver, snap, wakers, routing).await;
+        registry
+            .run(inbox_rx, driver, snap, wakers, routing_local)
+            .await;
     });
 
     TestNode {
@@ -125,6 +127,7 @@ async fn triangle_send_fans_out_to_both_peers() {
     a.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: b.device_id.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: Bytes::from_static(b"to-b"),
             waker: waker.clone(),
@@ -134,6 +137,7 @@ async fn triangle_send_fans_out_to_both_peers() {
     a.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: c.device_id.clone(),
+            target_endpoint: None,
             tx_gen: 0,
             datagram: Bytes::from_static(b"to-c"),
             waker,
@@ -186,6 +190,7 @@ async fn symmetric_connect_converges_to_one_channel() {
             a.inbox_tx
                 .send(PeerCommand::SendDatagram {
                     device_id: b.device_id.clone(),
+                    target_endpoint: None,
                     tx_gen: 0,
                     datagram: Bytes::from_static(b"a-to-b"),
                     waker: waker.clone(),
@@ -205,6 +210,7 @@ async fn symmetric_connect_converges_to_one_channel() {
             b.inbox_tx
                 .send(PeerCommand::SendDatagram {
                     device_id: a.device_id.clone(),
+                    target_endpoint: None,
                     tx_gen: 0,
                     datagram: Bytes::from_static(b"b-to-a"),
                     waker: waker.clone(),
@@ -274,6 +280,7 @@ async fn one_peer_flapping_does_not_disturb_others() {
         a.inbox_tx
             .send(PeerCommand::SendDatagram {
                 device_id: peer.clone(),
+                target_endpoint: None,
                 tx_gen: 0,
                 datagram: Bytes::copy_from_slice(payload),
                 waker: waker.clone(),
@@ -319,6 +326,7 @@ async fn one_peer_flapping_does_not_disturb_others() {
     a.inbox_tx
         .send(PeerCommand::SendDatagram {
             device_id: c.device_id.clone(),
+            target_endpoint: None,
             tx_gen: tx_gen_c_before,
             datagram: Bytes::from_static(b"still-talking-to-c"),
             waker: waker.clone(),
@@ -386,6 +394,7 @@ async fn adapter_off_on_one_node_does_not_evict_others() {
         from_inbox
             .send(PeerCommand::SendDatagram {
                 device_id: peer.clone(),
+                target_endpoint: None,
                 tx_gen: 0,
                 datagram: Bytes::copy_from_slice(payload),
                 waker: waker.clone(),

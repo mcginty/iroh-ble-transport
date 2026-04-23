@@ -10,8 +10,8 @@ use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_ble_transport::transport::BleTransport;
 use iroh_ble_transport::{
-    BleDedupHook, BlePeerInfo, BlePeerPhase, BleTransportConfig, Central, ConnectPath,
-    InMemoryPeerStore, L2capPolicy, Peripheral,
+    BleDedupHook, BlePeerInfo, BlePeerPhase, BleTransportConfig, Central, CentralConfig,
+    ConnectPath, InMemoryPeerStore, L2capPolicy, Peripheral,
 };
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
@@ -87,24 +87,29 @@ fn ble_phase_str(phase: BlePeerPhase) -> &'static str {
 
 impl PeerState {
     fn ui_status(&self) -> &'static str {
-        match self.ble_phase {
-            Some(BlePeerPhase::Connected) => "connected",
-            Some(BlePeerPhase::Handshaking) => "handshaking",
-            Some(BlePeerPhase::Connecting) => "connecting",
-            Some(BlePeerPhase::Reconnecting | BlePeerPhase::Restoring) => "reconnecting",
-            Some(BlePeerPhase::PendingDial) => "pending_dial",
-            Some(BlePeerPhase::Discovered | BlePeerPhase::Unknown) => {
-                if matches!(self.gossip, Some(GossipStatus::Direct)) {
-                    "connected"
-                } else if matches!(self.gossip, Some(GossipStatus::InTopic)) {
-                    "in_topic"
-                } else {
-                    "nearby"
-                }
-            }
-            Some(BlePeerPhase::Draining) => "draining",
-            Some(BlePeerPhase::Dead) => "dead",
-            None => match self.gossip {
+        // "connected" must mean "messages will be delivered". BLE Connected
+        // alone is not enough — right after a peer restart there is a
+        // window where the BLE L2CAP pipe is healthy but iroh-gossip hasn't
+        // re-adopted the peer as a direct neighbor (the old QUIC connection
+        // is still aging out its idle-timeout, and gossip messages from
+        // send_message broadcast to zero neighbors and disappear). Treat
+        // BLE-up but gossip-not-yet-Direct as "handshaking" so the UI
+        // reflects that sends aren't yet reaching the peer.
+        match (self.ble_phase, self.gossip) {
+            (Some(BlePeerPhase::Connected), Some(GossipStatus::Direct)) => "connected",
+            (Some(BlePeerPhase::Connected), _) => "handshaking",
+            (Some(BlePeerPhase::Handshaking), _) => "handshaking",
+            (Some(BlePeerPhase::Connecting), _) => "connecting",
+            (Some(BlePeerPhase::Reconnecting | BlePeerPhase::Restoring), _) => "reconnecting",
+            (Some(BlePeerPhase::PendingDial), _) => "pending_dial",
+            (Some(BlePeerPhase::Discovered | BlePeerPhase::Unknown), gossip) => match gossip {
+                Some(GossipStatus::Direct) => "connected",
+                Some(GossipStatus::InTopic) => "in_topic",
+                _ => "nearby",
+            },
+            (Some(BlePeerPhase::Draining), _) => "draining",
+            (Some(BlePeerPhase::Dead), _) => "dead",
+            (None, gossip) => match gossip {
                 Some(GossipStatus::Direct) => "connected",
                 Some(GossipStatus::InTopic) => "in_topic",
                 Some(GossipStatus::Stale) => "stale",
@@ -227,7 +232,20 @@ async fn start_node(
 
     let (verified_tx, verified_rx) = tokio::sync::mpsc::unbounded_channel();
     let ble_transport: Arc<BleTransport> = {
-        let central = Arc::new(Central::new().await.map_err(|e| e.to_string())?);
+        // Tighten blew's connect deadline below its 15 s default so a wedged
+        // dial attempt (Android's post-133 zombie state is the classic case)
+        // fails fast enough for the registry to retry within iroh-gossip's
+        // 15 s dial budget. Successful Android connects in our traces
+        // complete in under 1.5 s; 5 s leaves headroom for radio contention.
+        let central_config = CentralConfig {
+            connect_timeout: Some(std::time::Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let central = Arc::new(
+            Central::with_config(central_config)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
         let peripheral = Arc::new(Peripheral::new().await.map_err(|e| e.to_string())?);
         let local_id = st.secret_key.public();
         let transport = BleTransport::with_config(
@@ -260,12 +278,19 @@ async fn start_node(
     let lookup = ble_transport.address_lookup();
     let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble_transport.clone();
 
-    // BLE-tuned QUIC idle timeout. The default (30s) leaves a large window
-    // between BLE-level disconnect detection (~6s via ReliableChannel's
-    // LINK_DEAD_DEADLINE) and iroh finally marking the connection dead, which
-    // manifests as the UI showing a peer as connected long after the BLE link
-    // is gone. 15s is short enough to cut that gap noticeably while still
-    // tolerating the multi-second pauses real BLE links exhibit.
+    // BLE-tuned QUIC idle timeout. The default (30s) is too lax because
+    // BLE-level disconnect detection is ~6s (LINK_DEAD_DEADLINE), leaving
+    // iroh holding a dead Connection for a long window during which
+    // gossip sends broadcast to zero direct neighbors and vanish. But we
+    // cannot go below `keep_alive_interval * 3` (`BlePreset::keep_alive_interval = 5s`)
+    // without racing idle-timeout against keep-alive, and on a *fresh*
+    // peer the QUIC TLS handshake runs over the slow GATT path (L2CAP
+    // upgrade only fires after `VerifiedEndpoint`), which can take 3-5s
+    // with ARQ retransmits — a short idle timeout kills the handshake
+    // mid-flight and surfaces as `accepting failed: authentication
+    // failed` on the peer. 15s is the compromise: comfortably above the
+    // handshake time and keep-alive window, tight enough to not leave
+    // the UI showing "Connected" for >15s after BLE actually died.
     let transport_cfg = QuicTransportConfig::builder()
         .max_idle_timeout(Some(
             std::time::Duration::from_secs(15)
@@ -275,7 +300,11 @@ async fn start_node(
         .build();
 
     let ep = Endpoint::builder(presets::N0DisableRelay)
-        .hooks(BleDedupHook::new(verified_tx))
+        .hooks(BleDedupHook::new(
+            st.secret_key.public(),
+            ble_transport.routing_handle(),
+            verified_tx,
+        ))
         .add_custom_transport(Arc::clone(&transport))
         .address_lookup(lookup)
         .transport_config(transport_cfg)
@@ -325,6 +354,14 @@ async fn start_node(
         .map_err(|e| format!("gossip subscribe: {e}"))?;
 
     let (sender, receiver) = topic.split();
+
+    // Spawn the step-5 pipe-lifetime watchdog now that the iroh
+    // Endpoint is bound. When iroh decides a peer's Connection is
+    // gone (via its max_idle_timeout of 15 s above), the watchdog
+    // tells the BLE transport to tear down the pipe instead of
+    // holding the radio open. The `_watchdog` handle lives on
+    // `AppState` and is implicitly aborted when the app exits.
+    let _watchdog = ble_transport.spawn_pipe_watchdog(Arc::new(ep.clone()));
 
     st.endpoint = Some(ep);
     st._router = Some(router);
@@ -751,6 +788,10 @@ async fn bandwidth_tick(app: AppHandle, transport: Arc<BleTransport>) {
         let truncation_delta = now.truncations.saturating_sub(prev.truncations);
         let tx_kbps = (tx_delta as f64 * 8.0 / 1000.0) / elapsed;
         let rx_kbps = (rx_delta as f64 * 8.0 / 1000.0) / elapsed;
+        // routing counts: surfaces pending/routable/reservations
+        // for the debug panel during hardware testing. Small enough
+        // to ship with every bandwidth tick; counts are read-through.
+        let snap = transport.routing_snapshot();
         let _ = app.emit(
             "bandwidth",
             serde_json::json!({
@@ -758,6 +799,11 @@ async fn bandwidth_tick(app: AppHandle, transport: Arc<BleTransport>) {
                 "rx_kbps": rx_kbps,
                 "retransmits": retransmit_delta,
                 "truncations": truncation_delta,
+                "v2_pipes": snap.pipes,
+                "v2_scan_hints": snap.scan_hints,
+                "v2_pending": snap.pending,
+                "v2_routable": snap.routable,
+                "v2_reservations": snap.reservations,
             }),
         );
         prev = now;
@@ -776,7 +822,17 @@ async fn reconnect_tick(state: Arc<Mutex<AppState>>) {
         let Some(sender) = st.gossip_sender.clone() else {
             continue;
         };
-        let targets = collect_join_targets(st.own_id(), &st.peers, load_known_peers(&st.cache_dir));
+        let ble_transport = st.ble_transport.clone();
+        let targets = collect_join_targets(
+            st.own_id(),
+            &st.peers,
+            load_known_peers(&st.cache_dir),
+            |peer_id| {
+                ble_transport
+                    .as_ref()
+                    .is_some_and(|bt| bt.has_scan_hint_for_endpoint(peer_id))
+            },
+        );
         drop(st);
 
         if targets.is_empty() {
@@ -846,10 +902,11 @@ fn should_nudge_join_periodic(gossip: Option<GossipStatus>) -> bool {
     !matches!(gossip, Some(GossipStatus::Direct))
 }
 
-fn collect_join_targets(
+fn collect_join_targets<F: Fn(&EndpointId) -> bool>(
     own_id: EndpointId,
     peers: &HashMap<EndpointId, PeerState>,
     known_peers: Vec<EndpointId>,
+    is_in_scan: F,
 ) -> Vec<EndpointId> {
     let mut seen = HashSet::new();
     let mut targets = Vec::new();
@@ -862,7 +919,19 @@ fn collect_join_targets(
         if !seen.insert(peer_id) {
             continue;
         }
-        if should_nudge_join_periodic(peers.get(&peer_id).and_then(|peer| peer.gossip)) {
+        let peer = peers.get(&peer_id);
+        // Step 8: a peer that's only in the cached known_peers list
+        // (never observed this session) is eligible for gossip
+        // bootstrap *only* if scan has just surfaced its prefix.
+        // Otherwise gossip's internal dial retries keep spewing
+        // "Internal consistency error" for 60 s per peer that simply
+        // isn't nearby. Peers we've already observed this session
+        // stay in the targets list regardless of scan visibility so
+        // reconnect_tick still recovers flapping links.
+        if peer.is_none() && !is_in_scan(&peer_id) {
+            continue;
+        }
+        if should_nudge_join_periodic(peer.and_then(|peer| peer.gossip)) {
             targets.push(peer_id);
         }
     }
@@ -926,6 +995,32 @@ mod tests {
     }
 
     #[test]
+    fn ui_status_ble_connected_without_direct_gossip_is_handshaking() {
+        // The "fake connected" case: BLE-L2CAP is up but the peer just
+        // restarted and gossip hasn't re-adopted the connection yet.
+        // Previously this reported "connected" even though send_message
+        // was broadcasting to zero neighbors. Must be "handshaking" now.
+        let mut peer = test_peer();
+        peer.ble_phase = Some(BlePeerPhase::Connected);
+
+        peer.gossip = None;
+        assert_eq!(peer.ui_status(), "handshaking");
+
+        peer.gossip = Some(GossipStatus::InTopic);
+        assert_eq!(peer.ui_status(), "handshaking");
+
+        peer.gossip = Some(GossipStatus::Stale);
+        assert_eq!(peer.ui_status(), "handshaking");
+
+        peer.gossip = Some(GossipStatus::Direct);
+        assert_eq!(
+            peer.ui_status(),
+            "connected",
+            "both BLE-Connected and gossip-Direct required for \"connected\""
+        );
+    }
+
+    #[test]
     fn collect_join_targets_includes_non_direct_peers_once() {
         let own_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
         let direct_id = iroh::SecretKey::from_bytes(&[2u8; 32]).public();
@@ -943,13 +1038,68 @@ mod tests {
 
         peers.insert(unknown_id, new_peer_entry(unknown_id));
 
+        // Every peer is in `peers`, so the scan filter is irrelevant
+        // here — verifies the existing dedup + Direct-filter behavior.
         let targets = collect_join_targets(
             own_id,
             &peers,
             vec![own_id, direct_id, in_topic_id, unknown_id, in_topic_id],
+            |_| false,
         );
 
         assert_eq!(targets, vec![in_topic_id, unknown_id]);
+    }
+
+    #[test]
+    fn collect_join_targets_filters_cached_only_peers_by_scan_visibility() {
+        // A peer that's in the cached known_peers list but hasn't been
+        // observed this session (not in the `peers` map) is gated on
+        // the scan filter: included when scan sees its prefix, skipped
+        // otherwise. This is the step-8 F5 mitigation — gossip shouldn't
+        // pound on dial retries for cached peers who aren't nearby.
+        let own_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let nearby_cached = iroh::SecretKey::from_bytes(&[5u8; 32]).public();
+        let absent_cached = iroh::SecretKey::from_bytes(&[6u8; 32]).public();
+
+        let peers = HashMap::new(); // nothing observed this session
+        let known = vec![nearby_cached, absent_cached];
+
+        let targets = collect_join_targets(own_id, &peers, known.clone(), |peer_id| {
+            *peer_id == nearby_cached
+        });
+        assert_eq!(
+            targets,
+            vec![nearby_cached],
+            "cached peer visible in scan is included; absent peer is filtered out"
+        );
+
+        // When the scan filter says nothing is visible, no cached peer
+        // makes it through — this is the cold-start invariant: empty
+        // targets instead of a storm of failing dials.
+        let empty = collect_join_targets(own_id, &peers, known, |_| false);
+        assert!(
+            empty.is_empty(),
+            "no scan visibility → no cached peers bootstrapped"
+        );
+    }
+
+    #[test]
+    fn collect_join_targets_ignores_scan_filter_for_session_peers() {
+        // Peers we've already observed in this session (i.e., in the
+        // `peers` map) stay eligible for reconnect regardless of
+        // current scan visibility. Otherwise a transient scan gap
+        // would starve reconnect_tick during an ACL flap.
+        let own_id = iroh::SecretKey::from_bytes(&[1u8; 32]).public();
+        let observed = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+
+        let mut peers = HashMap::new();
+        let mut state = new_peer_entry(observed);
+        state.gossip = Some(GossipStatus::Stale);
+        peers.insert(observed, state);
+
+        // Scan filter returns false (peer momentarily invisible).
+        let targets = collect_join_targets(own_id, &peers, vec![observed], |_| false);
+        assert_eq!(targets, vec![observed]);
     }
 
     #[test]
@@ -1089,21 +1239,32 @@ async fn transport_state_tick(
 
                 // BLE just noticed a peer we've been told about. Kick
                 // `join_peers` immediately instead of waiting for the 10s
-                // `reconnect_tick`: the typical case is iroh-gossip's first
-                // dial timed out before slow BLE scanning surfaced the
-                // advert, and otherwise the peer sits in Discovered until
-                // the next tick boundary.
-                let is_new_sighting = peer.ble_phase.is_none()
-                    && matches!(
-                        new_phase,
-                        Some(
-                            BlePeerPhase::Discovered
-                                | BlePeerPhase::Connecting
-                                | BlePeerPhase::Handshaking
-                                | BlePeerPhase::Connected
-                        )
-                    );
-                if is_new_sighting && should_nudge_join_inbound(peer.gossip, peer.last_join_nudge) {
+                // `reconnect_tick`. Two cases matter:
+                //
+                // 1. Fresh sighting (ble_phase was None): the typical
+                //    cold-start case where iroh-gossip's first dial timed
+                //    out before slow BLE scanning surfaced the advert.
+                // 2. BLE restore (ble_phase was non-Connected, now
+                //    Connected): a peer restart cycles BLE through
+                //    Draining → Dead → Connected. Without a nudge here,
+                //    gossip keeps using its stale QUIC connection until
+                //    max_idle_timeout fires. The nudge triggers a fresh
+                //    QUIC handshake over the new BLE path.
+                let now_connected_or_forming = matches!(
+                    new_phase,
+                    Some(
+                        BlePeerPhase::Discovered
+                            | BlePeerPhase::Connecting
+                            | BlePeerPhase::Handshaking
+                            | BlePeerPhase::Connected
+                    )
+                );
+                let is_fresh_sighting = peer.ble_phase.is_none() && now_connected_or_forming;
+                let is_ble_restored = !matches!(peer.ble_phase, Some(BlePeerPhase::Connected))
+                    && matches!(new_phase, Some(BlePeerPhase::Connected));
+                if (is_fresh_sighting || is_ble_restored)
+                    && should_nudge_join_inbound(peer.gossip, peer.last_join_nudge)
+                {
                     peer.last_join_nudge = Some(Instant::now());
                     discovery_nudge_targets.push(peer.id);
                 }
@@ -1312,7 +1473,12 @@ async fn send_message(
     let own_id = st.own_id();
     let nickname = st.nickname.clone();
     let known_peers = load_known_peers(&st.cache_dir);
-    let join_targets = collect_join_targets(own_id, &st.peers, known_peers.clone());
+    let ble_transport = st.ble_transport.clone();
+    let join_targets = collect_join_targets(own_id, &st.peers, known_peers.clone(), |peer_id| {
+        ble_transport
+            .as_ref()
+            .is_some_and(|bt| bt.has_scan_hint_for_endpoint(peer_id))
+    });
     let join_target_summary = summarize_join_targets(&st.peers, &join_targets);
     let direct_peers = st
         .peers

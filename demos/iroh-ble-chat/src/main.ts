@@ -1427,16 +1427,36 @@ const bwTx = document.getElementById("bw-tx")!;
 const bwRx = document.getElementById("bw-rx")!;
 const bwRtx = document.getElementById("bw-rtx")!;
 const bwTrunc = document.getElementById("bw-trunc")!;
+const rv2Pipes = document.getElementById("rv2-pipes")!;
+const rv2Pending = document.getElementById("rv2-pending")!;
+const rv2Routable = document.getElementById("rv2-routable")!;
+const rv2Reservations = document.getElementById("rv2-reservations")!;
+const rv2ScanHints = document.getElementById("rv2-scan-hints")!;
 
 let rtxTotal = 0;
 let truncTotal = 0;
 
 listen("bandwidth", (event: any) => {
-  const { tx_kbps, rx_kbps, retransmits, truncations } = event.payload as {
+  const {
+    tx_kbps,
+    rx_kbps,
+    retransmits,
+    truncations,
+    v2_pipes,
+    v2_pending,
+    v2_routable,
+    v2_reservations,
+    v2_scan_hints,
+  } = event.payload as {
     tx_kbps: number;
     rx_kbps: number;
     retransmits: number;
     truncations: number;
+    v2_pipes?: number;
+    v2_pending?: number;
+    v2_routable?: number;
+    v2_reservations?: number;
+    v2_scan_hints?: number;
   };
   bwTx.textContent = tx_kbps < 10 ? tx_kbps.toFixed(1) : Math.round(tx_kbps).toString();
   bwRx.textContent = rx_kbps < 10 ? rx_kbps.toFixed(1) : Math.round(rx_kbps).toString();
@@ -1444,4 +1464,12 @@ listen("bandwidth", (event: any) => {
   truncTotal += truncations ?? 0;
   bwRtx.textContent = rtxTotal.toString();
   bwTrunc.textContent = truncTotal.toString();
+  // routing_v2 debug counts. Only populated when debug mode is on
+  // (the panel is display:none otherwise, so text updates are
+  // harmless no-ops).
+  rv2Pipes.textContent = (v2_pipes ?? 0).toString();
+  rv2Pending.textContent = (v2_pending ?? 0).toString();
+  rv2Routable.textContent = (v2_routable ?? 0).toString();
+  rv2Reservations.textContent = (v2_reservations ?? 0).toString();
+  rv2ScanHints.textContent = (v2_scan_hints ?? 0).toString();
 });

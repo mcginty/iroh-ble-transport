@@ -677,6 +677,7 @@ enum SendAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
@@ -701,6 +702,66 @@ mod tests {
         v.push(FRAGMENT_CANARY);
         v
     }
+
+    fn receive_schedule_strategy() -> impl Strategy<Value = (Vec<Vec<u8>>, Vec<usize>)> {
+        prop::collection::vec(prop::collection::vec(any::<u8>(), 1..8), 1..=5).prop_flat_map(
+            |chunks| {
+                let len = chunks.len();
+                (Just(chunks), prop::collection::vec(0..len, 0..=(len * 3)))
+            },
+        )
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn receive_side_reordering_duplicates_and_incomplete_schedules_match_expectations(
+            (chunks, schedule) in receive_schedule_strategy()
+        ) {
+            let result: Result<(), proptest::test_runner::TestCaseError> =
+                tokio::runtime::Runtime::new().unwrap().block_on(async move {
+                let (ch, mut rx) = make_channel();
+                let fragments: Vec<Vec<u8>> = chunks
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, chunk)| {
+                        fragment(
+                            idx as u8,
+                            idx == 0,
+                            idx + 1 == chunks.len(),
+                            chunk,
+                        )
+                    })
+                    .collect();
+
+                for index in &schedule {
+                    ch.receive_fragment(&fragments[*index]).await;
+                }
+
+                let complete = (0..chunks.len()).all(|idx| schedule.contains(&idx));
+                if complete {
+                    let expected: Vec<u8> = chunks.concat();
+                    let got = rx
+                        .try_recv()
+                        .unwrap_or_else(|_| panic!("complete schedules must deliver exactly one datagram"));
+                    prop_assert_eq!(got, expected);
+                    prop_assert!(
+                        rx.try_recv().is_err(),
+                        "receive-side duplicates must not redeliver the same datagram"
+                    );
+                } else {
+                    prop_assert!(
+                        rx.try_recv().is_err(),
+                        "incomplete fragment coverage must not deliver a datagram"
+                    );
+                }
+                Ok(())
+            });
+            result?;
+        }
+    }
+
     #[test]
     fn test_seq_dist_basic() {
         assert_eq!(seq_dist(0, 0), 0);
