@@ -16,10 +16,6 @@ other over BLE.
 Built on top of [blew](https://github.com/mcginty/blew), a cross-platform BLE
 library for Rust.
 
-## Requirements
-
-- Rust **1.95** or newer
-
 ## High-level functionality
 
 - Each node advertises a GATT service whose UUID encodes its public key prefix
@@ -29,11 +25,11 @@ library for Rust.
 
 ## Supported Platforms
 
-| Platform | Backend |
-|----------|---------|
-| macOS / iOS | CoreBluetooth (via `objc2`) |
-| Linux | BlueZ (via `bluer`) |
-| Android | JNI + Kotlin (via `jni` and `ndk-context`) |
+| Platform    |
+|-------------|
+| macOS / iOS |
+| Linux       |
+| Android     |
 
 ## Usage
 
@@ -48,24 +44,14 @@ let endpoint = Endpoint::builder()
     .await?;
 ```
 
-## Examples
+## Demo
 
-```sh
-# Echo + speed test (listener)
-cargo run --example iroh_ble -p iroh-ble-transport
+There is a Tauri-based (unencrypted, insecure) chat demo called BlewChat that
+works on iOS, Android, macOS, and Linux. For iOS, the easiest way to install
+is to [install the latest release via TestFlight](https://testflight.apple.com/join/sg71NHZU).
 
-# Echo + speed test (dialer)
-cargo run --example iroh_ble -p iroh-ble-transport -- <endpoint-id>
-```
-
-## Demo App
-
-There's a Tauri-based demo group chat app to show off Iroh BLE connectivity in
-`demos/iroh-ble-chat`. More details on this app will follow, but please do not
-use it for anything sensitive, it is not secure or in any way was written as a
-toy solely to demonstrate the underlying transport. The app starts with
-debug-event capture disabled by default so tester logs stay low-noise unless
-explicitly expanded.
+For other platforms, either build from source or download the release artifacts
+when they're made available.
 
 ## License
 
