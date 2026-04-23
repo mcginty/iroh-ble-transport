@@ -1,0 +1,100 @@
+name: Decrypt release secrets
+description: |
+  Decrypts all .age files in .github/secrets/ into $RUNNER_TEMP/secrets/,
+  and sources secrets.env into $GITHUB_ENV so later steps see every
+  KEY=VALUE as a regular environment variable. File-based secrets
+  (certificates, keystores, provisioning profiles) must be referenced by
+  the exported path variables.
+
+inputs:
+  age-identity:
+    description: Contents of the age identity private key (secrets.AGE_IDENTITY).
+    required: true
+
+outputs:
+  dir:
+    description: Absolute path of the directory where decrypted files land.
+    value: ${{ steps.decrypt.outputs.dir }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install age
+      shell: bash
+      run: |
+        set -eu
+        if ! command -v age >/dev/null; then
+          # mise-action already ran in the calling job, but be defensive
+          if command -v mise >/dev/null; then
+            mise install age
+            echo "$(mise where age)/bin" >> "$GITHUB_PATH"
+          else
+            echo "age not found and mise unavailable — add \`age\` to mise.toml" >&2
+            exit 1
+          fi
+        fi
+        age --version
+
+    - id: decrypt
+      shell: bash
+      env:
+        AGE_IDENTITY: ${{ inputs.age-identity }}
+      run: |
+        set -eu
+        if [ -z "${AGE_IDENTITY:-}" ]; then
+          echo "AGE_IDENTITY input is empty — configure the AGE_IDENTITY repo secret" >&2
+          exit 1
+        fi
+
+        KEY="$RUNNER_TEMP/age.key"
+        OUT="$RUNNER_TEMP/secrets"
+        umask 077
+        mkdir -p "$OUT"
+        printf '%s\n' "$AGE_IDENTITY" > "$KEY"
+
+        shopt -s nullglob
+        files=(".github/secrets"/*.age)
+        shopt -u nullglob
+        if [ ${#files[@]} -eq 0 ]; then
+          echo "No .age files in .github/secrets/" >&2
+          exit 1
+        fi
+
+        for f in "${files[@]}"; do
+          name=$(basename "${f%.age}")
+          age --decrypt --identity "$KEY" --output "$OUT/$name" "$f"
+        done
+
+        # Export KEY=VALUE lines from secrets.env into $GITHUB_ENV, masking each value.
+        ENV_FILE="$OUT/secrets.env"
+        if [ -f "$ENV_FILE" ]; then
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            key="${line%%=*}"
+            value="${line#*=}"
+            # Strip optional surrounding quotes so accidental quoting doesn't break things.
+            case "$value" in
+              \"*\") value="${value#\"}"; value="${value%\"}" ;;
+              \'*\') value="${value#\'}"; value="${value%\'}" ;;
+            esac
+            echo "::add-mask::$value"
+            printf '%s=%s\n' "$key" "$value" >> "$GITHUB_ENV"
+          done < "$ENV_FILE"
+        fi
+
+        # Export the decrypted-files directory + per-file convenience paths.
+        echo "SECRETS_DIR=$OUT" >> "$GITHUB_ENV"
+        for f in "$OUT"/*; do
+          [ -f "$f" ] || continue
+          name=$(basename "$f")
+          [ "$name" = "secrets.env" ] && continue
+          # Path var name: e.g. IOS_DIST_P12 -> /path/to/ios-dist.p12
+          var=$(printf '%s' "$name" | tr '[:lower:].-' '[:upper:]__')
+          printf 'SECRET_PATH_%s=%s\n' "$var" "$f" >> "$GITHUB_ENV"
+        done
+
+        rm -f "$KEY"
+        echo "dir=$OUT" >> "$GITHUB_OUTPUT"
+        ls -lh "$OUT"
