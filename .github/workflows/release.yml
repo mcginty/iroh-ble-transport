@@ -422,21 +422,18 @@ jobs:
             armv7-linux-androideabi \
             x86_64-linux-android
 
-      - name: Set up Android NDK environment
+      - name: Install Android NDK
+        env:
+          NDK_VERSION: 27.2.12479018
         run: |
           set -eu
-          # Tauri looks for NDK_HOME specifically; the runner pre-sets
-          # ANDROID_NDK_ROOT but not NDK_HOME, so we always re-export.
-          NDK="${ANDROID_NDK_ROOT:-${ANDROID_NDK_HOME:-}}"
-          if [ -z "$NDK" ] && [ -d "${ANDROID_HOME:-}/ndk" ]; then
-            NDK=$(ls -1d "$ANDROID_HOME"/ndk/*/ | sort -V | tail -n1 | sed 's:/$::')
-          fi
-          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
-            echo "No Android NDK found (ANDROID_HOME=$ANDROID_HOME)" >&2
-            ls -la "${ANDROID_HOME:-/opt/android-sdk}/ndk" 2>&1 || true
-            exit 1
-          fi
-          echo "Using NDK at $NDK"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || { echo "sdkmanager not found at $SDKMANAGER" >&2; exit 1; }
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "ndk;$NDK_VERSION" > /dev/null
+          NDK="$ANDROID_HOME/ndk/$NDK_VERSION"
+          [ -d "$NDK" ] || { echo "NDK not present at $NDK after install" >&2; exit 1; }
+          echo "Installed NDK at $NDK"
           echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
@@ -460,7 +457,15 @@ jobs:
         working-directory: ${{ env.CHAT_DIR }}
         env:
           ORG_GRADLE_PROJECT_androidTargetAbis: arm64-v8a,armeabi-v7a,x86_64
+          # Re-assert NDK paths inline so we don't rely on $GITHUB_ENV
+          # propagation from the "Set up Android NDK environment" step.
+          NDK_HOME: ${{ env.NDK_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
         run: |
+          echo "--- NDK env visible to this step ---"
+          env | grep -iE 'ndk|android' | sort || true
+          echo "---"
           pnpm tauri android build --apk \
             --target aarch64 \
             --target armv7 \
