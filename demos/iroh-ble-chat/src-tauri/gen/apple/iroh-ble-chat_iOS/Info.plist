@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>BlewChat</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -12,16 +14,29 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
-	<key>CFBundleDisplayName</key>
-	<string>BlewChat</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.2.0</string>
+	<string>0.2.1</string>
 	<key>CFBundleVersion</key>
-	<string>136</string>
+	<string>143</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>This app uses Bluetooth to discover and connect to nearby iroh peers.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+		<string>_https._tcp</string>
+	</array>
+	<key>NSCameraUsageDescription</key>
+	<string>This app uses the camera to scan QR code invitation links.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>This app connects to a local development server and to nearby peers over BLE.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>This app accesses your photo library to share images in chat.</string>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIRequiredDeviceCapabilities</key>
@@ -42,20 +57,5 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>This app connects to a local development server and to nearby peers over BLE.</string>
-	<key>NSBonjourServices</key>
-	<array>
-		<string>_http._tcp</string>
-		<string>_https._tcp</string>
-	</array>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>This app uses Bluetooth to discover and connect to nearby iroh peers.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>This app uses the camera to scan QR code invitation links.</string>
-	<key>NSPhotoLibraryUsageDescription</key>
-	<string>This app accesses your photo library to share images in chat.</string>
-	<key>ITSAppUsesNonExemptEncryption</key>
-	<false/>
 </dict>
 </plist>

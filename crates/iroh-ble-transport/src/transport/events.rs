@@ -1,11 +1,13 @@
 //! Translates `blew` events into `PeerCommand`s on the registry inbox.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use blew::central::CentralEvent;
 use blew::peripheral::{PeripheralRequest, PeripheralStateEvent};
 use blew::{Central, Peripheral};
 use bytes::Bytes;
+
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -188,7 +190,7 @@ pub async fn run_peripheral_state_events(
 pub async fn run_peripheral_requests(
     peripheral: Arc<Peripheral>,
     inbox: mpsc::Sender<PeerCommand>,
-    psm: Option<u16>,
+    psm: Arc<AtomicU16>,
 ) {
     use tokio_stream::StreamExt as _;
     let Some(mut requests) = peripheral.take_requests() else {
@@ -223,7 +225,8 @@ pub async fn run_peripheral_requests(
                 ..
             } => {
                 if char_uuid == crate::transport::transport::IROH_PSM_CHAR_UUID {
-                    if let Some(psm_val) = psm {
+                    let psm_val = psm.load(Ordering::Relaxed);
+                    if psm_val != 0 {
                         responder.respond(psm_val.to_le_bytes().to_vec());
                     } else {
                         responder.respond(Vec::new());

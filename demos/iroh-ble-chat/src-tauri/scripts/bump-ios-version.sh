@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # cargo-release pre-release-hook. Runs with cwd = src-tauri (CRATE_ROOT).
-# Patches tauri.conf.json so Tauri writes the correct values into Info.plist
-# and build.gradle at build time.
+# Patches tauri.conf.json and the checked-in Apple project metadata so
+# cargo-release and Xcode Cloud agree on the same iOS version/build number.
 #
 # - version := Cargo version with prerelease suffix stripped
 #   (Apple requires X.Y.Z integers, so "0.1.0-alpha.4" -> "0.1.0").
@@ -16,7 +16,7 @@ set -euo pipefail
 SHORT_VERSION="${NEW_VERSION%%-*}"
 BUILD_NUMBER="$(git rev-list --count HEAD)"
 
-echo -en "\033[1;32m     Bumping\033[0m tauri.conf.json (version = $SHORT_VERSION, bundle.iOS.bundleVersion = $BUILD_NUMBER)"
+echo -en "\033[1;32m     Bumping\033[0m iOS release metadata (version = $SHORT_VERSION, build = $BUILD_NUMBER)"
 if [[ "$DRY_RUN" == "true" ]]; then
   echo -e "\033[1;33m [dry run, no files touched]\033[0m"
   exit
@@ -24,14 +24,37 @@ fi
 
 echo ""
 
-python3 -c "
-import json, sys
-p, ver, build = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(p) as f:
-    d = json.load(f)
-d['version'] = ver
-d.setdefault('bundle', {}).setdefault('iOS', {})['bundleVersion'] = build
-with open(p, 'w') as f:
-    json.dump(d, f, indent=2)
-    f.write('\n')
-" tauri.conf.json "$SHORT_VERSION" "$BUILD_NUMBER"
+JQ_BIN="${JQ_BIN:-$(command -v jq 2>/dev/null || true)}"
+YQ_BIN="${YQ_BIN:-$(command -v yq 2>/dev/null || true)}"
+PLIST_BUDDY="${PLIST_BUDDY:-/usr/libexec/PlistBuddy}"
+
+[[ -n "$JQ_BIN" ]] || { echo "jq not found" >&2; exit 1; }
+if [[ -z "$YQ_BIN" ]] && command -v mise >/dev/null 2>&1; then
+  YQ_BIN="$(mise which yq 2>/dev/null || true)"
+fi
+[[ -n "$YQ_BIN" ]] || { echo "yq not found" >&2; exit 1; }
+[[ -x "$PLIST_BUDDY" ]] || { echo "PlistBuddy not found at $PLIST_BUDDY" >&2; exit 1; }
+
+tmp_json="$(mktemp "${TMPDIR:-/tmp}/tauri.conf.json.XXXXXX")"
+trap 'rm -f "$tmp_json"' EXIT
+
+"$JQ_BIN" --indent 2 \
+  --arg version "$SHORT_VERSION" \
+  --arg build "$BUILD_NUMBER" \
+  '
+    .version = $version
+    | .bundle.iOS.bundleVersion = $build
+  ' \
+  tauri.conf.json > "$tmp_json"
+mv "$tmp_json" tauri.conf.json
+trap - EXIT
+
+SHORT_VERSION="$SHORT_VERSION" BUILD_NUMBER="$BUILD_NUMBER" "$YQ_BIN" -i '
+  .targets."iroh-ble-chat_iOS".info.properties.CFBundleShortVersionString = strenv(SHORT_VERSION)
+  | .targets."iroh-ble-chat_iOS".info.properties.CFBundleVersion = strenv(BUILD_NUMBER)
+' gen/apple/project.yml
+
+"$PLIST_BUDDY" \
+  -c "Set :CFBundleShortVersionString $SHORT_VERSION" \
+  -c "Set :CFBundleVersion $BUILD_NUMBER" \
+  gen/apple/iroh-ble-chat_iOS/Info.plist

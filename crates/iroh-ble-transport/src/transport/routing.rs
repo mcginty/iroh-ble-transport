@@ -746,6 +746,13 @@ impl Routing {
     /// just opened a pipe to, find the prefix that's been tracking it
     /// and (if any) consume the reservation. Convenience for the
     /// pipe-open path, which knows `DeviceId` but not `KeyPrefix`.
+    ///
+    /// Edge case: if `scan_hint` was remapped between `reserve_outbound`
+    /// and pipe-open, this returns `None` and the reservation is not
+    /// consumed here. It is not a true leak: the reservation is keyed on
+    /// `KeyPrefix` and will be picked up by a later outbound
+    /// `consume_reservation_for_endpoint` for the same prefix, or by a
+    /// subsequent inbound peer that advertises under the same prefix.
     pub fn consume_reservation_for_device(&self, device_id: &DeviceId) -> Option<Reservation> {
         let mut inner = self.inner.lock();
         let prefix = *inner
