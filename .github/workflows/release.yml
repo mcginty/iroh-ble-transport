@@ -23,6 +23,12 @@ on:
   push:
     tags:
       - 'iroh-ble-chat-v*'
+    # TEMP: branch trigger for pre-merge smoke testing. Revert before merging
+    # to main — workflow_dispatch will work once the file lands on the default
+    # branch. See plan job: branch pushes default to `android-release` only to
+    # avoid duplicate-build-number rejections on TestFlight.
+    branches:
+      - release-pipeline
   workflow_dispatch:
     inputs:
       targets:
@@ -63,7 +69,16 @@ jobs:
       - id: decide
         run: |
           target="${{ github.event.inputs.targets }}"
-          if [ "${{ github.event_name }}" = "push" ]; then target="all"; fi
+          if [ "${{ github.event_name }}" = "push" ]; then
+            case "${{ github.ref }}" in
+              refs/tags/*) target="all" ;;
+              # TEMP: branch-push smoke test — android-only (no external uploads,
+              # no duplicate-version collisions with TestFlight). Revert with the
+              # matching `on.push.branches` entry.
+              refs/heads/release-pipeline) target="android-release" ;;
+              *) echo "Unexpected push ref: ${{ github.ref }}" >&2; exit 1 ;;
+            esac
+          fi
           case "$target" in
             all)                ios=1; mas=1; rel=1; apk=1 ;;
             testflight-all)     ios=1; mas=1; rel=0; apk=0 ;;
