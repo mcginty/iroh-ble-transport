@@ -422,27 +422,38 @@ jobs:
             armv7-linux-androideabi \
             x86_64-linux-android
 
-      - name: Install Android NDK
-        env:
-          NDK_VERSION: 27.2.12479018
+      - name: Configure Android SDK + NDK
         run: |
           set -eu
           # mise.toml declares `android-sdk = "latest"` which makes mise-action
           # point ANDROID_HOME at an empty mise install dir. Override to the
           # system Android SDK that ubuntu-latest actually ships with.
           SDK="/usr/local/lib/android/sdk"
-          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          if [ ! -x "$SDKMANAGER" ]; then
-            echo "sdkmanager not found at $SDKMANAGER" >&2
-            echo "Available android tooling under /usr/local/lib/android:" >&2
-            ls -la /usr/local/lib/android 2>&1 || true
+          # Prefer the pre-installed NDKs over installing a new one via
+          # sdkmanager — the latter has historically produced incomplete
+          # installs when ANDROID_HOME writes need perms we don't have.
+          for candidate in \
+            "${ANDROID_NDK_LATEST_HOME:-}" \
+            "${ANDROID_NDK_HOME:-}" \
+            "${ANDROID_NDK:-}"; do
+            if [ -n "$candidate" ] && [ -f "$candidate/source.properties" ]; then
+              NDK="$candidate"
+              break
+            fi
+          done
+          if [ -z "${NDK:-}" ] && [ -d "$SDK/ndk" ]; then
+            NDK=$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n1 | sed 's:/$::')
+          fi
+          if [ -z "${NDK:-}" ] || [ ! -f "$NDK/source.properties" ]; then
+            echo "No usable pre-installed NDK found. Contents of $SDK/ndk:" >&2
+            ls -la "$SDK/ndk" 2>&1 || true
             exit 1
           fi
-          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
-          "$SDKMANAGER" --install "ndk;$NDK_VERSION" > /dev/null
-          NDK="$SDK/ndk/$NDK_VERSION"
-          [ -d "$NDK" ] || { echo "NDK not present at $NDK after install" >&2; exit 1; }
-          echo "Installed NDK at $NDK"
+          echo "Using pre-installed NDK at $NDK"
+          grep -E '^Pkg\.(Revision|Desc)' "$NDK/source.properties" || true
+          # Sanity-check the LLVM toolchain dir that cargo-mobile2 validates.
+          LLVM_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$LLVM_BIN" ] || { echo "NDK incomplete: missing $LLVM_BIN" >&2; exit 1; }
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
