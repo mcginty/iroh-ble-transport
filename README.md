@@ -29,16 +29,16 @@ This library currently supports iOS, macOS, Android, and Linux.
 
 ## Usage
 
-```rust
-use iroh_ble_transport::BleTransport;
-use iroh::Endpoint;
+BLE is a high-touch transport — it needs more wiring than the IP-based
+defaults (a dedup hook, an address lookup, BLE-tuned QUIC config, and a
+pipe-lifetime watchdog). See:
 
-let transport = BleTransport::new().await?;
-let endpoint = Endpoint::builder()
-    .add_custom_transport(transport)
-    .bind()
-    .await?;
-```
+- [`examples/initialization.rs`](crates/iroh-ble-transport/examples/initialization.rs)
+  — the minimum viable setup, end to end.
+- [`examples/iroh_ble.rs`](crates/iroh-ble-transport/examples/iroh_ble.rs)
+  — echo + 48 KB speed test over a dialer/listener pair.
+- [`demos/iroh-ble-chat`](demos/iroh-ble-chat) — production-grade
+  iroh-gossip app built on this transport.
 
 ## Demo
 
