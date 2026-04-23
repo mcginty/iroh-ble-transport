@@ -226,6 +226,8 @@ impl<I: BleInterface> Driver<I> {
                 });
             }
 
+            // TODO: Own these detached maintenance tasks in Driver so transport
+            // shutdown can abort them instead of letting them outlive the actor.
             PeerAction::Refresh { device_id, .. } => {
                 let iface = Arc::clone(&self.iface);
                 tokio::spawn(async move {
@@ -388,6 +390,8 @@ impl<I: BleInterface> Driver<I> {
         let iface = Arc::clone(&self.iface);
         let inbox = self.inbox.clone();
         let dev_for_msg = device_id.clone();
+        // TODO: Track and cancel in-flight L2CAP opens when the registry
+        // abandons the upgrade, instead of detaching them until timeout/completion.
         tokio::spawn(async move {
             let result = tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
                 let psm = read_psm_with_retry(&READ_PSM_BACKOFFS_MS, &device_id, || {

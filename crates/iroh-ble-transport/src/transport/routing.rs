@@ -560,11 +560,16 @@ impl Routing {
     /// clean up both pools uniformly. Returns `true` if an entry was
     /// removed. If a routable entry was removed, wakes any resolver
     /// parked on that endpoint so it re-polls (e.g., emitting a
-    /// `reservation_new` for the next dial attempt).
+    /// `reservation_new` for the next dial attempt). Also wakes the
+    /// target endpoint of a removed pending entry so long-lived
+    /// resolver streams do not stay parked on a dead pending id until
+    /// the next advertisement happens to land.
     pub fn evict_pipe_state(&self, pipe: StableConnId) -> bool {
-        let (pending_removed, routable_endpoint) = {
+        let (pending_removed, pending_target, routable_endpoint) = {
             let mut inner = self.inner.lock();
-            let pending_removed = inner.pending.remove(&pipe).is_some();
+            let pending = inner.pending.remove(&pipe);
+            let pending_removed = pending.is_some();
+            let pending_target = pending.and_then(|p| p.target_endpoint);
             // Routable is keyed on EndpointId; reverse-lookup by pipe.
             let routable_endpoint = inner
                 .routable
@@ -578,9 +583,13 @@ impl Routing {
             };
             (
                 pending_removed,
+                pending_target,
                 routable_endpoint.filter(|_| routable_removed),
             )
         };
+        if let Some(ep) = pending_target {
+            self.wake_endpoint_waiters(&ep);
+        }
         if let Some(ep) = routable_endpoint {
             self.wake_endpoint_waiters(&ep);
         }
@@ -2046,9 +2055,22 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_waker_fires_when_scan_hint_lands_for_prefix() {
+    fn endpoint_waker_fires_when_targeted_pending_is_evicted() {
         let r = Routing::new();
         let ep = test_endpoint(39);
+        let id = r.register_pipe(dev("peer"), Direction::Outbound);
+        r.register_pending(id, Some(ep));
+
+        let (counter, waker) = counting_waker();
+        r.register_endpoint_waker(ep, &waker);
+        assert!(r.evict_pipe_state(id), "pending entry should be removed");
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn endpoint_waker_fires_when_scan_hint_lands_for_prefix() {
+        let r = Routing::new();
+        let ep = test_endpoint(40);
         let (counter, waker) = counting_waker();
         r.register_endpoint_waker(ep, &waker);
         r.note_scan_hint(prefix_of(&ep), dev("first-sighting"));
@@ -2058,8 +2080,8 @@ mod tests {
     #[test]
     fn endpoint_waker_does_not_fire_for_unrelated_prefix() {
         let r = Routing::new();
-        let ep_a = test_endpoint(40);
-        let ep_b = test_endpoint(41);
+        let ep_a = test_endpoint(41);
+        let ep_b = test_endpoint(42);
         let (counter, waker) = counting_waker();
         r.register_endpoint_waker(ep_a, &waker);
         // Scan hints for a different prefix must not wake ep_a's waiters.
@@ -2070,7 +2092,7 @@ mod tests {
     #[test]
     fn register_endpoint_waker_dedupes() {
         let r = Routing::new();
-        let ep = test_endpoint(42);
+        let ep = test_endpoint(43);
         let (counter, waker) = counting_waker();
         r.register_endpoint_waker(ep, &waker);
         r.register_endpoint_waker(ep, &waker);
