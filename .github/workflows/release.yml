@@ -415,7 +415,9 @@ jobs:
       - name: Install Linux system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libdbus-1-dev libglib2.0-dev pkg-config
+          # nasm is required by the rav1e build script (pulled in via ravif
+          # for image encoding in the chat app).
+          sudo apt-get install -y libdbus-1-dev libglib2.0-dev pkg-config nasm
 
       - uses: Swatinem/rust-cache@v2
         with:
