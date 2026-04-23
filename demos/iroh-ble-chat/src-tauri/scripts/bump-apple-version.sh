@@ -3,12 +3,14 @@ set -euo pipefail
 
 # cargo-release pre-release-hook. Runs with cwd = src-tauri (CRATE_ROOT).
 # Patches tauri.conf.json and the checked-in Apple project metadata so
-# cargo-release and Xcode Cloud agree on the same iOS version/build number.
+# cargo-release, Xcode Cloud, and the GitHub Actions release pipeline
+# agree on the same version/build number.
 #
 # - version := Cargo version with prerelease suffix stripped
 #   (Apple requires X.Y.Z integers, so "0.1.0-alpha.4" -> "0.1.0").
-# - bundle.iOS.bundleVersion := monotonic integer from git history, so
-#   every alpha upload has a strictly-increasing build number.
+# - bundle.iOS.bundleVersion   := monotonic integer from git history.
+# - bundle.macOS.bundleVersion := same integer (TestFlight requires a
+#   strictly-increasing CFBundleVersion per CFBundleShortVersionString).
 # - Android versionCode is handled by Tauri's autoIncrementVersionCode.
 
 : "${NEW_VERSION:?NEW_VERSION not set — this script must be run by cargo-release}"
@@ -16,7 +18,7 @@ set -euo pipefail
 SHORT_VERSION="${NEW_VERSION%%-*}"
 BUILD_NUMBER="$(git rev-list --count HEAD)"
 
-echo -en "\033[1;32m     Bumping\033[0m iOS release metadata (version = $SHORT_VERSION, build = $BUILD_NUMBER)"
+echo -en "\033[1;32m     Bumping\033[0m Apple release metadata (version = $SHORT_VERSION, build = $BUILD_NUMBER)"
 if [[ "$DRY_RUN" == "true" ]]; then
   echo -e "\033[1;33m [dry run, no files touched]\033[0m"
   exit
@@ -44,6 +46,7 @@ trap 'rm -f "$tmp_json"' EXIT
   '
     .version = $version
     | .bundle.iOS.bundleVersion = $build
+    | .bundle.macOS.bundleVersion = $build
   ' \
   tauri.conf.json > "$tmp_json"
 mv "$tmp_json" tauri.conf.json

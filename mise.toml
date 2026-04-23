@@ -16,6 +16,7 @@ ktlint = "latest"
 android-sdk = "latest"
 xcodes = "latest"
 yq = "latest"
+age = "latest"
 
 [env]
 CARGO_TERM_COLOR = "always"

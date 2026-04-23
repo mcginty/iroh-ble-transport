@@ -1,0 +1,489 @@
+name: Release
+
+# Publishes the iroh-ble-chat demo.
+#
+# Jobs:
+#   - ios-testflight       : signed IPA → App Store Connect (TestFlight).
+#   - macos-testflight     : sandboxed .pkg → App Store Connect (TestFlight).
+#   - macos-release-build  : Developer ID .app/.dmg (notarized) → workflow artifact.
+#   - android-release-build: signed universal APK → workflow artifact.
+#   - publish              : collects release artifacts → single GitHub Release (tag push only).
+#
+# Secrets live in .github/secrets/ as age-encrypted files. A single repo secret
+# AGE_IDENTITY holds the private key that decrypts them. Local tooling:
+# scripts/secrets.sh {encrypt,decrypt,rekey}.
+#
+# Triggered by:
+#   - Tag push matching `iroh-ble-chat-v*` → runs everything + creates a GitHub Release.
+#   - Manual dispatch with a `targets` input → runs the selected subset (no Release).
+#
+# See demos/iroh-ble-chat/RELEASE.md for the required secrets and one-time setup.
+
+on:
+  push:
+    tags:
+      - 'iroh-ble-chat-v*'
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'Which jobs to run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - testflight-all
+          - release-all
+          - ios-testflight
+          - macos-testflight
+          - macos-release
+          - android-release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: iroh-ble-chat
+  CHAT_DIR: demos/iroh-ble-chat
+  BUNDLE_ID: org.jakebot.iroh-ble-chat
+  APPLE_TEAM_ID: XG66F95CNS
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      run_ios_testflight: ${{ steps.decide.outputs.ios_testflight }}
+      run_macos_testflight: ${{ steps.decide.outputs.macos_testflight }}
+      run_macos_release: ${{ steps.decide.outputs.macos_release }}
+      run_android_release: ${{ steps.decide.outputs.android_release }}
+    steps:
+      - id: decide
+        run: |
+          target="${{ github.event.inputs.targets }}"
+          if [ "${{ github.event_name }}" = "push" ]; then target="all"; fi
+          case "$target" in
+            all)                ios=1; mas=1; rel=1; apk=1 ;;
+            testflight-all)     ios=1; mas=1; rel=0; apk=0 ;;
+            release-all)        ios=0; mas=0; rel=1; apk=1 ;;
+            ios-testflight)     ios=1; mas=0; rel=0; apk=0 ;;
+            macos-testflight)   ios=0; mas=1; rel=0; apk=0 ;;
+            macos-release)      ios=0; mas=0; rel=1; apk=0 ;;
+            android-release)    ios=0; mas=0; rel=0; apk=1 ;;
+            *) echo "Unknown target: $target" >&2; exit 1 ;;
+          esac
+          echo "ios_testflight=$ios" >> "$GITHUB_OUTPUT"
+          echo "macos_testflight=$mas" >> "$GITHUB_OUTPUT"
+          echo "macos_release=$rel" >> "$GITHUB_OUTPUT"
+          echo "android_release=$apk" >> "$GITHUB_OUTPUT"
+
+  ios-testflight:
+    name: iOS → TestFlight
+    needs: plan
+    if: needs.plan.outputs.run_ios_testflight == '1'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust node pnpm age
+
+      - uses: ./.github/actions/decrypt-secrets
+        with:
+          age-identity: ${{ secrets.AGE_IDENTITY }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: ios-release
+
+      - run: rustup target add aarch64-apple-ios
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.CHAT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage App Store Connect API key
+        run: |
+          set -eu
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          install -m 600 "$SECRET_PATH_APPLE_API_KEY_P8" \
+            "$HOME/.appstoreconnect/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+
+      - name: Import iOS distribution certificate
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$SECRET_PATH_IOS_DIST_P12" \
+            -P "$APPLE_IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | xargs)
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Install iOS provisioning profile
+        run: |
+          set -eu
+          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+          DEST="$HOME/Library/MobileDevice/Provisioning Profiles/ios-appstore.mobileprovision"
+          install -m 600 "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" "$DEST"
+          NAME=$(security cms -D -i "$DEST" | /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin)
+          echo "Installed profile: $NAME"
+
+      - name: Build iOS IPA (App Store Connect)
+        working-directory: ${{ env.CHAT_DIR }}
+        env:
+          APPLE_API_KEY: ${{ env.APPSTORE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ env.APPSTORE_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ env.SECRET_PATH_APPLE_API_KEY_P8 }}
+          IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+        run: pnpm tauri ios build --export-method app-store-connect --ci
+
+      - name: Upload IPA to TestFlight
+        run: |
+          set -eu
+          IPA=$(ls "$CHAT_DIR"/src-tauri/gen/apple/build/arm64/*.ipa | head -n1)
+          echo "Uploading $IPA"
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$IPA" \
+            --apiKey "$APPSTORE_API_KEY_ID" \
+            --apiIssuer "$APPSTORE_API_ISSUER_ID"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ios-ipa
+          path: ${{ env.CHAT_DIR }}/src-tauri/gen/apple/build/arm64/*.ipa
+          if-no-files-found: warn
+          retention-days: 14
+
+  macos-testflight:
+    name: macOS → TestFlight
+    needs: plan
+    if: needs.plan.outputs.run_macos_testflight == '1'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust node pnpm age
+
+      - uses: ./.github/actions/decrypt-secrets
+        with:
+          age-identity: ${{ secrets.AGE_IDENTITY }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: macos-mas-release
+
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.CHAT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage App Store Connect API key
+        run: |
+          set -eu
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          install -m 600 "$SECRET_PATH_APPLE_API_KEY_P8" \
+            "$HOME/.appstoreconnect/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+
+      - name: Import MAS signing certificates
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$SECRET_PATH_MAS_APP_P12" \
+            -P "$APPLE_MAS_APP_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security import "$SECRET_PATH_MAS_INSTALLER_P12" \
+            -P "$APPLE_MAS_INSTALLER_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | xargs)
+          security set-key-partition-list -S apple-tool:,apple:,productbuild: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "--- codesigning identities ---"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          echo "--- all identities ---"
+          security find-identity -v "$KEYCHAIN"
+
+      - name: Resolve signing identity names
+        id: identities
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          APP_IDENT=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F\" '/3rd Party Mac Developer Application/ {print $2; exit}')
+          INSTALLER_IDENT=$(security find-identity -v "$KEYCHAIN" \
+            | awk -F\" '/3rd Party Mac Developer Installer/ {print $2; exit}')
+          if [ -z "$APP_IDENT" ] || [ -z "$INSTALLER_IDENT" ]; then
+            echo "Missing 3rd Party Mac Developer identity in keychain" >&2
+            exit 1
+          fi
+          echo "Application: $APP_IDENT"
+          echo "Installer:   $INSTALLER_IDENT"
+          echo "app=$APP_IDENT" >> "$GITHUB_OUTPUT"
+          echo "installer=$INSTALLER_IDENT" >> "$GITHUB_OUTPUT"
+
+      - name: Install MAS provisioning profile
+        run: |
+          set -eu
+          install -m 600 "$SECRET_PATH_MAS_APPSTORE_PROVISIONPROFILE" \
+            "$CHAT_DIR/src-tauri/embedded.provisionprofile"
+
+      - name: Build macOS app bundle (MAS)
+        working-directory: ${{ env.CHAT_DIR }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.identities.outputs.app }}
+          APPLE_API_KEY: ${{ env.APPSTORE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ env.APPSTORE_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ env.SECRET_PATH_APPLE_API_KEY_P8 }}
+        run: |
+          pnpm tauri build \
+            --target universal-apple-darwin \
+            --bundles app \
+            --config src-tauri/tauri.mas.conf.json
+
+      - name: Wrap .app as signed .pkg
+        id: pkg
+        env:
+          INSTALLER_IDENT: ${{ steps.identities.outputs.installer }}
+        run: |
+          set -eu
+          APP_PATH=$(ls -d target/universal-apple-darwin/release/bundle/macos/*.app | head -n1)
+          PKG_PATH="$RUNNER_TEMP/${APP_NAME}.pkg"
+          echo "Building installer from $APP_PATH"
+          xcrun productbuild \
+            --sign "$INSTALLER_IDENT" \
+            --component "$APP_PATH" /Applications \
+            "$PKG_PATH"
+          echo "pkg_path=$PKG_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload PKG to TestFlight
+        env:
+          PKG_PATH: ${{ steps.pkg.outputs.pkg_path }}
+        run: |
+          xcrun altool --upload-app \
+            --type macos \
+            --file "$PKG_PATH" \
+            --apiKey "$APPSTORE_API_KEY_ID" \
+            --apiIssuer "$APPSTORE_API_ISSUER_ID"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-mas-pkg
+          path: ${{ runner.temp }}/*.pkg
+          if-no-files-found: warn
+          retention-days: 14
+
+  macos-release-build:
+    name: macOS release build
+    needs: plan
+    if: needs.plan.outputs.run_macos_release == '1'
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust node pnpm age
+
+      - uses: ./.github/actions/decrypt-secrets
+        with:
+          age-identity: ${{ secrets.AGE_IDENTITY }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: macos-developer-id-release
+
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.CHAT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Import Developer ID certificate
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$SECRET_PATH_DEVELOPER_ID_P12" \
+            -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | xargs)
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+      - name: Resolve Developer ID identity
+        id: identity
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          IDENT=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F\" '/Developer ID Application/ {print $2; exit}')
+          if [ -z "$IDENT" ]; then
+            echo "No Developer ID Application identity found" >&2
+            exit 1
+          fi
+          echo "Developer ID: $IDENT"
+          echo "app=$IDENT" >> "$GITHUB_OUTPUT"
+
+      - name: Build signed + notarized .app/.dmg (Developer ID)
+        working-directory: ${{ env.CHAT_DIR }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.identity.outputs.app }}
+          APPLE_API_KEY: ${{ env.APPSTORE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ env.APPSTORE_API_ISSUER_ID }}
+          APPLE_API_KEY_PATH: ${{ env.SECRET_PATH_APPLE_API_KEY_P8 }}
+        run: |
+          pnpm tauri build \
+            --target universal-apple-darwin \
+            --bundles app dmg
+
+      - name: Stage release artifacts
+        run: |
+          set -eu
+          OUT="$RUNNER_TEMP/release"
+          mkdir -p "$OUT"
+          cp target/universal-apple-darwin/release/bundle/dmg/*.dmg "$OUT/" 2>/dev/null || true
+          APP_PATH=$(ls -d target/universal-apple-darwin/release/bundle/macos/*.app | head -n1)
+          APP_BASE=$(basename "$APP_PATH" .app)
+          (cd "$(dirname "$APP_PATH")" && zip -qry "$OUT/${APP_BASE}.app.zip" "$(basename "$APP_PATH")")
+          ls -lh "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  android-release-build:
+    name: Android release build
+    needs: plan
+    if: needs.plan.outputs.run_android_release == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust node pnpm java age
+
+      - uses: ./.github/actions/decrypt-secrets
+        with:
+          age-identity: ${{ secrets.AGE_IDENTITY }}
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libglib2.0-dev pkg-config
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: android-release
+
+      - name: Add Rust Android targets
+        run: |
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            x86_64-linux-android
+
+      - name: Set up Android NDK environment
+        run: |
+          set -eu
+          if [ -z "${ANDROID_NDK_ROOT:-}" ]; then
+            NDK_DIR=$(ls -1d "$ANDROID_HOME"/ndk/*/ | sort -V | tail -n1 | sed 's:/$::')
+            echo "ANDROID_NDK_ROOT=$NDK_DIR" >> "$GITHUB_ENV"
+            echo "ANDROID_NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+            echo "NDK_HOME=$NDK_DIR" >> "$GITHUB_ENV"
+            echo "Using NDK at $NDK_DIR"
+          fi
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.CHAT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure Android signing
+        run: |
+          set -eu
+          ANDROID_DIR="$CHAT_DIR/src-tauri/gen/android"
+          {
+            echo "storeFile=$SECRET_PATH_ANDROID_RELEASE_JKS"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+          } > "$ANDROID_DIR/keystore.properties"
+
+      - name: Build universal APK
+        working-directory: ${{ env.CHAT_DIR }}
+        env:
+          ORG_GRADLE_PROJECT_androidTargetAbis: arm64-v8a,armeabi-v7a,x86_64
+        run: |
+          pnpm tauri android build --apk \
+            --target aarch64 \
+            --target armv7 \
+            --target x86_64
+
+      - name: Stage APK
+        run: |
+          set -eu
+          OUT="$RUNNER_TEMP/release"
+          mkdir -p "$OUT"
+          APK_SRC=$(find "$CHAT_DIR/src-tauri/gen/android/app/build/outputs/apk" \
+            -type f -name '*.apk' \
+            | grep -Ei '/release/|/universal/' \
+            | head -n1 || true)
+          if [ -z "$APK_SRC" ]; then
+            echo "No release APK found; listing outputs:" >&2
+            find "$CHAT_DIR/src-tauri/gen/android/app/build/outputs" -type f >&2 || true
+            exit 1
+          fi
+          VERSION=$(python3 -c "import json; print(json.load(open('$CHAT_DIR/src-tauri/tauri.conf.json'))['version'])")
+          DEST="$OUT/${APP_NAME}-${VERSION}-universal.apk"
+          cp "$APK_SRC" "$DEST"
+          ls -lh "$OUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    needs: [plan, macos-release-build, android-release-build]
+    if: |
+      always()
+        && startsWith(github.ref, 'refs/tags/iroh-ble-chat-v')
+        && (needs.macos-release-build.result == 'success' || needs.android-release-build.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: List release artifacts
+        run: ls -lh "$RUNNER_TEMP/artifacts"
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ runner.temp }}/artifacts/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}
