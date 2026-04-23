@@ -25,11 +25,7 @@ library for Rust.
 
 ## Supported Platforms
 
-| Platform    |
-|-------------|
-| macOS / iOS |
-| Linux       |
-| Android     |
+This library currently supports iOS, macOS, Android, and Linux.
 
 ## Usage
 
