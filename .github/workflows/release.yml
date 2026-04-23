@@ -396,6 +396,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: Release
     timeout-minutes: 45
+    env:
+      # mise.toml declares `android-sdk` as a managed tool. On every pnpm
+      # invocation (pnpm is on PATH via mise shims), the shim re-activates
+      # mise and resets ANDROID_HOME to the mise install dir — which has
+      # no NDK, so Tauri's ensure_ndk() bails with "Android NDK not found".
+      # Disable the tool for this job so mise leaves ANDROID_HOME alone.
+      MISE_DISABLE_TOOLS: android-sdk
     steps:
       - uses: actions/checkout@v6
       - uses: jdx/mise-action@v4
