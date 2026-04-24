@@ -52,6 +52,11 @@ env:
   CHAT_DIR: demos/iroh-ble-chat
   BUNDLE_ID: org.jakebot.iroh-ble-chat
   APPLE_TEAM_ID: XG66F95CNS
+  # Pre-trust the repo's mise.toml for every shell on every runner — the
+  # Xcode preBuildScript in gen/apple/project.yml shells out to `pnpm`
+  # (a mise shim), which re-activates mise inside a subshell that doesn't
+  # inherit the trust state `jdx/mise-action@v4` configured at job start.
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
 
 jobs:
   plan:
