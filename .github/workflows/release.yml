@@ -294,11 +294,14 @@ jobs:
 
       - name: Build macOS app bundle (MAS)
         working-directory: ${{ env.CHAT_DIR }}
+        # Intentionally NOT setting APPLE_API_KEY* env vars here: Tauri
+        # would otherwise try to notarize the output, but notarization
+        # only accepts Developer ID-signed binaries. MAS binaries are
+        # signed with the "3rd Party Mac Developer Application" identity
+        # and validated server-side by Apple when the .pkg is uploaded
+        # to App Store Connect — no notarization step involved.
         env:
           APPLE_SIGNING_IDENTITY: ${{ steps.identities.outputs.app }}
-          APPLE_API_KEY: ${{ env.APPSTORE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ env.APPSTORE_API_ISSUER_ID }}
-          APPLE_API_KEY_PATH: ${{ env.SECRET_PATH_APPLE_API_KEY_P8 }}
         run: |
           pnpm tauri build \
             --target universal-apple-darwin \
