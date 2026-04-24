@@ -333,7 +333,8 @@ jobs:
         if: needs.plan.outputs.dry_run == 'true'
         env:
           PKG_PATH: ${{ steps.pkg.outputs.pkg_path }}
-        run: echo "::notice::Dry run: built $PKG_PATH but skipped App Store Connect upload."
+        run: |
+          echo "::notice::Dry run: built $PKG_PATH but skipped App Store Connect upload."
 
       - uses: actions/upload-artifact@v4
         if: always()
