@@ -27,7 +27,7 @@ use crate::transport::driver::{BlewDriver, Driver, IncomingPacket};
 use crate::transport::events::{
     run_central_events, run_l2cap_accept, run_peripheral_requests, run_peripheral_state_events,
 };
-use crate::transport::hook::{BleDedupHook, VerifiedEndpointEvent};
+use crate::transport::hook::{BleDedupHook, HookEvent};
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
 use crate::transport::routing::{TOKEN_LEN, parse_token_addr, token_custom_addr};
@@ -241,50 +241,13 @@ pub struct BleMetricsSnapshot {
     pub empty_frames: u64,
 }
 
-/// RAII guard for the pipe-lifetime watchdog spawned by
-/// [`BleTransport::start_pipe_watchdog`]. Dropping this guard aborts
-/// the watchdog task.
-///
-/// ## Why this isn't held inside `BleTransport`
-///
-/// The watchdog task needs to call `remote_info()` on the iroh
-/// `Endpoint`, so it holds an `Arc<Endpoint>` internally. Iroh's
-/// `Endpoint` in turn holds the transports list, which holds
-/// `Arc<BleTransport>` (installed via
-/// [`BleTransport::as_custom_transport`]). If `BleTransport` also
-/// stored the watchdog's task handle, we'd have a reference cycle
-/// (`Arc<BleTransport>` → task → `Endpoint` → `Arc<BleTransport>`)
-/// and neither would ever be dropped.
-///
-/// Iroh 0.98 does not expose a `Weak<Endpoint>` handle that would
-/// let us break the cycle. A future iroh release may add one, or an
-/// `on_connection_closed` hook that obviates the watchdog entirely —
-/// when that lands this guard can become an internal detail.
-#[must_use = "dropping the PipeWatchdog aborts the watchdog task"]
-pub struct PipeWatchdog {
-    handle: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for PipeWatchdog {
-    fn drop(&mut self) {
-        tracing::info!("pipe_watchdog: guard dropped; aborting watchdog task");
-        self.handle.abort();
-    }
-}
-
-impl std::fmt::Debug for PipeWatchdog {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PipeWatchdog").finish()
-    }
-}
-
 pub struct BleTransport {
     local_id: EndpointId,
     /// Sender half of the verified-endpoint channel. Cloned into every
     /// [`BleDedupHook`] returned from [`BleTransport::dedup_hook`]; the
     /// receiver half is consumed by the forwarder task spawned at
     /// construction time.
-    verified_tx: tokio::sync::mpsc::UnboundedSender<VerifiedEndpointEvent>,
+    hook_tx: tokio::sync::mpsc::UnboundedSender<HookEvent>,
     handle: RegistryHandle,
     incoming_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingPacket>>>,
     /// Authoritative routing table. Tracks scan hints, pending
@@ -308,6 +271,54 @@ pub struct BleTransport {
 impl std::fmt::Debug for BleTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BleTransport").finish()
+    }
+}
+
+async fn handle_hook_event(
+    inbox: &mpsc::Sender<PeerCommand>,
+    routing: &crate::transport::routing::Routing,
+    event: HookEvent,
+) -> Result<(), mpsc::error::SendError<PeerCommand>> {
+    match event {
+        HookEvent::VerifiedEndpoint {
+            endpoint_id,
+            token,
+            evicted_devices,
+        } => {
+            // Fire teardown for any pipes the promote rule evicted to make
+            // room for this handshake. Each `Stalled` causes the registry
+            // to drain the device's pipe and close its BLE channel; the
+            // pipe worker then exits, which evicts the lingering routing
+            // pipe record.
+            for device_id in evicted_devices {
+                inbox.send(PeerCommand::Stalled { device_id }).await?;
+            }
+            inbox
+                .send(PeerCommand::VerifiedEndpoint { endpoint_id, token })
+                .await
+        }
+        HookEvent::ConnectionClosed {
+            endpoint_id,
+            stable_id,
+        } => {
+            if routing
+                .evict_routable_if_pipe(&endpoint_id, stable_id)
+                .is_some()
+            {
+                let device_id = routing.device_for_pipe(stable_id);
+                routing.evict_pipe_state(stable_id);
+                if let Some(device_id) = device_id {
+                    tracing::info!(
+                        %endpoint_id,
+                        %stable_id,
+                        device = %device_id,
+                        "iroh connection closed; tearing BLE pipe down"
+                    );
+                    inbox.send(PeerCommand::Stalled { device_id }).await?;
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -421,34 +432,15 @@ impl BleTransport {
                 .await;
         });
 
-        // Verified-endpoint channel: the hook returned from
-        // `BleTransport::dedup_hook` sends events here, the forwarder
-        // below translates them into `PeerCommand`s the registry acts on.
-        let (verified_tx, mut verified_rx) =
-            tokio::sync::mpsc::unbounded_channel::<VerifiedEndpointEvent>();
+        // Hook channel: the hook returned from `BleTransport::dedup_hook`
+        // sends verified-endpoint and connection-close events here; the
+        // forwarder translates them into `PeerCommand`s the registry acts on.
+        let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookEvent>();
         let forwarder_inbox = inbox_tx.clone();
+        let forwarder_routing = Arc::clone(&routing);
         tokio::spawn(async move {
-            while let Some(verified) = verified_rx.recv().await {
-                // Fire teardown for any pipes the promote rule
-                // evicted to make room for this handshake. Each
-                // `Stalled` causes the registry to drain the
-                // device's pipe and close its BLE channel; the
-                // pipe worker then exits, which evicts the
-                // lingering routing pipe record.
-                for device_id in verified.evicted_devices {
-                    if forwarder_inbox
-                        .send(PeerCommand::Stalled { device_id })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                if forwarder_inbox
-                    .send(PeerCommand::VerifiedEndpoint {
-                        endpoint_id: verified.endpoint_id,
-                        token: verified.token,
-                    })
+            while let Some(event) = hook_rx.recv().await {
+                if handle_hook_event(&forwarder_inbox, &forwarder_routing, event)
                     .await
                     .is_err()
                 {
@@ -476,7 +468,7 @@ impl BleTransport {
 
         Ok(Arc::new(Self {
             local_id,
-            verified_tx,
+            hook_tx,
             handle: RegistryHandle {
                 inbox: inbox_tx,
                 snapshots,
@@ -512,7 +504,7 @@ impl BleTransport {
         BleDedupHook::new(
             self.local_id,
             Arc::clone(&self.routing),
-            self.verified_tx.clone(),
+            self.hook_tx.clone(),
         )
     }
 
@@ -522,35 +514,6 @@ impl BleTransport {
     #[must_use]
     pub fn routing_snapshot(&self) -> crate::transport::routing::RoutingSnapshot {
         self.routing.snapshot()
-    }
-
-    /// Start the pipe-lifetime watchdog. Polls `endpoint.remote_info`
-    /// for every routable entry and, when iroh reports no active path,
-    /// tells the registry to drain the corresponding BLE pipe. See
-    /// [`crate::transport::pipe_watchdog`] for the full contract.
-    ///
-    /// The returned [`PipeWatchdog`] is a drop-guard: dropping it
-    /// aborts the watchdog task. Bind it to a variable whose lifetime
-    /// matches the endpoint (e.g. the same scope, or a field on your
-    /// app state) to keep the watchdog running.
-    ///
-    /// `endpoint` is cloned internally (`iroh::Endpoint` is already
-    /// internally `Arc`-backed, so this is cheap).
-    ///
-    /// This must be a separate call rather than being bundled into the
-    /// transport because holding the `Endpoint` on `BleTransport` would
-    /// create a reference cycle — see the module documentation on
-    /// [`PipeWatchdog`] for details.
-    #[must_use = "dropping the returned PipeWatchdog aborts the watchdog task"]
-    pub fn start_pipe_watchdog(&self, endpoint: &iroh::Endpoint) -> PipeWatchdog {
-        let handle = crate::transport::pipe_watchdog::spawn(
-            Arc::new(endpoint.clone()),
-            Arc::clone(&self.routing),
-            self.handle.inbox.clone(),
-            crate::transport::pipe_watchdog::DEFAULT_POLL_INTERVAL,
-            crate::transport::pipe_watchdog::DEFAULT_GRACE_PERIOD,
-        );
-        PipeWatchdog { handle }
     }
 
     /// Debug-only: list the pipes currently tracked by the shadow
@@ -1054,7 +1017,7 @@ impl AddressLookup for BleAddressLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::routing::{Direction, Routing, StableConnId};
+    use crate::transport::routing::{Dialer, Direction, Routing, StableConnId};
     use n0_future::Stream;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -1085,6 +1048,10 @@ mod tests {
         secret.public()
     }
 
+    fn dev(s: &str) -> blew::DeviceId {
+        blew::DeviceId::from(s)
+    }
+
     fn extract_token(
         stream: &mut n0_future::stream::Boxed<Result<Item, address_lookup::Error>>,
         cx: &mut Context<'_>,
@@ -1104,6 +1071,62 @@ mod tests {
             }
             other => panic!("expected Ready(Some(Ok(_))), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn hook_connection_closed_stalls_current_routable_pipe() {
+        let routing = Arc::new(Routing::new());
+        let endpoint_id = endpoint_id_with_first_byte(0xA1);
+        let stable_id = routing.register_pipe(dev("close-current"), Direction::Outbound);
+        routing.insert_routable(endpoint_id, stable_id, Dialer::Low);
+
+        let (tx, mut rx) = mpsc::channel::<PeerCommand>(4);
+        handle_hook_event(
+            &tx,
+            &routing,
+            HookEvent::ConnectionClosed {
+                endpoint_id,
+                stable_id,
+            },
+        )
+        .await
+        .expect("hook event should forward");
+
+        assert_eq!(routing.routable_pipe_for(&endpoint_id), None);
+        match rx.try_recv().expect("Stalled emitted") {
+            PeerCommand::Stalled { device_id } => {
+                assert_eq!(device_id, dev("close-current"));
+            }
+            other => panic!("expected Stalled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_connection_closed_ignores_stale_pipe_after_replacement() {
+        let routing = Arc::new(Routing::new());
+        let endpoint_id = endpoint_id_with_first_byte(0xA2);
+        let old_id = routing.register_pipe(dev("close-old"), Direction::Outbound);
+        routing.insert_routable(endpoint_id, old_id, Dialer::Low);
+        let new_id = routing.register_pipe(dev("close-new"), Direction::Inbound);
+        routing.insert_routable(endpoint_id, new_id, Dialer::High);
+
+        let (tx, mut rx) = mpsc::channel::<PeerCommand>(4);
+        handle_hook_event(
+            &tx,
+            &routing,
+            HookEvent::ConnectionClosed {
+                endpoint_id,
+                stable_id: old_id,
+            },
+        )
+        .await
+        .expect("hook event should be ignored cleanly");
+
+        assert_eq!(routing.routable_pipe_for(&endpoint_id), Some(new_id));
+        assert!(
+            rx.try_recv().is_err(),
+            "stale close must not stall replacement pipe"
+        );
     }
 
     // ---------- Test #1: resolve parks until scan or pipe appears ----------

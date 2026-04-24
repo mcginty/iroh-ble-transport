@@ -30,8 +30,31 @@ This library currently supports iOS, macOS, Android, and Linux.
 ## Usage
 
 BLE is a high-touch transport — it needs more wiring than the IP-based
-defaults (a dedup hook, an address lookup, BLE-tuned QUIC config, and a
-pipe-lifetime watchdog). See:
+defaults (a dedup hook and an address lookup):
+
+```rust
+use iroh::endpoint::presets;
+use iroh::{Endpoint, SecretKey};
+use iroh_ble_transport::BleTransport;
+
+async fn bind_ble_endpoint() -> anyhow::Result<Endpoint> {
+    let secret_key = SecretKey::generate();
+    let ble = BleTransport::builder().build(secret_key.public()).await?;
+
+    let endpoint = Endpoint::builder(presets::N0DisableRelay)
+        .hooks(ble.dedup_hook())
+        .add_custom_transport(ble.as_custom_transport())
+        .address_lookup(ble.address_lookup())
+        .secret_key(secret_key)
+        .clear_ip_transports()
+        .bind()
+        .await?;
+
+    Ok(endpoint)
+}
+```
+
+See:
 
 - [`examples/initialization.rs`](crates/iroh-ble-transport/examples/initialization.rs)
   — the minimum viable setup, end to end.

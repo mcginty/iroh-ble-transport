@@ -632,11 +632,11 @@ impl Routing {
 
     /// Snapshot of the current routable pool for the pipe-lifetime
     /// watchdog. Each entry is resolved into
-    /// `(endpoint_id, stable_id, device_id, verified_at)` so the
-    /// watchdog can cross-reference iroh's `remote_info` and, on
-    /// mismatch, push the matching `DeviceId` to the registry for
-    /// tearing down the BLE pipe. Entries with no corresponding pipe
-    /// in `pipes` are dropped from the snapshot (the pipe was evicted
+    /// `(endpoint_id, stable_id, device_id, verified_at)` so close
+    /// handlers can cross-reference iroh connection lifecycle events
+    /// and push the matching `DeviceId` to the registry for tearing
+    /// down the BLE pipe. Entries with no corresponding pipe in
+    /// `pipes` are dropped from the snapshot (the pipe was evicted
     /// between the lock releases).
     #[must_use]
     pub fn routable_entries(&self) -> Vec<RoutableSnapshot> {

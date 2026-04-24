@@ -11,7 +11,6 @@ use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_
 use iroh_ble_transport::transport::BleTransport;
 use iroh_ble_transport::{
     BlePeerInfo, BlePeerPhase, Central, CentralConfig, ConnectPath, L2capPolicy, Peripheral,
-    PipeWatchdog,
 };
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
@@ -137,8 +136,6 @@ struct AppState {
     endpoint: Option<Endpoint>,
     /// Dropping this kills gossip, so we hold it for the app lifetime.
     _router: Option<Router>,
-    /// Dropping this aborts the BLE pipe watchdog, so we hold it for the app lifetime.
-    _watchdog: Option<PipeWatchdog>,
     gossip_sender: Option<iroh_gossip::api::GossipSender>,
     ble_transport: Option<Arc<BleTransport>>,
     peers: HashMap<EndpointId, PeerState>,
@@ -342,12 +339,6 @@ async fn start_node(
         .map_err(|e| format!("gossip subscribe: {e}"))?;
 
     let (sender, receiver) = topic.split();
-
-    // Spawn the pipe-lifetime watchdog now that the iroh Endpoint is
-    // bound. When iroh decides a peer's Connection is gone (via its
-    // max_idle_timeout of 15 s above), the watchdog tells the BLE
-    // transport to tear down the pipe instead of holding the radio open.
-    st._watchdog = Some(ble_transport.start_pipe_watchdog(&ep));
 
     st.endpoint = Some(ep);
     st._router = Some(router);
@@ -1897,7 +1888,6 @@ pub fn run() {
                 cache_dir,
                 endpoint: None,
                 _router: None,
-                _watchdog: None,
                 gossip_sender: None,
                 ble_transport: None,
                 peers: HashMap::new(),

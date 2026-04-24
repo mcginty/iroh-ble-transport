@@ -125,7 +125,6 @@ async fn run_listener() -> Result<(), Box<dyn std::error::Error>> {
         .clear_ip_transports()
         .bind()
         .await?;
-    let _watchdog = ble.start_pipe_watchdog(&ep);
 
     println!("Listening. Endpoint ID:");
     println!("  {public}");
@@ -300,7 +299,6 @@ async fn run_dialer(remote_str: &str) -> Result<(), Box<dyn std::error::Error>> 
         .clear_ip_transports()
         .bind()
         .await?;
-    let _watchdog = ble.start_pipe_watchdog(&ep);
 
     println!("Scanning for peer {}...", remote_id.fmt_short());
     println!("(Make sure the listener is running on another machine)");

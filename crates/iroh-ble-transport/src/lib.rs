@@ -13,5 +13,5 @@ pub use error::{BleError, BleResult};
 pub use transport::hook::BleDedupHook;
 pub use transport::{
     BlePeerInfo, BlePeerPhase, BleTransport, BleTransportBuilder, ConnectPath, InMemoryPeerStore,
-    IncomingPacket, KEY_PREFIX_LEN, KeyPrefix, L2capPolicy, PeerSnapshot, PeerStore, PipeWatchdog,
+    IncomingPacket, KEY_PREFIX_LEN, KeyPrefix, L2capPolicy, PeerSnapshot, PeerStore,
 };

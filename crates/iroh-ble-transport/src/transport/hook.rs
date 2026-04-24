@@ -40,22 +40,28 @@ use crate::transport::transport::BLE_TRANSPORT_ID;
 /// this struct holds all point at transport-owned state, not at the
 /// endpoint, so there's no cycle.
 #[derive(Debug, Clone)]
-pub(crate) struct VerifiedEndpointEvent {
-    pub endpoint_id: EndpointId,
-    pub token: Option<u64>,
-    /// `DeviceId`s of pipes the `promote()` rule evicted to make room
-    /// for this handshake. The forwarder on the transport side turns
-    /// each into a `PeerCommand::Stalled` so the old BLE pipes get
-    /// drained and closed rather than zombied until their own
-    /// `LinkDead` detection or BLE ACL drop.
-    pub evicted_devices: Vec<DeviceId>,
+pub(crate) enum HookEvent {
+    VerifiedEndpoint {
+        endpoint_id: EndpointId,
+        token: Option<u64>,
+        /// `DeviceId`s of pipes the `promote()` rule evicted to make room
+        /// for this handshake. The forwarder on the transport side turns
+        /// each into a `PeerCommand::Stalled` so the old BLE pipes get
+        /// drained and closed rather than zombied until their own
+        /// `LinkDead` detection or BLE ACL drop.
+        evicted_devices: Vec<DeviceId>,
+    },
+    ConnectionClosed {
+        endpoint_id: EndpointId,
+        stable_id: StableConnId,
+    },
 }
 
 #[derive(Debug, Clone)]
 pub struct BleDedupHook {
     self_endpoint: EndpointId,
     routing: Arc<Routing>,
-    tx: mpsc::UnboundedSender<VerifiedEndpointEvent>,
+    tx: mpsc::UnboundedSender<HookEvent>,
 }
 
 impl BleDedupHook {
@@ -63,7 +69,7 @@ impl BleDedupHook {
     pub(crate) fn new(
         self_endpoint: EndpointId,
         routing: Arc<Routing>,
-        tx: mpsc::UnboundedSender<VerifiedEndpointEvent>,
+        tx: mpsc::UnboundedSender<HookEvent>,
     ) -> Self {
         Self {
             self_endpoint,
@@ -77,8 +83,10 @@ impl EndpointHooks for BleDedupHook {
     async fn after_handshake<'a>(&'a self, conn: &'a ConnectionInfo) -> AfterHandshakeOutcome {
         let remote_endpoint = conn.remote_id();
         let token = conn
-            .selected_path()
-            .and_then(|path| match path.remote_addr() {
+            .paths()
+            .into_iter()
+            .filter(|path| !path.is_closed())
+            .find_map(|path| match path.remote_addr() {
                 TransportAddr::Custom(addr) if addr.id() == BLE_TRANSPORT_ID => {
                     parse_token_addr(addr).ok()
                 }
@@ -93,6 +101,7 @@ impl EndpointHooks for BleDedupHook {
         // connection. The evicted pipes' DeviceIds are forwarded so
         // the registry can `Stalled` them into teardown.
         let mut evicted_devices: Vec<DeviceId> = Vec::new();
+        let mut close_watch: Option<StableConnId> = None;
         if let Some(token) = token {
             let stable_id = StableConnId::from_raw(token);
             match self
@@ -105,7 +114,7 @@ impl EndpointHooks for BleDedupHook {
                         %stable_id,
                         "BleDedupHook: rejecting handshake (promotion rule said so)"
                     );
-                    let _ = self.tx.send(VerifiedEndpointEvent {
+                    let _ = self.tx.send(HookEvent::VerifiedEndpoint {
                         endpoint_id: remote_endpoint,
                         token: Some(token),
                         evicted_devices: Vec::new(),
@@ -133,6 +142,7 @@ impl EndpointHooks for BleDedupHook {
                         evicted_devices = evicted_devices.len(),
                         "BleDedupHook: promoted to routable"
                     );
+                    close_watch = Some(stable_id);
                 }
             }
         }
@@ -140,11 +150,22 @@ impl EndpointHooks for BleDedupHook {
         // Forward to the actor loop; the forwarder on the transport
         // side dispatches `PeerCommand::Stalled` for each evicted
         // device so its pipe worker is properly drained.
-        let _ = self.tx.send(VerifiedEndpointEvent {
+        let _ = self.tx.send(HookEvent::VerifiedEndpoint {
             endpoint_id: remote_endpoint,
             token,
             evicted_devices,
         });
+        if let Some(stable_id) = close_watch {
+            let conn = conn.clone();
+            let tx = self.tx.clone();
+            tokio::spawn(async move {
+                let _ = conn.closed().await;
+                let _ = tx.send(HookEvent::ConnectionClosed {
+                    endpoint_id: remote_endpoint,
+                    stable_id,
+                });
+            });
+        }
         AfterHandshakeOutcome::Accept
     }
 }
