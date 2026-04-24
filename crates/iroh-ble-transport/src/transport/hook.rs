@@ -11,40 +11,36 @@ use crate::transport::transport::BLE_TRANSPORT_ID;
 
 /// `EndpointHooks` implementation that runs the pending→routable
 /// promotion rule against `routing` the instant iroh's TLS
-/// handshake binds a connection to an `EndpointId`. See
-/// [`crate::transport::routing::Routing::promote`] for the rule.
+/// handshake binds a connection to an `EndpointId`.
 ///
-/// Install alongside `add_custom_transport`:
+/// Obtain an instance via [`BleTransport::dedup_hook`]:
 ///
 /// ```no_run
-/// # use iroh_ble_transport::{BleDedupHook, BleTransport, BleTransportConfig};
-/// # use std::sync::Arc;
+/// # use iroh_ble_transport::BleTransport;
+/// # use iroh::{Endpoint, SecretKey, endpoint::presets};
 /// # async fn example() -> anyhow::Result<()> {
-/// # let (id, c, p) = todo!();
-/// let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-/// let transport = BleTransport::with_config(id, c, p, BleTransportConfig {
-///     verified_rx: Some(rx),
-///     ..Default::default()
-/// }).await?;
-/// let hook = BleDedupHook::new(
-///     id,
-///     transport.routing_handle(),
-///     tx,
-/// );
-/// iroh::Endpoint::builder()
-///     .hooks(hook)
-///     .add_custom_transport(transport)
-///     .bind().await?;
+/// # let secret_key = SecretKey::generate();
+/// let ble = BleTransport::builder().build(secret_key.public()).await?;
+///
+/// Endpoint::builder(presets::N0DisableRelay)
+///     .hooks(ble.dedup_hook())
+///     .add_custom_transport(ble.as_custom_transport())
+///     .address_lookup(ble.address_lookup())
+///     .secret_key(secret_key)
+///     .bind()
+///     .await?;
 /// # Ok(())
 /// # }
 /// ```
+///
+/// [`BleTransport::dedup_hook`]: crate::BleTransport::dedup_hook
 ///
 /// CAVEAT: never store an `Endpoint` on the hook — doing so creates an Arc
 /// cycle because the endpoint holds the hook via its own Arc. The `Arc`s
 /// this struct holds all point at transport-owned state, not at the
 /// endpoint, so there's no cycle.
 #[derive(Debug, Clone)]
-pub struct VerifiedEndpointEvent {
+pub(crate) struct VerifiedEndpointEvent {
     pub endpoint_id: EndpointId,
     pub token: Option<u64>,
     /// `DeviceId`s of pipes the `promote()` rule evicted to make room
@@ -64,7 +60,7 @@ pub struct BleDedupHook {
 
 impl BleDedupHook {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         self_endpoint: EndpointId,
         routing: Arc<Routing>,
         tx: mpsc::UnboundedSender<VerifiedEndpointEvent>,

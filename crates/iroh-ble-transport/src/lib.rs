@@ -10,8 +10,8 @@ pub use blew::peripheral::{
 };
 pub use blew::{BleDevice, Central, CentralConfig, DeviceId, Peripheral};
 pub use error::{BleError, BleResult};
-pub use transport::hook::{BleDedupHook, VerifiedEndpointEvent};
+pub use transport::hook::BleDedupHook;
 pub use transport::{
-    BlePeerInfo, BlePeerPhase, BleTransport, BleTransportConfig, ConnectPath, InMemoryPeerStore,
-    IncomingPacket, KEY_PREFIX_LEN, KeyPrefix, L2capPolicy, PeerSnapshot, PeerStore,
+    BlePeerInfo, BlePeerPhase, BleTransport, BleTransportBuilder, ConnectPath, InMemoryPeerStore,
+    IncomingPacket, KEY_PREFIX_LEN, KeyPrefix, L2capPolicy, PeerSnapshot, PeerStore, PipeWatchdog,
 };

@@ -27,7 +27,7 @@ use crate::transport::driver::{BlewDriver, Driver, IncomingPacket};
 use crate::transport::events::{
     run_central_events, run_l2cap_accept, run_peripheral_requests, run_peripheral_state_events,
 };
-use crate::transport::hook::VerifiedEndpointEvent;
+use crate::transport::hook::{BleDedupHook, VerifiedEndpointEvent};
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
 use crate::transport::routing::{TOKEN_LEN, parse_token_addr, token_custom_addr};
@@ -58,37 +58,105 @@ pub enum L2capPolicy {
     PreferL2cap,
 }
 
-pub struct BleTransportConfig {
-    pub l2cap_policy: L2capPolicy,
-    /// Persistent peer cache. Defaults to an in-memory store; applications
-    /// that want durable state across restarts can plug in their own
-    /// implementation of [`PeerStore`]. The transport writes a snapshot
-    /// whenever a peer leaves `Connected`, and forgets a peer when it
-    /// transitions to `Dead { MaxRetries }`.
-    pub store: Arc<dyn PeerStore>,
-    /// Receiver for verified [`EndpointId`] events emitted by a
-    /// [`crate::BleDedupHook`] installed on the iroh `Endpoint`. When `None`,
-    /// handshake-time dedup is effectively disabled — useful for tests that
-    /// don't run a real iroh `Endpoint`.
-    pub verified_rx: Option<tokio::sync::mpsc::UnboundedReceiver<VerifiedEndpointEvent>>,
+/// Builder for [`BleTransport`].
+///
+/// Use [`BleTransport::builder`] to get an instance, chain configuration
+/// methods, then call [`BleTransportBuilder::build`] with your
+/// `EndpointId` to construct the transport.
+///
+/// Defaults:
+/// - [`L2capPolicy::PreferL2cap`]
+/// - [`Central::new`] + [`Peripheral::new`] are constructed with
+///   default config at `build` time
+/// - [`InMemoryPeerStore`] (non-durable across restarts)
+pub struct BleTransportBuilder {
+    l2cap_policy: L2capPolicy,
+    central: Option<Arc<Central>>,
+    peripheral: Option<Arc<Peripheral>>,
+    peer_store: Option<Arc<dyn PeerStore>>,
 }
 
-impl Default for BleTransportConfig {
-    fn default() -> Self {
+impl BleTransportBuilder {
+    fn new() -> Self {
         Self {
             l2cap_policy: L2capPolicy::default(),
-            store: Arc::new(InMemoryPeerStore::new()),
-            verified_rx: None,
+            central: None,
+            peripheral: None,
+            peer_store: None,
         }
+    }
+
+    /// Override the L2CAP policy. Defaults to [`L2capPolicy::PreferL2cap`].
+    #[must_use]
+    pub fn l2cap_policy(mut self, policy: L2capPolicy) -> Self {
+        self.l2cap_policy = policy;
+        self
+    }
+
+    /// Supply a pre-constructed [`Central`]. If omitted, [`build`] calls
+    /// [`Central::new`] with default config.
+    ///
+    /// [`build`]: Self::build
+    #[must_use]
+    pub fn central(mut self, central: Arc<Central>) -> Self {
+        self.central = Some(central);
+        self
+    }
+
+    /// Supply a pre-constructed [`Peripheral`]. If omitted, [`build`]
+    /// calls [`Peripheral::new`] with default config.
+    ///
+    /// [`build`]: Self::build
+    #[must_use]
+    pub fn peripheral(mut self, peripheral: Arc<Peripheral>) -> Self {
+        self.peripheral = Some(peripheral);
+        self
+    }
+
+    /// Persistent peer cache. Defaults to an [`InMemoryPeerStore`];
+    /// applications that want durable state across restarts can plug in
+    /// their own implementation of [`PeerStore`]. The transport writes a
+    /// snapshot whenever a peer leaves `Connected`, and forgets a peer
+    /// when it transitions to `Dead { MaxRetries }`.
+    #[must_use]
+    pub fn peer_store(mut self, store: Arc<dyn PeerStore>) -> Self {
+        self.peer_store = Some(store);
+        self
+    }
+
+    /// Construct the transport. `endpoint_id` is the local node's iroh
+    /// `EndpointId` — the advertising-service UUID embeds its first 12
+    /// bytes so peers discover each other without coordination. This
+    /// must match the secret key used on the `Endpoint` that will host
+    /// the transport.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from bringing up the BLE radio (adapter not
+    /// powered, GATT registration, advertising start).
+    pub async fn build(self, endpoint_id: EndpointId) -> BleResult<Arc<BleTransport>> {
+        let central = match self.central {
+            Some(c) => c,
+            None => Arc::new(Central::new().await?),
+        };
+        let peripheral = match self.peripheral {
+            Some(p) => p,
+            None => Arc::new(Peripheral::new().await?),
+        };
+        let store = self
+            .peer_store
+            .unwrap_or_else(|| Arc::new(InMemoryPeerStore::new()));
+        BleTransport::construct(endpoint_id, central, peripheral, store, self.l2cap_policy).await
     }
 }
 
-impl std::fmt::Debug for BleTransportConfig {
+impl std::fmt::Debug for BleTransportBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BleTransportConfig")
+        f.debug_struct("BleTransportBuilder")
             .field("l2cap_policy", &self.l2cap_policy)
-            .field("store", &"<PeerStore>")
-            .field("verified_rx", &self.verified_rx.is_some())
+            .field("central", &self.central.is_some())
+            .field("peripheral", &self.peripheral.is_some())
+            .field("peer_store", &self.peer_store.is_some())
             .finish()
     }
 }
@@ -173,14 +241,56 @@ pub struct BleMetricsSnapshot {
     pub empty_frames: u64,
 }
 
+/// RAII guard for the pipe-lifetime watchdog spawned by
+/// [`BleTransport::start_pipe_watchdog`]. Dropping this guard aborts
+/// the watchdog task.
+///
+/// ## Why this isn't held inside `BleTransport`
+///
+/// The watchdog task needs to call `remote_info()` on the iroh
+/// `Endpoint`, so it holds an `Arc<Endpoint>` internally. Iroh's
+/// `Endpoint` in turn holds the transports list, which holds
+/// `Arc<BleTransport>` (installed via
+/// [`BleTransport::as_custom_transport`]). If `BleTransport` also
+/// stored the watchdog's task handle, we'd have a reference cycle
+/// (`Arc<BleTransport>` → task → `Endpoint` → `Arc<BleTransport>`)
+/// and neither would ever be dropped.
+///
+/// Iroh 0.98 does not expose a `Weak<Endpoint>` handle that would
+/// let us break the cycle. A future iroh release may add one, or an
+/// `on_connection_closed` hook that obviates the watchdog entirely —
+/// when that lands this guard can become an internal detail.
+#[must_use = "dropping the PipeWatchdog aborts the watchdog task"]
+pub struct PipeWatchdog {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for PipeWatchdog {
+    fn drop(&mut self) {
+        tracing::info!("pipe_watchdog: guard dropped; aborting watchdog task");
+        self.handle.abort();
+    }
+}
+
+impl std::fmt::Debug for PipeWatchdog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PipeWatchdog").finish()
+    }
+}
+
 pub struct BleTransport {
+    local_id: EndpointId,
+    /// Sender half of the verified-endpoint channel. Cloned into every
+    /// [`BleDedupHook`] returned from [`BleTransport::dedup_hook`]; the
+    /// receiver half is consumed by the forwarder task spawned at
+    /// construction time.
+    verified_tx: tokio::sync::mpsc::UnboundedSender<VerifiedEndpointEvent>,
     handle: RegistryHandle,
     incoming_rx: tokio::sync::Mutex<Option<mpsc::Receiver<IncomingPacket>>>,
     /// Authoritative routing table. Tracks scan hints, pending
     /// pipes, routable (post-handshake) pipes, outbound reservations,
     /// and the per-endpoint waker set. Exposed via
-    /// `routing_snapshot()` for telemetry and
-    /// `routing_handle()` for the dedup hook.
+    /// `routing_snapshot()` for telemetry.
     routing: Arc<crate::transport::routing::Routing>,
     tx_bytes: Arc<AtomicU64>,
     rx_bytes: Arc<AtomicU64>,
@@ -202,20 +312,19 @@ impl std::fmt::Debug for BleTransport {
 }
 
 impl BleTransport {
-    pub async fn new(
-        local_id: EndpointId,
-        central: Arc<Central>,
-        peripheral: Arc<Peripheral>,
-    ) -> BleResult<Self> {
-        Self::with_config(local_id, central, peripheral, BleTransportConfig::default()).await
+    /// Start configuring a new transport. See [`BleTransportBuilder`].
+    #[must_use]
+    pub fn builder() -> BleTransportBuilder {
+        BleTransportBuilder::new()
     }
 
-    pub async fn with_config(
+    async fn construct(
         local_id: EndpointId,
         central: Arc<Central>,
         peripheral: Arc<Peripheral>,
-        config: BleTransportConfig,
-    ) -> BleResult<Self> {
+        store: Arc<dyn PeerStore>,
+        l2cap_policy: L2capPolicy,
+    ) -> BleResult<Arc<Self>> {
         central
             .wait_ready(std::time::Duration::from_secs(5))
             .await
@@ -278,11 +387,11 @@ impl BleTransport {
             Arc::clone(&retransmits),
             Arc::clone(&truncations),
             Arc::clone(&empty_frames),
-            Arc::clone(&config.store),
+            Arc::clone(&store),
             Arc::clone(&routing),
         );
 
-        if config.l2cap_policy == L2capPolicy::PreferL2cap {
+        if l2cap_policy == L2capPolicy::PreferL2cap {
             match peripheral.l2cap_listener().await {
                 Ok((assigned_psm, listener)) => {
                     let val = assigned_psm.value();
@@ -296,7 +405,7 @@ impl BleTransport {
             }
         }
 
-        let registry = Registry::new(config.l2cap_policy, local_id);
+        let registry = Registry::new(l2cap_policy, local_id);
         let snap_for_actor = Arc::clone(&snapshots);
         let wakers_for_actor = Arc::clone(&inbox_capacity_wakers);
         let routing_for_actor = Arc::clone(&routing);
@@ -312,38 +421,41 @@ impl BleTransport {
                 .await;
         });
 
-        if let Some(mut verified_rx) = config.verified_rx {
-            let inbox = inbox_tx.clone();
-            tokio::spawn(async move {
-                while let Some(verified) = verified_rx.recv().await {
-                    // Fire teardown for any pipes the promote rule
-                    // evicted to make room for this handshake. Each
-                    // `Stalled` causes the registry to drain the
-                    // device's pipe and close its BLE channel; the
-                    // pipe worker then exits, which evicts the
-                    // lingering routing pipe record.
-                    for device_id in verified.evicted_devices {
-                        if inbox
-                            .send(PeerCommand::Stalled { device_id })
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    if inbox
-                        .send(PeerCommand::VerifiedEndpoint {
-                            endpoint_id: verified.endpoint_id,
-                            token: verified.token,
-                        })
+        // Verified-endpoint channel: the hook returned from
+        // `BleTransport::dedup_hook` sends events here, the forwarder
+        // below translates them into `PeerCommand`s the registry acts on.
+        let (verified_tx, mut verified_rx) =
+            tokio::sync::mpsc::unbounded_channel::<VerifiedEndpointEvent>();
+        let forwarder_inbox = inbox_tx.clone();
+        tokio::spawn(async move {
+            while let Some(verified) = verified_rx.recv().await {
+                // Fire teardown for any pipes the promote rule
+                // evicted to make room for this handshake. Each
+                // `Stalled` causes the registry to drain the
+                // device's pipe and close its BLE channel; the
+                // pipe worker then exits, which evicts the
+                // lingering routing pipe record.
+                for device_id in verified.evicted_devices {
+                    if forwarder_inbox
+                        .send(PeerCommand::Stalled { device_id })
                         .await
                         .is_err()
                     {
-                        break;
+                        return;
                     }
                 }
-            });
-        }
+                if forwarder_inbox
+                    .send(PeerCommand::VerifiedEndpoint {
+                        endpoint_id: verified.endpoint_id,
+                        token: verified.token,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         tokio::spawn(run_central_events(
             Arc::clone(&central),
@@ -362,7 +474,9 @@ impl BleTransport {
         ));
         tokio::spawn(run_watchdog(inbox_tx.clone()));
 
-        Ok(Self {
+        Ok(Arc::new(Self {
+            local_id,
+            verified_tx,
             handle: RegistryHandle {
                 inbox: inbox_tx,
                 snapshots,
@@ -375,8 +489,31 @@ impl BleTransport {
             truncations,
             empty_frames,
             inbox_capacity_wakers,
-            store: config.store,
-        })
+            store,
+        }))
+    }
+
+    /// Coerce to the trait object iroh's `Endpoint::builder()` consumes:
+    /// `endpoint_builder.add_custom_transport(ble.as_custom_transport())`.
+    #[must_use]
+    pub fn as_custom_transport(
+        self: &Arc<Self>,
+    ) -> Arc<dyn iroh::endpoint::transports::CustomTransport> {
+        Arc::clone(self) as Arc<dyn iroh::endpoint::transports::CustomTransport>
+    }
+
+    /// Build the [`EndpointHooks`] implementation that runs the BLE
+    /// handshake-dedup promotion rule. Pair with
+    /// `endpoint_builder.hooks(ble.dedup_hook())`.
+    ///
+    /// [`EndpointHooks`]: iroh::endpoint::EndpointHooks
+    #[must_use]
+    pub fn dedup_hook(&self) -> BleDedupHook {
+        BleDedupHook::new(
+            self.local_id,
+            Arc::clone(&self.routing),
+            self.verified_tx.clone(),
+        )
     }
 
     /// Counts-only snapshot of the routing table (pipes / scan hints /
@@ -387,37 +524,33 @@ impl BleTransport {
         self.routing.snapshot()
     }
 
-    /// Shared handle to the routing table, for plumbing into the
-    /// `BleDedupHook` (which runs the promotion rule at TLS handshake
-    /// completion). Cloning the returned `Arc` is cheap. Exposed only
-    /// because the hook must hold a reference and the hook's
-    /// construction site can't access private transport fields.
-    #[must_use]
-    pub fn routing_handle(&self) -> Arc<crate::transport::routing::Routing> {
-        Arc::clone(&self.routing)
-    }
-
-    /// Spawn the pipe-lifetime watchdog. Polls
-    /// `endpoint.remote_info` for every routable entry and, when iroh
-    /// reports no active path, tells the registry to drain the
-    /// corresponding BLE pipe. See
+    /// Start the pipe-lifetime watchdog. Polls `endpoint.remote_info`
+    /// for every routable entry and, when iroh reports no active path,
+    /// tells the registry to drain the corresponding BLE pipe. See
     /// [`crate::transport::pipe_watchdog`] for the full contract.
     ///
-    /// Must be called after the iroh `Endpoint` is bound. Caller owns
-    /// the returned `JoinHandle` — abort it on teardown if you want
-    /// the loop to stop before the transport shuts down.
-    #[must_use]
-    pub fn spawn_pipe_watchdog(
-        &self,
-        endpoint: Arc<iroh::Endpoint>,
-    ) -> tokio::task::JoinHandle<()> {
-        crate::transport::pipe_watchdog::spawn(
-            endpoint,
+    /// The returned [`PipeWatchdog`] is a drop-guard: dropping it
+    /// aborts the watchdog task. Bind it to a variable whose lifetime
+    /// matches the endpoint (e.g. the same scope, or a field on your
+    /// app state) to keep the watchdog running.
+    ///
+    /// `endpoint` is cloned internally (`iroh::Endpoint` is already
+    /// internally `Arc`-backed, so this is cheap).
+    ///
+    /// This must be a separate call rather than being bundled into the
+    /// transport because holding the `Endpoint` on `BleTransport` would
+    /// create a reference cycle — see the module documentation on
+    /// [`PipeWatchdog`] for details.
+    #[must_use = "dropping the returned PipeWatchdog aborts the watchdog task"]
+    pub fn start_pipe_watchdog(&self, endpoint: &iroh::Endpoint) -> PipeWatchdog {
+        let handle = crate::transport::pipe_watchdog::spawn(
+            Arc::new(endpoint.clone()),
             Arc::clone(&self.routing),
             self.handle.inbox.clone(),
             crate::transport::pipe_watchdog::DEFAULT_POLL_INTERVAL,
             crate::transport::pipe_watchdog::DEFAULT_GRACE_PERIOD,
-        )
+        );
+        PipeWatchdog { handle }
     }
 
     /// Debug-only: list the pipes currently tracked by the shadow

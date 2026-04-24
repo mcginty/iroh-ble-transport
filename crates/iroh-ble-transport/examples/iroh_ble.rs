@@ -38,14 +38,11 @@ use std::time::Instant;
 #[path = "../../../demos/support/key_utils.rs"]
 mod key_utils;
 
-use std::sync::Arc;
-
 use iroh::Endpoint;
 use iroh::endpoint::Connection;
 use iroh::endpoint::presets;
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
-use iroh_ble_transport::transport::BleTransport;
-use iroh_ble_transport::{Central, Peripheral};
+use iroh_ble_transport::BleTransport;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -118,19 +115,17 @@ async fn run_listener() -> Result<(), Box<dyn std::error::Error>> {
     let public = secret.public();
 
     println!("Initialising BLE transport...");
-    let central = Arc::new(Central::new().await?);
-    let peripheral = Arc::new(Peripheral::new().await?);
-    let transport = BleTransport::new(public, central, peripheral).await?;
-    let lookup = transport.address_lookup();
-    let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = Arc::new(transport);
+    let ble = BleTransport::builder().build(public).await?;
 
     let ep = Endpoint::builder(presets::N0DisableRelay)
-        .add_custom_transport(transport)
-        .address_lookup(lookup)
+        .hooks(ble.dedup_hook())
+        .add_custom_transport(ble.as_custom_transport())
+        .address_lookup(ble.address_lookup())
         .secret_key(secret)
         .clear_ip_transports()
         .bind()
         .await?;
+    let _watchdog = ble.start_pipe_watchdog(&ep);
 
     println!("Listening. Endpoint ID:");
     println!("  {public}");
@@ -295,19 +290,17 @@ async fn run_dialer(remote_str: &str) -> Result<(), Box<dyn std::error::Error>> 
     let local_id = secret.public();
 
     println!("Initialising BLE transport...");
-    let central = Arc::new(Central::new().await?);
-    let peripheral = Arc::new(Peripheral::new().await?);
-    let transport = BleTransport::new(local_id, central, peripheral).await?;
-    let lookup = transport.address_lookup();
-    let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = Arc::new(transport);
+    let ble = BleTransport::builder().build(local_id).await?;
 
     let ep = Endpoint::builder(presets::N0DisableRelay)
-        .add_custom_transport(transport)
-        .address_lookup(lookup)
+        .hooks(ble.dedup_hook())
+        .add_custom_transport(ble.as_custom_transport())
+        .address_lookup(ble.address_lookup())
         .secret_key(secret)
         .clear_ip_transports()
         .bind()
         .await?;
+    let _watchdog = ble.start_pipe_watchdog(&ep);
 
     println!("Scanning for peer {}...", remote_id.fmt_short());
     println!("(Make sure the listener is running on another machine)");

@@ -21,22 +21,22 @@ yq = "latest"
 CARGO_TERM_COLOR = "always"
 
 [tasks.build]
-description = "Build all crates"
-run = "cargo build"
+description = "Build all crates, targets, and features"
+run = "cargo build --workspace --all-targets --all-features"
 
 [tasks.check]
-description = "Type-check all crates (no codegen)"
-run = "cargo check --workspace"
+description = "Type-check all crates, targets, and features (no codegen)"
+run = "cargo check --workspace --all-targets --all-features"
 
 [tasks.lint]
-description = "Run clippy on all code"
+description = "Run clippy on all crates, targets, and features"
 depends = ["fmt:check"]
-run = "cargo clippy --workspace -- -D warnings"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 
 [tasks."lint:fix"]
-description = "Run clippy --fix on all code"
+description = "Run clippy --fix on all crates, targets, and features"
 depends = ["fmt"]
-run = "cargo clippy --workspace --fix"
+run = "cargo clippy --workspace --all-targets --all-features --fix"
 
 [tasks.test]
 description = "Run all tests (includes feature-gated integration tests)"
@@ -213,13 +213,13 @@ echo "Done. Logs in /tmp/android*.log"
 # --- CI ---------------------------------------------------------------
 
 [tasks."ci:lint"]
-description = "Run clippy on all crates"
-run = "cargo clippy --workspace -- -D warnings"
+description = "Run clippy on all crates, targets, and features"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 
 [tasks."ci:check-ios"]
-description = "Type-check for iOS"
-run = "cargo check --target aarch64-apple-ios -p iroh-ble-transport"
+description = "Type-check all iroh-ble-transport targets and features for iOS"
+run = "cargo check --target aarch64-apple-ios -p iroh-ble-transport --all-targets --all-features"
 
 [tasks."ci:check-android"]
-description = "Type-check for Android"
-run = "cargo ndk -t arm64-v8a check -p iroh-ble-transport"
+description = "Type-check all iroh-ble-transport targets and features for Android"
+run = "cargo ndk -t arm64-v8a check -p iroh-ble-transport --all-targets --all-features"

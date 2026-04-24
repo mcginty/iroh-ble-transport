@@ -15,16 +15,16 @@ Built on [blew](https://github.com/mcginty/blew) for cross-platform BLE. Wraps a
 Uses [mise](https://mise.jdx.dev) for task management. `mise tasks` lists everything.
 
 ```sh
-mise run build           # cargo build --workspace
-mise run check           # cargo check --workspace (no codegen)
-mise run test            # cargo nextest run --workspace
-mise run lint            # clippy (depends on fmt:check)
+mise run build           # cargo build --workspace --all-targets --all-features
+mise run check           # cargo check --workspace --all-targets --all-features (no codegen)
+mise run test            # cargo nextest run --workspace --all-features
+mise run lint            # cargo clippy --workspace --all-targets --all-features (depends on fmt:check)
 mise run fmt             # cargo fmt --all
 mise run fmt:check       # cargo fmt --all -- --check
 mise run verify          # fmt + lint + test (pre-commit gate)
 mise run deny            # license/vulnerability audit
-mise run ci:check-ios    # cargo check for aarch64-apple-ios
-mise run ci:check-android # cargo ndk check for arm64-v8a
+mise run ci:check-ios    # cargo check --all-targets --all-features for aarch64-apple-ios
+mise run ci:check-android # cargo ndk check --all-targets --all-features for arm64-v8a
 
 # Chat demo
 mise run chat:dev                # desktop dev server
@@ -213,13 +213,9 @@ Owns two pieces of state above the per-peer state machine:
 - No `ReliableChannel` — L2CAP CoC is already reliable and stream-oriented
 - Outbound datagrams are framed and written directly; inbound frames are read and delivered to `incoming_tx`
 
-### QUIC configuration (BlePreset)
+### QUIC configuration
 
-- `initial_mtu(1200)`, `mtu_discovery_config(None)` — fixed MTU, no discovery
-- `max_idle_timeout(300s)`, `keep_alive_interval(5s)` — long timeouts for slow BLE
-- `default_path_max_idle_timeout(6s)`, `default_path_keep_alive_interval(4s)`
-
-The chat-app override (`max_idle_timeout(15s)`) is set on the iroh `Endpoint` builder so iroh tears down stalled connections closer to the BLE-level disconnect detection window.
+The transport does **not** bundle a QUIC config — iroh's defaults are used unless the application overrides them via `Endpoint::builder().transport_config(...)`. For slow/lossy BLE links the chat app sets `max_idle_timeout(15s)` so iroh tears down stalled connections closer to the BLE-level disconnect detection window (`LINK_DEAD_DEADLINE` = 6 s); anything shorter risks killing the TLS handshake over the initial GATT path, which can take 3-5 s with ARQ retransmits.
 
 ## Reliable transport protocol (`src/transport/reliable.rs`)
 

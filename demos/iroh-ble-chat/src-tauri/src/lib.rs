@@ -10,8 +10,8 @@ use iroh::{Endpoint, EndpointId};
 use iroh_ble_chat_protocol::{load_known_peers, save_known_peers, ChatMsg, IMAGE_ALPN};
 use iroh_ble_transport::transport::BleTransport;
 use iroh_ble_transport::{
-    BleDedupHook, BlePeerInfo, BlePeerPhase, BleTransportConfig, Central, CentralConfig,
-    ConnectPath, InMemoryPeerStore, L2capPolicy, Peripheral,
+    BlePeerInfo, BlePeerPhase, Central, CentralConfig, ConnectPath, L2capPolicy, Peripheral,
+    PipeWatchdog,
 };
 use iroh_gossip::proto::{HyparviewConfig, TopicId};
 use iroh_gossip::Gossip;
@@ -137,6 +137,8 @@ struct AppState {
     endpoint: Option<Endpoint>,
     /// Dropping this kills gossip, so we hold it for the app lifetime.
     _router: Option<Router>,
+    /// Dropping this aborts the BLE pipe watchdog, so we hold it for the app lifetime.
+    _watchdog: Option<PipeWatchdog>,
     gossip_sender: Option<iroh_gossip::api::GossipSender>,
     ble_transport: Option<Arc<BleTransport>>,
     peers: HashMap<EndpointId, PeerState>,
@@ -230,7 +232,6 @@ async fn start_node(
         return Err("ble_permissions_required".into());
     }
 
-    let (verified_tx, verified_rx) = tokio::sync::mpsc::unbounded_channel();
     let ble_transport: Arc<BleTransport> = {
         // Tighten blew's connect deadline below its 15 s default so a wedged
         // dial attempt (Android's post-133 zombie state is the classic case)
@@ -247,36 +248,27 @@ async fn start_node(
                 .map_err(|e| e.to_string())?,
         );
         let peripheral = Arc::new(Peripheral::new().await.map_err(|e| e.to_string())?);
-        let local_id = st.secret_key.public();
-        let transport = BleTransport::with_config(
-            local_id,
-            central,
-            peripheral,
-            BleTransportConfig {
-                l2cap_policy: L2capPolicy::PreferL2cap,
-                store: Arc::new(InMemoryPeerStore::new()),
-                verified_rx: Some(verified_rx),
-            },
-        )
-        .await
-        .map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("adapter not found") || msg.contains("AdapterNotFound") {
-                "Bluetooth is not available on this device. A physical Bluetooth adapter is required — simulators and emulators are not supported.".to_string()
-            } else if msg.contains("not powered")
-                || msg.contains("timed out waiting for Bluetooth")
-                || msg.contains("power on")
-            {
-                "Bluetooth is turned off. Please enable Bluetooth in Settings and restart the app."
-                    .to_string()
-            } else {
-                msg
-            }
-        })?;
-        Arc::new(transport)
+        BleTransport::builder()
+            .l2cap_policy(L2capPolicy::PreferL2cap)
+            .central(central)
+            .peripheral(peripheral)
+            .build(st.secret_key.public())
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("adapter not found") || msg.contains("AdapterNotFound") {
+                    "Bluetooth is not available on this device. A physical Bluetooth adapter is required — simulators and emulators are not supported.".to_string()
+                } else if msg.contains("not powered")
+                    || msg.contains("timed out waiting for Bluetooth")
+                    || msg.contains("power on")
+                {
+                    "Bluetooth is turned off. Please enable Bluetooth in Settings and restart the app."
+                        .to_string()
+                } else {
+                    msg
+                }
+            })?
     };
-    let lookup = ble_transport.address_lookup();
-    let transport: Arc<dyn iroh::endpoint::transports::CustomTransport> = ble_transport.clone();
 
     // BLE-tuned QUIC idle timeout. The default (30s) is too lax because
     // BLE-level disconnect detection is ~6s (LINK_DEAD_DEADLINE), leaving
@@ -300,13 +292,9 @@ async fn start_node(
         .build();
 
     let ep = Endpoint::builder(presets::N0DisableRelay)
-        .hooks(BleDedupHook::new(
-            st.secret_key.public(),
-            ble_transport.routing_handle(),
-            verified_tx,
-        ))
-        .add_custom_transport(Arc::clone(&transport))
-        .address_lookup(lookup)
+        .hooks(ble_transport.dedup_hook())
+        .add_custom_transport(ble_transport.as_custom_transport())
+        .address_lookup(ble_transport.address_lookup())
         .transport_config(transport_cfg)
         .secret_key(st.secret_key.clone())
         .clear_ip_transports()
@@ -355,13 +343,11 @@ async fn start_node(
 
     let (sender, receiver) = topic.split();
 
-    // Spawn the step-5 pipe-lifetime watchdog now that the iroh
-    // Endpoint is bound. When iroh decides a peer's Connection is
-    // gone (via its max_idle_timeout of 15 s above), the watchdog
-    // tells the BLE transport to tear down the pipe instead of
-    // holding the radio open. The `_watchdog` handle lives on
-    // `AppState` and is implicitly aborted when the app exits.
-    let _watchdog = ble_transport.spawn_pipe_watchdog(Arc::new(ep.clone()));
+    // Spawn the pipe-lifetime watchdog now that the iroh Endpoint is
+    // bound. When iroh decides a peer's Connection is gone (via its
+    // max_idle_timeout of 15 s above), the watchdog tells the BLE
+    // transport to tear down the pipe instead of holding the radio open.
+    st._watchdog = Some(ble_transport.start_pipe_watchdog(&ep));
 
     st.endpoint = Some(ep);
     st._router = Some(router);
@@ -1911,6 +1897,7 @@ pub fn run() {
                 cache_dir,
                 endpoint: None,
                 _router: None,
+                _watchdog: None,
                 gossip_sender: None,
                 ble_transport: None,
                 peers: HashMap::new(),
