@@ -15,25 +15,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  fmt:
-    name: Format
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: jdx/mise-action@v4
-      - run: mise install --force rust
-      - uses: Swatinem/rust-cache@v2
-      - run: mise run fmt:check
-
-  deny:
-    name: Deny
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-
-  clippy:
-    name: Clippy
+  verify:
+    name: Verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -42,29 +25,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: jdx/mise-action@v4
-      - run: mise install --force rust
+      - run: mise install --force rust cargo-binstall cargo:cargo-nextest cargo:cargo-deny node pnpm
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y $LINUX_APT_DEPS
-      - run: mise run ci:lint
-
-  test:
-    name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@v6
-      - uses: jdx/mise-action@v4
-      - run: mise install --force rust
-      - uses: Swatinem/rust-cache@v2
-      - name: Install Linux system dependencies
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y $LINUX_APT_DEPS
-      - run: mise run test
+      - run: mise run verify
 
   check-ios:
     name: Check (iOS)
@@ -82,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: jdx/mise-action@v4
-      - run: mise install --force rust
+      - run: mise install --force rust cargo-binstall cargo:cargo-ndk java android-sdk
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux system dependencies
         run: sudo apt-get update && sudo apt-get install -y $LINUX_APT_DEPS

@@ -59,8 +59,9 @@ description = "Type-check the chat app frontend (TypeScript)"
 run = "cd demos/iroh-ble-chat && pnpm install --frozen-lockfile && npx tsc --noEmit"
 
 [tasks.verify]
-description = "Pre-commit gate: fmt + lint + test + deny + frontend typecheck"
-depends = ["fmt", "lint", "test", "deny", "chat:typecheck"]
+alias = ["ci"]
+description = "Pre-commit gate: fmt check + lint + test + deny + frontend typecheck"
+depends = ["fmt:check", "lint", "test", "deny", "chat:typecheck"]
 
 [tasks.clean]
 description = "Clean all build artifacts (Cargo, frontend, Android, iOS)"
