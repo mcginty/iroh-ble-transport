@@ -12,7 +12,6 @@ them at build time.
 | ----------------------- | ---------------------------------- | ---------------------------------- |
 | `ios-testflight`        | `.ipa`                             | App Store Connect → TestFlight     |
 | `macos-testflight`      | `.pkg` (sandboxed, MAS-signed)     | App Store Connect → TestFlight     |
-| `macos-release-build`   | `.app.zip` + `.dmg` (Developer ID) | GitHub Release (via `publish`)     |
 | `android-release-build` | universal `.apk` (signed)          | GitHub Release (via `publish`)     |
 | `publish`               | —                                  | Creates/updates the GitHub Release |
 
@@ -49,10 +48,8 @@ GitHub UI → Actions → "Release" → "Run workflow":
 | ------------------- | ----------------------------------------------------------------- |
 | `all`               | everything                                                        |
 | `testflight-all`    | iOS + macOS TestFlight uploads                                    |
-| `release-all`       | macOS Developer ID + Android APK (no TestFlight)                  |
 | `ios-testflight`    | iOS only                                                          |
 | `macos-testflight`  | macOS MAS only                                                    |
-| `macos-release`     | macOS Developer ID only                                           |
 | `android-release`   | Android only                                                      |
 
 Manual runs reuse whatever `version`/`bundleVersion` is currently in `tauri.conf.json` — re-run
@@ -110,7 +107,6 @@ APPSTORE_API_ISSUER_ID=00000000-0000-0000-0000-000000000000
 APPLE_IOS_CERTIFICATE_PASSWORD=…
 APPLE_MAS_APP_CERTIFICATE_PASSWORD=…
 APPLE_MAS_INSTALLER_CERTIFICATE_PASSWORD=…
-APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD=…
 ANDROID_KEY_ALIAS=release
 ANDROID_KEYSTORE_PASSWORD=…
 ANDROID_KEY_PASSWORD=…
@@ -131,7 +127,6 @@ scripts/secrets.sh encrypt path/to/secrets.env
 | `mas-app.p12.age`                        | required  | 3rd Party Mac Developer Application cert (.p12).       |
 | `mas-installer.p12.age`                  | required  | 3rd Party Mac Developer Installer cert (.p12).         |
 | `mas-appstore.provisionprofile.age`      | required  | Mac App Store provisioning profile.                    |
-| `developer-id.p12.age`                   | required  | Developer ID Application cert (.p12).                  |
 
 Get the API key from [App Store Connect → Users and Access → Integrations](https://appstoreconnect.apple.com/access/integrations/api).
 Role must be **App Manager** (or higher) so xcodebuild can create/update provisioning
