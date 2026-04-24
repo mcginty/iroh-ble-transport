@@ -24,7 +24,6 @@ runs:
       run: |
         set -eu
         if ! command -v age >/dev/null; then
-          # mise-action already ran in the calling job, but be defensive
           if command -v mise >/dev/null; then
             mise install age
             echo "$(mise where age)/bin" >> "$GITHUB_PATH"
