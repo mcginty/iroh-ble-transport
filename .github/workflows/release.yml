@@ -32,7 +32,7 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Which jobs to run'
+        description: 'Which jobs to run (manual dispatch is always dry-run)'
         required: true
         default: 'all'
         type: choice
@@ -44,11 +44,6 @@ on:
           - macos-testflight
           - macos-release
           - android-release
-      dry_run:
-        description: 'Dry run — build + sign but skip App Store Connect uploads'
-        required: false
-        default: true
-        type: boolean
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -75,32 +70,20 @@ jobs:
       - id: decide
         run: |
           target="${{ github.event.inputs.targets }}"
-          dry_run="${{ github.event.inputs.dry_run }}"
-          msg="${{ github.event.head_commit.message }}"
+          # Only tag pushes publish. Everything else (branch push, manual
+          # dispatch) runs as a dry-run: full build + sign, no uploads.
           if [ "${{ github.event_name }}" = "push" ]; then
+            target="all"
             case "${{ github.ref }}" in
-              refs/tags/*) target="all"; dry_run="false" ;;
-              # TEMP: branch-push smoke test. Default to android-release (no
-              # external uploads). Override via commit-message trailer —
-              # e.g. "[ci: ios]", "[ci: macos]", "[ci: all]" — to smoke-test
-              # iOS/macOS paths in dry-run mode before the workflow lands on
-              # main (where workflow_dispatch becomes available). Revert this
-              # whole branch-push clause + the `on.push.branches` entry
-              # before merging.
-              refs/heads/release-pipeline)
-                dry_run="true"
-                if   [[ "$msg" == *"[ci: all]"*     ]]; then target="all"
-                elif [[ "$msg" == *"[ci: ios]"*     ]]; then target="ios-testflight"
-                elif [[ "$msg" == *"[ci: macos]"*   ]]; then target="macos-testflight"
-                elif [[ "$msg" == *"[ci: mac-rel]"* ]]; then target="macos-release"
-                else                                         target="android-release"
-                fi
-                ;;
+              refs/tags/*)                  dry_run="false" ;;
+              # TEMP: branch-push smoke test. Revert this case + the
+              # `on.push.branches` entry before merging.
+              refs/heads/release-pipeline)  dry_run="true" ;;
               *) echo "Unexpected push ref: ${{ github.ref }}" >&2; exit 1 ;;
             esac
+          else
+            dry_run="true"
           fi
-          # workflow_dispatch: default to dry_run=true if unset (safer).
-          [ -n "$dry_run" ] || dry_run="true"
           case "$target" in
             all)                ios=1; mas=1; rel=1; apk=1 ;;
             testflight-all)     ios=1; mas=1; rel=0; apk=0 ;;
