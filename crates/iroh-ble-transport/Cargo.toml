@@ -22,7 +22,7 @@ tokio = { version = "1", features = ["sync", "rt", "time"] }
 tokio-stream = "0.1"
 bytes = "1"
 atomic-waker = "1"
-iroh = { version = "0.98.0", features = ["unstable-custom-transports"] }
+iroh = { version = "0.98.1", features = ["unstable-custom-transports"] }
 iroh-base = "0.98"
 n0-watcher = "0.6"
 n0-future = "0.3"
@@ -45,3 +45,9 @@ anyhow = "1"
 rand = "0.9"
 blew = { version = "0.3", features = ["testing"] }
 proptest = "1"
+
+[profile.test.package.proptest]
+opt-level = 3
+
+[profile.test.package.rand_chacha]
+opt-level = 3
