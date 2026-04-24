@@ -51,7 +51,7 @@ cargo run --example peripheral -p iroh-ble-transport          # bare peripheral 
 - Don't add features, refactor, or "improve" code beyond what was asked.
 - Clippy pedantic is enabled (`pedantic = "warn"` in blew). Fix warnings, don't suppress them unless there's a good reason.
 - Test with nextest: `cargo nextest run --workspace`.
-- **Commit attribution**: when an AI assistant helps write a commit, use an `Assisted-by:` trailer instead of `Co-Authored-by:`, following the [Linux kernel guidance](https://docs.kernel.org/process/ai.html). Format: `Assisted-by: crush:kimi-k2.6`.
+- **Commit attribution**: when an AI assistant helps write a commit, use an `Assisted-by:` trailer instead of `Co-Authored-by:`, following the [Linux kernel guidance](https://docs.kernel.org/process/ai.html). Format like: `Assisted-by: crush:kimi-k2.6` or `Assisted-by: Claude:claude-opus-4-7` or `Assisted-by: Codex:gpt-5-5`.
 - **Commit message style**:
   - Title: `crate: concise summary` with comma-separated clauses (no "and").
   - Body: bullet points with `-` for each logical change.
