@@ -227,6 +227,7 @@ async fn register_gatt_services(
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct BleMetricsSnapshot {
     pub tx_bytes: u64,
     pub rx_bytes: u64,
@@ -594,6 +595,7 @@ impl BleTransport {
 }
 
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BlePeerInfo {
     pub device_id: blew::DeviceId,
     pub phase: BlePeerPhase,
@@ -602,7 +604,27 @@ pub struct BlePeerInfo {
     pub verified_endpoint: Option<EndpointId>,
 }
 
+impl BlePeerInfo {
+    #[must_use]
+    pub fn new(
+        device_id: blew::DeviceId,
+        phase: BlePeerPhase,
+        consecutive_failures: u32,
+        connect_path: Option<ConnectPath>,
+        verified_endpoint: Option<EndpointId>,
+    ) -> Self {
+        Self {
+            device_id,
+            phase,
+            consecutive_failures,
+            connect_path,
+            verified_endpoint,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BlePeerPhase {
     Unknown,
     Discovered,

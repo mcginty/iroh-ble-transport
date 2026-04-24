@@ -11,9 +11,20 @@ use crate::error::BleResult;
 use crate::transport::peer::KeyPrefix;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct PeerSnapshot {
     pub last_device_id: String,
     pub last_seen: SystemTime,
+}
+
+impl PeerSnapshot {
+    #[must_use]
+    pub fn new(last_device_id: String, last_seen: SystemTime) -> Self {
+        Self {
+            last_device_id,
+            last_seen,
+        }
+    }
 }
 
 #[async_trait]
@@ -68,10 +79,7 @@ mod tests {
     use crate::transport::peer::KEY_PREFIX_LEN;
 
     fn sample() -> PeerSnapshot {
-        PeerSnapshot {
-            last_device_id: "test-device".into(),
-            last_seen: SystemTime::UNIX_EPOCH,
-        }
+        PeerSnapshot::new("test-device".into(), SystemTime::UNIX_EPOCH)
     }
 
     #[tokio::test]

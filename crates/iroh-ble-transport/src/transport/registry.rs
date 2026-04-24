@@ -1728,10 +1728,10 @@ impl Registry {
         if was_connected && let Some(prefix) = entry.prefix {
             out.push(PeerAction::PutPeerStore {
                 prefix,
-                snapshot: crate::transport::store::PeerSnapshot {
-                    last_device_id: entry.device_id.as_str().to_string(),
-                    last_seen: std::time::SystemTime::now(),
-                },
+                snapshot: crate::transport::store::PeerSnapshot::new(
+                    entry.device_id.as_str().to_string(),
+                    std::time::SystemTime::now(),
+                ),
             });
         }
         entry.phase = PeerPhase::Draining { since: now, reason };

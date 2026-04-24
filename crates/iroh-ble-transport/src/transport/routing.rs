@@ -192,19 +192,18 @@ pub struct Routable {
 }
 
 #[derive(Debug, Clone)]
-pub struct PipeTombstone {
-    pub stable_id: StableConnId,
-    pub device_id: DeviceId,
-    pub direction: Direction,
-    pub pipe_lifetime: Duration,
-    pub evicted_at: Instant,
-    pub dropped_transmits: u64,
+pub(crate) struct PipeTombstone {
+    pub(crate) device_id: DeviceId,
+    pub(crate) direction: Direction,
+    pub(crate) pipe_lifetime: Duration,
+    pub(crate) evicted_at: Instant,
+    pub(crate) dropped_transmits: u64,
 }
 
 #[derive(Debug, Clone)]
-pub struct TombstonedTransmit {
-    pub tombstone: PipeTombstone,
-    pub dropped_count: u64,
+pub(crate) struct TombstonedTransmit {
+    pub(crate) tombstone: PipeTombstone,
+    pub(crate) dropped_count: u64,
 }
 
 /// Authoritative routing table shared across the transport. Owns every
@@ -355,7 +354,6 @@ impl Routing {
                 inner.pipe_tombstones.insert(
                     id,
                     PipeTombstone {
-                        stable_id: id,
                         device_id: pipe.device_id.clone(),
                         direction: pipe.direction,
                         pipe_lifetime: pipe.created_at.elapsed(),
@@ -691,7 +689,10 @@ impl Routing {
 
     /// Record a transmit that still targets a recently-evicted pipe.
     /// Returns `None` once the tombstone expires or if the id was never ours.
-    pub fn note_tombstoned_transmit(&self, stable_id: StableConnId) -> Option<TombstonedTransmit> {
+    pub(crate) fn note_tombstoned_transmit(
+        &self,
+        stable_id: StableConnId,
+    ) -> Option<TombstonedTransmit> {
         let mut inner = self.inner.lock();
         inner.prune_pipe_tombstones(Instant::now());
         let tombstone = inner.pipe_tombstones.get_mut(&stable_id)?;
@@ -1080,6 +1081,7 @@ pub enum PromoteOutcome {
 /// so the watchdog can issue a targeted teardown to the registry
 /// without racing through a second lock.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RoutableSnapshot {
     pub endpoint_id: EndpointId,
     pub stable_id: StableConnId,
@@ -1092,6 +1094,7 @@ pub struct RoutableSnapshot {
 /// `pipes_for_debug` path. Includes `reservations` so the chat app's
 /// debug panel can show outstanding resolver promises to iroh.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RoutingSnapshot {
     pub pipes: usize,
     pub pipe_tombstones: usize,
@@ -2084,7 +2087,6 @@ mod tests {
         let first = r
             .note_tombstoned_transmit(id)
             .expect("recently evicted pipe should have tombstone");
-        assert_eq!(first.tombstone.stable_id, id);
         assert_eq!(first.tombstone.device_id, dev("tombstoned"));
         assert_eq!(first.tombstone.direction, Direction::Outbound);
         assert_eq!(first.dropped_count, 1);

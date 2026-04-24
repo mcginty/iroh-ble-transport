@@ -81,6 +81,7 @@ fn ble_phase_str(phase: BlePeerPhase) -> &'static str {
         BlePeerPhase::Reconnecting => "reconnecting",
         BlePeerPhase::Dead => "dead",
         BlePeerPhase::Restoring => "restoring",
+        _ => "unknown",
     }
 }
 
@@ -108,6 +109,12 @@ impl PeerState {
             },
             (Some(BlePeerPhase::Draining), _) => "draining",
             (Some(BlePeerPhase::Dead), _) => "dead",
+            (Some(_), gossip) => match gossip {
+                Some(GossipStatus::Direct) => "connected",
+                Some(GossipStatus::InTopic) => "in_topic",
+                Some(GossipStatus::Stale) => "stale",
+                _ => "unknown",
+            },
             (None, gossip) => match gossip {
                 Some(GossipStatus::Direct) => "connected",
                 Some(GossipStatus::InTopic) => "in_topic",
@@ -1114,34 +1121,34 @@ mod tests {
             own_id,
             &mut peers,
             &[
-                BlePeerInfo {
-                    device_id: "dev-verified".into(),
-                    phase: BlePeerPhase::Connected,
-                    consecutive_failures: 0,
-                    connect_path: Some(ConnectPath::Gatt),
-                    verified_endpoint: Some(verified_peer),
-                },
-                BlePeerInfo {
-                    device_id: "dev-existing".into(),
-                    phase: BlePeerPhase::Connected,
-                    consecutive_failures: 0,
-                    connect_path: Some(ConnectPath::L2cap),
-                    verified_endpoint: Some(existing_peer),
-                },
-                BlePeerInfo {
-                    device_id: "dev-self".into(),
-                    phase: BlePeerPhase::Connected,
-                    consecutive_failures: 0,
-                    connect_path: Some(ConnectPath::Gatt),
-                    verified_endpoint: Some(own_id),
-                },
-                BlePeerInfo {
-                    device_id: "dev-unverified".into(),
-                    phase: BlePeerPhase::Connected,
-                    consecutive_failures: 0,
-                    connect_path: Some(ConnectPath::Gatt),
-                    verified_endpoint: None,
-                },
+                BlePeerInfo::new(
+                    "dev-verified".into(),
+                    BlePeerPhase::Connected,
+                    0,
+                    Some(ConnectPath::Gatt),
+                    Some(verified_peer),
+                ),
+                BlePeerInfo::new(
+                    "dev-existing".into(),
+                    BlePeerPhase::Connected,
+                    0,
+                    Some(ConnectPath::L2cap),
+                    Some(existing_peer),
+                ),
+                BlePeerInfo::new(
+                    "dev-self".into(),
+                    BlePeerPhase::Connected,
+                    0,
+                    Some(ConnectPath::Gatt),
+                    Some(own_id),
+                ),
+                BlePeerInfo::new(
+                    "dev-unverified".into(),
+                    BlePeerPhase::Connected,
+                    0,
+                    Some(ConnectPath::Gatt),
+                    None,
+                ),
             ],
         );
 
