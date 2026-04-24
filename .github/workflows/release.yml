@@ -103,7 +103,7 @@ jobs:
     name: iOS → TestFlight
     needs: plan
     if: needs.plan.outputs.run_ios_testflight == '1'
-    runs-on: macos-15
+    runs-on: macos-latest
     environment: Release
     timeout-minutes: 60
     steps:
@@ -125,6 +125,9 @@ jobs:
       - name: Install frontend dependencies
         working-directory: ${{ env.CHAT_DIR }}
         run: pnpm install --frozen-lockfile
+
+      - name: Select Xcode 26.3
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
       - name: Seed .xcode.env so preBuildScript inherits mise trust
         # The iOS Xcode project's preBuildScript (gen/apple/project.yml)
@@ -213,7 +216,7 @@ jobs:
     name: macOS → TestFlight
     needs: plan
     if: needs.plan.outputs.run_macos_testflight == '1'
-    runs-on: macos-15
+    runs-on: macos-latest
     environment: Release
     timeout-minutes: 60
     steps:
@@ -237,6 +240,9 @@ jobs:
         # image encoding). Only the x86_64-apple-darwin slice of the universal
         # build hits the nasm code path; arm64 doesn't. Still needed on macos-15.
         run: brew install nasm
+
+      - name: Select Xcode 26.3
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
       - name: Install frontend dependencies
         working-directory: ${{ env.CHAT_DIR }}
