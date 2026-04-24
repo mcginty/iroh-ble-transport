@@ -583,17 +583,6 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
     // VerifiedEndpoint triggers UpgradeToL2cap (L2capPolicy::PreferL2cap).
     // self's endpoint (0xFF) > peer's endpoint (0x01) → self keeps Central →
     // should_win(Central, ep_self, ep_peer) = true → upgrade is triggered.
-    //
-    // Read the current tx_gen before sending VerifiedEndpoint; all subsequent
-    // sends must carry this value so the registry forwards them to the pipe.
-    let live_tx_gen = node
-        .snapshots
-        .load()
-        .peer_states
-        .get(&dev_peer)
-        .expect("peer entry must exist after Connected")
-        .tx_gen;
-
     node.inbox_tx
         .send(PeerCommand::VerifiedEndpoint {
             endpoint_id: ep_peer,
@@ -602,33 +591,58 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
         .await
         .unwrap();
 
-    // Wait a moment for the upgrade path to complete (read_psm + open_l2cap +
-    // SwapPipeToL2cap) before flooding with sends. The mock returns immediately,
-    // so 100 ms is ample.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the registry to observe the L2CAP upgrade before driving
+    // traffic. A fixed sleep here is scheduler-sensitive: if the burst lands
+    // while the pipe still only has GATT, the nonblocking send path can drop
+    // most of it as WouldBlock and never fill the L2CAP queues.
+    let live_tx_gen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snap = node.snapshots.load();
+            if let Some(state) = snap.peer_states.get(&dev_peer)
+                && state.phase_kind == PhaseKind::Connected
+                && state.connect_path == Some(ConnectPath::L2cap)
+            {
+                return state.tx_gen;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("node never reached Connected{L2cap}");
 
-    // Fill the L2CAP pipe chain with sends using the correct tx_gen.
-    // The duplex buffer (64 B) fills after the first framed write (2-byte len +
-    // 64-byte payload = 66 B). The L2CAP IO task's outbound channel (cap 64)
-    // and the pipe supervisor's outbound_fwd channel (cap 32) also need to fill
-    // so that `forward_outbound`'s `outbound_fwd_tx.send()` actually blocks.
-    // 64 + 32 + 1 = 97 sends is sufficient; send 150 for margin.
+    // Keep offering datagrams until the handover timeout is observed. The
+    // registry's pipe send is deliberately nonblocking, so a one-shot burst can
+    // be partially rejected before the supervisor has had a chance to drain and
+    // fill the downstream L2CAP queues.
     let sender = node.inbox_tx.clone();
     let dev_peer_clone = dev_peer.clone();
-    tokio::spawn(async move {
-        for _ in 0..150u64 {
-            let (waker_tx, _) = mpsc::channel::<()>(1);
-            let waker = waker_from_channel(waker_tx);
-            let _ = sender
+    let snapshots = Arc::clone(&node.snapshots);
+    let flood_task = tokio::spawn(async move {
+        let (waker_tx, _) = mpsc::channel::<()>(1);
+        let waker = waker_from_channel(waker_tx);
+        loop {
+            if snapshots
+                .load()
+                .peer_states
+                .get(&dev_peer_clone)
+                .map(|s| s.l2cap_upgrade_failed)
+                .unwrap_or(true)
+            {
+                break;
+            }
+            if sender
                 .send(PeerCommand::SendDatagram {
                     device_id: dev_peer_clone.clone(),
                     target_endpoint: None,
                     tx_gen: live_tx_gen,
                     datagram: Bytes::from(vec![0xAB; 64]),
-                    waker,
+                    waker: waker.clone(),
                 })
-                .await;
-            // Yield between sends so the registry actor can drain the inbox.
+                .await
+                .is_err()
+            {
+                break;
+            }
             tokio::task::yield_now().await;
         }
     });
@@ -651,6 +665,8 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
     })
     .await
     .expect("l2cap_upgrade_failed never set after handover timeout");
+    flood_task.abort();
+    let _ = flood_task.await;
 
     // Assert post-revert state: still Connected, l2cap_upgrade_failed=true.
     let snap = node.snapshots.load();
