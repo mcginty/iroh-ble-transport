@@ -126,6 +126,19 @@ jobs:
         working-directory: ${{ env.CHAT_DIR }}
         run: pnpm install --frozen-lockfile
 
+      - name: Seed .xcode.env so preBuildScript inherits mise trust
+        # The iOS Xcode project's preBuildScript (gen/apple/project.yml)
+        # sources $SRCROOT/.xcode.env before invoking `pnpm tauri ios
+        # xcode-script`. xcodebuild sanitizes env for phase scripts, so the
+        # workflow-level MISE_TRUSTED_CONFIG_PATHS never reaches the mise
+        # shim inside pnpm. Write it into .xcode.env explicitly.
+        run: |
+          set -eu
+          XCODE_ENV="$CHAT_DIR/src-tauri/gen/apple/.xcode.env"
+          mkdir -p "$(dirname "$XCODE_ENV")"
+          printf 'export MISE_TRUSTED_CONFIG_PATHS=%q\n' "$GITHUB_WORKSPACE" > "$XCODE_ENV"
+          cat "$XCODE_ENV"
+
       - name: Stage App Store Connect API key
         run: |
           set -eu
