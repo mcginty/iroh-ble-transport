@@ -312,7 +312,7 @@ async fn handle_hook_event(
                         %endpoint_id,
                         %stable_id,
                         device = %device_id,
-                        "iroh connection closed; tearing BLE pipe down"
+                        "all watched iroh connections closed; tearing BLE pipe down"
                     );
                     inbox.send(PeerCommand::Stalled { device_id }).await?;
                 }
@@ -433,8 +433,8 @@ impl BleTransport {
         });
 
         // Hook channel: the hook returned from `BleTransport::dedup_hook`
-        // sends verified-endpoint and connection-close events here; the
-        // forwarder translates them into `PeerCommand`s the registry acts on.
+        // sends verified-endpoint and last-connection-closed events here;
+        // the forwarder translates them into `PeerCommand`s the registry acts on.
         let (hook_tx, mut hook_rx) = tokio::sync::mpsc::unbounded_channel::<HookEvent>();
         let forwarder_inbox = inbox_tx.clone();
         let forwarder_routing = Arc::clone(&routing);
@@ -830,6 +830,25 @@ impl CustomSender for BleSender {
                     )));
                 }
             }
+        } else if let Some(tombstoned) = self.routing.note_tombstoned_transmit(stable_id) {
+            if tombstoned.dropped_count == 1 {
+                let tombstone = &tombstoned.tombstone;
+                tracing::debug!(
+                    %stable_id,
+                    device = %tombstone.device_id,
+                    direction = ?tombstone.direction,
+                    pipe_lifetime_ms = tombstone.pipe_lifetime.as_millis(),
+                    evicted_ms_ago = tombstone.evicted_at.elapsed().as_millis(),
+                    "dropping transmit for recently-evicted BLE stable-conn token"
+                );
+            } else {
+                tracing::trace!(
+                    %stable_id,
+                    dropped_count = tombstoned.dropped_count,
+                    "dropping transmit for recently-evicted BLE stable-conn token"
+                );
+            }
+            return Poll::Ready(Ok(()));
         } else {
             return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1074,9 +1093,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_verified_endpoint_stalls_evicted_devices_then_verifies() {
+        let routing = Routing::new();
+        let (tx, mut rx) = mpsc::channel::<PeerCommand>(4);
+        let endpoint_id = endpoint_id_with_first_byte(0xA1);
+        let evicted = blew::DeviceId::from("evicted-pipe");
+
+        handle_hook_event(
+            &tx,
+            &routing,
+            HookEvent::VerifiedEndpoint {
+                endpoint_id,
+                token: Some(42),
+                evicted_devices: vec![evicted.clone()],
+            },
+        )
+        .await
+        .expect("hook event should forward");
+
+        match rx.try_recv().expect("Stalled emitted first") {
+            PeerCommand::Stalled { device_id } => {
+                assert_eq!(device_id, evicted);
+            }
+            other => panic!("expected Stalled, got {other:?}"),
+        }
+        match rx.try_recv().expect("VerifiedEndpoint emitted second") {
+            PeerCommand::VerifiedEndpoint {
+                endpoint_id: ep,
+                token,
+            } => {
+                assert_eq!(ep, endpoint_id);
+                assert_eq!(token, Some(42));
+            }
+            other => panic!("expected VerifiedEndpoint, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn hook_connection_closed_stalls_current_routable_pipe() {
         let routing = Arc::new(Routing::new());
-        let endpoint_id = endpoint_id_with_first_byte(0xA1);
+        let endpoint_id = endpoint_id_with_first_byte(0xA2);
         let stable_id = routing.register_pipe(dev("close-current"), Direction::Outbound);
         routing.insert_routable(endpoint_id, stable_id, Dialer::Low);
 
@@ -1104,7 +1160,7 @@ mod tests {
     #[tokio::test]
     async fn hook_connection_closed_ignores_stale_pipe_after_replacement() {
         let routing = Arc::new(Routing::new());
-        let endpoint_id = endpoint_id_with_first_byte(0xA2);
+        let endpoint_id = endpoint_id_with_first_byte(0xA3);
         let old_id = routing.register_pipe(dev("close-old"), Direction::Outbound);
         routing.insert_routable(endpoint_id, old_id, Dialer::Low);
         let new_id = routing.register_pipe(dev("close-new"), Direction::Inbound);

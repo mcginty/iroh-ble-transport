@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::Waker;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use blew::DeviceId;
 use iroh_base::{CustomAddr, EndpointId};
@@ -38,6 +38,9 @@ use parking_lot::Mutex;
 
 use crate::transport::peer::{KEY_PREFIX_LEN, KeyPrefix};
 use crate::transport::transport::BLE_TRANSPORT_ID;
+
+const PIPE_TOMBSTONE_TTL: Duration = Duration::from_secs(30);
+const MAX_PIPE_TOMBSTONES: usize = 128;
 
 /// Length in bytes of the opaque token payload embedded in a BLE
 /// `CustomAddr`. The token is a little-endian `u64`
@@ -188,6 +191,22 @@ pub struct Routable {
     pub verified_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+pub struct PipeTombstone {
+    pub stable_id: StableConnId,
+    pub device_id: DeviceId,
+    pub direction: Direction,
+    pub pipe_lifetime: Duration,
+    pub evicted_at: Instant,
+    pub dropped_transmits: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TombstonedTransmit {
+    pub tombstone: PipeTombstone,
+    pub dropped_count: u64,
+}
+
 /// Authoritative routing table shared across the transport. Owns every
 /// piece of connection-system state that isn't the per-peer lifecycle
 /// machine in `registry.rs`.
@@ -200,6 +219,7 @@ pub struct Routing {
 #[derive(Debug, Default)]
 struct RoutingInner {
     pipes: HashMap<StableConnId, Pipe>,
+    pipe_tombstones: HashMap<StableConnId, PipeTombstone>,
     /// Scan-hint table: `KeyPrefix → DeviceId`. Populated whenever the
     /// central-side event pump sees an advertising packet whose service
     /// UUID matches the iroh-ble prefix shape. Answers "who might be
@@ -232,6 +252,27 @@ struct RoutingInner {
     /// endpoint. Keyed on endpoint so different resolvers don't wake
     /// each other spuriously.
     endpoint_wakers: HashMap<EndpointId, Vec<Waker>>,
+}
+
+impl RoutingInner {
+    fn prune_pipe_tombstones(&mut self, now: Instant) {
+        self.pipe_tombstones.retain(|_, tombstone| {
+            now.saturating_duration_since(tombstone.evicted_at) <= PIPE_TOMBSTONE_TTL
+        });
+        if self.pipe_tombstones.len() <= MAX_PIPE_TOMBSTONES {
+            return;
+        }
+        let mut by_age: Vec<(StableConnId, Instant)> = self
+            .pipe_tombstones
+            .iter()
+            .map(|(id, tombstone)| (*id, tombstone.evicted_at))
+            .collect();
+        by_age.sort_by_key(|(_, evicted_at)| *evicted_at);
+        let overflow = self.pipe_tombstones.len() - MAX_PIPE_TOMBSTONES;
+        for (id, _) in by_age.into_iter().take(overflow) {
+            self.pipe_tombstones.remove(&id);
+        }
+    }
 }
 
 /// Outcome of `Routing::note_scan_hint`, telling the caller whether
@@ -290,6 +331,7 @@ impl Routing {
         };
         {
             let mut inner = self.inner.lock();
+            inner.prune_pipe_tombstones(Instant::now());
             inner.pipes.insert(id, pipe);
         }
         tracing::debug!(
@@ -306,7 +348,23 @@ impl Routing {
     pub fn evict_pipe(&self, id: StableConnId) {
         let removed = {
             let mut inner = self.inner.lock();
-            inner.pipes.remove(&id)
+            let removed = inner.pipes.remove(&id);
+            if let Some(pipe) = &removed {
+                let now = Instant::now();
+                inner.prune_pipe_tombstones(now);
+                inner.pipe_tombstones.insert(
+                    id,
+                    PipeTombstone {
+                        stable_id: id,
+                        device_id: pipe.device_id.clone(),
+                        direction: pipe.direction,
+                        pipe_lifetime: pipe.created_at.elapsed(),
+                        evicted_at: now,
+                        dropped_transmits: 0,
+                    },
+                );
+            }
+            removed
         };
         if let Some(p) = removed {
             tracing::debug!(
@@ -325,6 +383,7 @@ impl Routing {
         let inner = self.inner.lock();
         RoutingSnapshot {
             pipes: inner.pipes.len(),
+            pipe_tombstones: inner.pipe_tombstones.len(),
             scan_hints: inner.scan_hint.len(),
             pending: inner.pending.len(),
             routable: inner.routable.len(),
@@ -630,6 +689,19 @@ impl Routing {
             .map(|p| p.device_id.clone())
     }
 
+    /// Record a transmit that still targets a recently-evicted pipe.
+    /// Returns `None` once the tombstone expires or if the id was never ours.
+    pub fn note_tombstoned_transmit(&self, stable_id: StableConnId) -> Option<TombstonedTransmit> {
+        let mut inner = self.inner.lock();
+        inner.prune_pipe_tombstones(Instant::now());
+        let tombstone = inner.pipe_tombstones.get_mut(&stable_id)?;
+        tombstone.dropped_transmits += 1;
+        Some(TombstonedTransmit {
+            tombstone: tombstone.clone(),
+            dropped_count: tombstone.dropped_transmits,
+        })
+    }
+
     /// Snapshot of the current routable pool for the pipe-lifetime
     /// watchdog. Each entry is resolved into
     /// `(endpoint_id, stable_id, device_id, verified_at)` so close
@@ -685,6 +757,7 @@ impl Routing {
     pub fn reserve_outbound(&self, endpoint_id: EndpointId) -> StableConnId {
         let prefix = crate::transport::routing::prefix_from_endpoint(&endpoint_id);
         let mut inner = self.inner.lock();
+        inner.prune_pipe_tombstones(Instant::now());
         if let Some(existing) = inner.reservations.get(&prefix) {
             return existing.stable_id;
         }
@@ -729,6 +802,7 @@ impl Routing {
         let mut inner = self.inner.lock();
         let reservation = inner.reservations.remove(prefix)?;
         inner.reserved_stable_ids.remove(&reservation.stable_id);
+        inner.pipe_tombstones.remove(&reservation.stable_id);
         Some(reservation)
     }
 
@@ -761,6 +835,7 @@ impl Routing {
             .find_map(|(p, d)| (d == device_id).then_some(p))?;
         let reservation = inner.reservations.remove(&prefix)?;
         inner.reserved_stable_ids.remove(&reservation.stable_id);
+        inner.pipe_tombstones.remove(&reservation.stable_id);
         Some(reservation)
     }
 
@@ -782,6 +857,8 @@ impl Routing {
             created_at: Instant::now(),
         };
         let mut inner = self.inner.lock();
+        inner.prune_pipe_tombstones(Instant::now());
+        inner.pipe_tombstones.remove(&stable_id);
         debug_assert!(
             !inner.pipes.contains_key(&stable_id),
             "StableConnId collision: id={stable_id} already live"
@@ -1017,6 +1094,7 @@ pub struct RoutableSnapshot {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RoutingSnapshot {
     pub pipes: usize,
+    pub pipe_tombstones: usize,
     pub scan_hints: usize,
     pub pending: usize,
     pub routable: usize,
@@ -1993,6 +2071,41 @@ mod tests {
         r.register_pipe_with_id(id, dev("mac-36"), Direction::Outbound);
         assert_eq!(r.snapshot().pipes, 1);
         assert_eq!(r.device_for_pipe(id).as_ref(), Some(&dev("mac-36")));
+    }
+
+    #[test]
+    fn evict_pipe_leaves_tombstone_for_stale_transmits() {
+        let r = Routing::new();
+        let id = r.register_pipe(dev("tombstoned"), Direction::Outbound);
+
+        r.evict_pipe(id);
+
+        assert!(r.device_for_pipe(id).is_none());
+        let first = r
+            .note_tombstoned_transmit(id)
+            .expect("recently evicted pipe should have tombstone");
+        assert_eq!(first.tombstone.stable_id, id);
+        assert_eq!(first.tombstone.device_id, dev("tombstoned"));
+        assert_eq!(first.tombstone.direction, Direction::Outbound);
+        assert_eq!(first.dropped_count, 1);
+        let second = r
+            .note_tombstoned_transmit(id)
+            .expect("tombstone should remain during ttl");
+        assert_eq!(second.dropped_count, 2);
+    }
+
+    #[test]
+    fn register_pipe_with_id_clears_matching_tombstone() {
+        let r = Routing::new();
+        let id = StableConnId::for_test(77);
+        r.register_pipe_with_id(id, dev("old"), Direction::Outbound);
+        r.evict_pipe(id);
+        assert!(r.note_tombstoned_transmit(id).is_some());
+
+        r.register_pipe_with_id(id, dev("new"), Direction::Inbound);
+
+        assert!(r.note_tombstoned_transmit(id).is_none());
+        assert_eq!(r.device_for_pipe(id).as_ref(), Some(&dev("new")));
     }
 
     #[test]
