@@ -57,6 +57,13 @@ env:
   # (a mise shim), which re-activates mise inside a subshell that doesn't
   # inherit the trust state `jdx/mise-action@v4` configured at job start.
   MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  # Force xcodebuild onto the default Xcode toolchain. Xcode 26.x runner
+  # images auto-overlay a MetalToolchain whose Swift stdlib is missing
+  # swiftCompatibility{50,51,56,Concurrency,Packs} — Tauri's pre-built
+  # Swift plugins still auto-link those compat libs, so the link step
+  # dies with undefined symbols. Pinning TOOLCHAINS sidesteps the overlay.
+  # See actions/runner-images#13135.
+  TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
 
 jobs:
   plan:
@@ -127,19 +134,26 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Select Xcode 26.3
+        # macos-latest defaults to Xcode 16.4 which doesn't understand
+        # the Icon Composer `.icon` file referenced by project.yml.
+        # Xcode 26.3 does — it's pre-installed, just needs to be active.
         run: sudo xcode-select -s /Applications/Xcode_26.3.app
 
-      - name: Seed .xcode.env so preBuildScript inherits mise trust
+      - name: Seed .xcode.env so preBuildScript inherits mise trust + toolchain
         # The iOS Xcode project's preBuildScript (gen/apple/project.yml)
         # sources $SRCROOT/.xcode.env before invoking `pnpm tauri ios
         # xcode-script`. xcodebuild sanitizes env for phase scripts, so the
-        # workflow-level MISE_TRUSTED_CONFIG_PATHS never reaches the mise
-        # shim inside pnpm. Write it into .xcode.env explicitly.
+        # workflow-level MISE_TRUSTED_CONFIG_PATHS + TOOLCHAINS never reach
+        # the mise shim / cargo / Swift compiler inside pnpm. Write them
+        # into .xcode.env explicitly.
         run: |
           set -eu
           XCODE_ENV="$CHAT_DIR/src-tauri/gen/apple/.xcode.env"
           mkdir -p "$(dirname "$XCODE_ENV")"
-          printf 'export MISE_TRUSTED_CONFIG_PATHS=%q\n' "$GITHUB_WORKSPACE" > "$XCODE_ENV"
+          {
+            printf 'export MISE_TRUSTED_CONFIG_PATHS=%q\n' "$GITHUB_WORKSPACE"
+            printf 'export TOOLCHAINS=%q\n' "com.apple.dt.toolchain.XcodeDefault"
+          } > "$XCODE_ENV"
           cat "$XCODE_ENV"
 
       - name: Stage App Store Connect API key
