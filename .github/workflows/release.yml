@@ -219,6 +219,12 @@ jobs:
 
       - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
+      - name: Install macOS system dependencies
+        # nasm is required by rav1e's build script (pulled in via ravif for
+        # image encoding). Only the x86_64-apple-darwin slice of the universal
+        # build hits the nasm code path; arm64 doesn't. Still needed on macos-15.
+        run: brew install nasm
+
       - name: Install frontend dependencies
         working-directory: ${{ env.CHAT_DIR }}
         run: pnpm install --frozen-lockfile
