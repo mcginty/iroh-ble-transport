@@ -21,7 +21,7 @@ name: Release
 on:
   push:
     tags:
-      - 'iroh-ble-chat-v*'
+      - "iroh-ble-chat-v*"
     # TEMP: branch trigger for pre-merge smoke testing. Revert before merging
     # to main — workflow_dispatch will work once the file lands on the default
     # branch. See plan job: branch pushes default to `android-release` only to
@@ -31,9 +31,9 @@ on:
   workflow_dispatch:
     inputs:
       targets:
-        description: 'Which jobs to run (manual dispatch is always dry-run)'
+        description: "Which jobs to run (manual dispatch is always dry-run)"
         required: true
-        default: 'all'
+        default: "all"
         type: choice
         options:
           - all
@@ -167,8 +167,8 @@ jobs:
           APPLE_API_KEY: ${{ env.APPSTORE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ env.APPSTORE_API_ISSUER_ID }}
           APPLE_API_KEY_PATH: ${{ env.SECRET_PATH_APPLE_API_KEY_P8 }}
-          IPHONEOS_DEPLOYMENT_TARGET: '16.0'
-        run: pnpm tauri ios build --export-method app-store-connect --ci
+          IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+        run: mise exec -- pnpm tauri ios build --export-method app-store-connect --ci
 
       - name: Upload IPA to TestFlight
         if: needs.plan.outputs.dry_run != 'true'
