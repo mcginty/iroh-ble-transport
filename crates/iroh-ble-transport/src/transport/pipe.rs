@@ -687,11 +687,9 @@ async fn run_l2cap_pipe(
                             len = datagram.len(),
                             "l2cap pipe got outbound"
                         );
-                        // Guard iroh's `socket.rs:575` div-by-zero panic on the
-                        // peer: if we forward a zero-length Transmit onto the
-                        // wire, the remote's poll_recv hands iroh `stride = 0`
-                        // and it panics. Ack the send so the waker unblocks
-                        // (iroh treats it as delivered), but skip the wire.
+                        // Keep mixed-version peers from seeing zero-length
+                        // L2CAP datagrams. Ack the send so iroh's waker
+                        // unblocks, but skip the wire.
                         if datagram.is_empty() {
                             empty_frames_counter.fetch_add(1, Ordering::Relaxed);
                             tracing::warn!(

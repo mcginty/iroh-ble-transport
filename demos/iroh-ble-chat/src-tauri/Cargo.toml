@@ -27,7 +27,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 iroh-ble-transport = { path = "../../../crates/iroh-ble-transport" }
 iroh-ble-chat-protocol = { path = "../../protocol" }
-iroh = { version = "0.98.0", features = ["unstable-custom-transports"] }
+iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
 iroh-base = "0.98"
 rand = "0.9"
 tokio = { version = "1", features = ["full"] }

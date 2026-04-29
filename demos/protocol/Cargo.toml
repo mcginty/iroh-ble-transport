@@ -9,7 +9,7 @@ publish = false
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1", features = ["alloc"] }
 bytes = "1"
-iroh = "0.98"
+iroh = "0.98.2"
 iroh-base = "0.98"
 anyhow = "1"
 rand = "0.9"

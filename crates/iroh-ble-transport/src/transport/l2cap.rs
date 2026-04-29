@@ -121,17 +121,14 @@ where
             match read_framed_datagram(&mut reader).await {
                 Ok(Some(data)) => {
                     last_rx_at.bump();
-                    // Guard iroh's `socket.rs:575` div-by-zero panic on
-                    // `stride == 0`. A `[0x00, 0x00]` frame on the wire
-                    // (either from a noq/iroh regression on the peer's
-                    // outbound side, or from a misbehaving peer) decodes
-                    // to an empty payload; forwarding it would panic the
-                    // iroh socket driver. Drop + count for diagnosis.
+                    // Keep empty L2CAP frames out of QUIC. iroh 0.98.2 no
+                    // longer panics on these, but they still indicate either
+                    // a mixed-version peer or malformed transport input.
                     if data.is_empty() {
                         empty_frames_counter.fetch_add(1, Ordering::Relaxed);
                         warn!(
                             device = %device_id,
-                            "l2cap recv task dropping zero-length frame (would trip iroh stride=0 panic)"
+                            "l2cap recv task dropping zero-length frame"
                         );
                         continue;
                     }
