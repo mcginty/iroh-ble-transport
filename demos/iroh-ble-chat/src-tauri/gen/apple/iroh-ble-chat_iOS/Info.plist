@@ -57,5 +57,16 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>iroh-ble-chat</string>
+			</array>
+			<key>CFBundleURLName</key>
+			<string>iroh-ble-chat</string>
+		</dict>
+	</array>
 </dict>
 </plist>

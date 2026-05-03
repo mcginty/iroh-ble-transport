@@ -19,6 +19,7 @@ yq = "latest"
 
 [env]
 CARGO_TERM_COLOR = "always"
+ANDROID_NDK_VERSION = "29.0.14206865"
 
 [tasks.build]
 description = "Build all crates, targets, and features"
@@ -80,6 +81,42 @@ rm -rf demos/iroh-ble-chat/src-tauri/gen/apple/build
 echo "==> Done."
 """
 
+# --- Android SDK setup -----------------------------------------------
+
+[tasks."android:setup"]
+description = "Install required Android NDK version via sdkmanager (idempotent)"
+run = """
+SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-$HOME/Library/Android/sdk}}"
+NDK_VERSION="${ANDROID_NDK_VERSION:-29.0.14206865}"
+NDK_PATH="$SDK/ndk/$NDK_VERSION"
+
+if [ -d "$NDK_PATH" ]; then
+  echo "NDK $NDK_VERSION already installed."
+  exit 0
+fi
+
+if [ ! -d "$SDK" ]; then
+  echo "error: Android SDK not found at $SDK"
+  echo "Install Android Studio or set ANDROID_SDK_ROOT."
+  exit 1
+fi
+
+echo "==> Installing NDK $NDK_VERSION into $SDK..."
+SDKMANAGER=""
+for candidate in "$SDK/cmdline-tools/latest/bin/sdkmanager" "$SDK/cmdline-tools/bin/sdkmanager"; do
+  [ -x "$candidate" ] && SDKMANAGER="$candidate" && break
+done
+[ -z "$SDKMANAGER" ] && SDKMANAGER="$(which sdkmanager 2>/dev/null || true)"
+if [ -z "$SDKMANAGER" ]; then
+  echo "error: sdkmanager not found. Install Android Studio or cmdline-tools."
+  exit 1
+fi
+
+yes | "$SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null 2>&1 || true
+"$SDKMANAGER" --sdk_root="$SDK" "ndk;$NDK_VERSION"
+echo "==> NDK $NDK_VERSION installed."
+"""
+
 # --- Chat app tasks ---------------------------------------------------
 
 [tasks."chat:dev"]
@@ -105,10 +142,12 @@ pnpm tauri ios dev --no-dev-server --open
 
 [tasks."chat:dev:android"]
 description = "Run the chat app on Android device"
+depends = ["android:setup"]
 run = "cd demos/iroh-ble-chat && pnpm install && pnpm tauri android dev --open"
 
 [tasks."chat:deploy:android:all"]
 description = "Build debug APK and deploy+launch on all connected Android devices"
+depends = ["android:setup"]
 dir = "demos/iroh-ble-chat"
 file = "scripts/deploy-android-all.sh"
 
@@ -223,4 +262,5 @@ run = "cargo check --target aarch64-apple-ios -p iroh-ble-transport --all-target
 
 [tasks."ci:check-android"]
 description = "Type-check all iroh-ble-transport targets and features for Android"
+depends = ["android:setup"]
 run = "cargo ndk -t arm64-v8a check -p iroh-ble-transport --all-targets --all-features"

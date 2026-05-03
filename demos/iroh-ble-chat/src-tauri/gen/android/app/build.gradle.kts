@@ -15,6 +15,7 @@ val tauriProperties = Properties().apply {
 
 android {
     compileSdk = 36
+    ndkVersion = "29.0.14206865"
     namespace = "org.jakebot.iroh_ble_chat"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"

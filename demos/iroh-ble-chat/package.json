@@ -13,17 +13,17 @@
     "@fontsource/jetbrains-mono": "^5.2.8",
     "@fontsource/press-start-2p": "^5.2.7",
     "@fontsource/space-grotesk": "^5.2.10",
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.11.0",
     "@tauri-apps/plugin-barcode-scanner": "^2.4.4",
-    "@tauri-apps/plugin-deep-link": "^2.4.8",
+    "@tauri-apps/plugin-deep-link": "^2.4.9",
     "@tauri-apps/plugin-log": "~2.8.0",
-    "@tauri-apps/plugin-opener": "^2",
+    "@tauri-apps/plugin-opener": "^2.5.4",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2",
+    "@tauri-apps/cli": "^2.11.0",
     "@types/qrcode": "^1.5.6",
-    "typescript": "~5.6.2",
-    "vite": "^6.0.3"
+    "typescript": "~5.6.3",
+    "vite": "^6.4.2"
   }
 }
