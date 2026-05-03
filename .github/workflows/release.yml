@@ -111,7 +111,6 @@ jobs:
     needs: plan
     if: needs.plan.outputs.run_ios_testflight == '1'
     runs-on: macos-latest
-    environment: Release
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -231,7 +230,6 @@ jobs:
     needs: plan
     if: needs.plan.outputs.run_macos_testflight == '1'
     runs-on: macos-latest
-    environment: Release
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -374,7 +372,6 @@ jobs:
     needs: plan
     if: needs.plan.outputs.run_android_release == '1'
     runs-on: ubuntu-latest
-    environment: Release
     timeout-minutes: 45
     env:
       # mise.toml declares `android-sdk` as a managed tool. On every pnpm
