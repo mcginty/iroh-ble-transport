@@ -505,12 +505,29 @@ jobs:
           set -eu
           OUT="$RUNNER_TEMP/release"
           mkdir -p "$OUT"
-          APPIMAGE=$(find "$CHAT_DIR/src-tauri/target/release/bundle/appimage" \
-            -type f -name '*.AppImage' \
-            | head -n1 || true)
+          APPIMAGE=""
+          for DIR in \
+            "$CHAT_DIR/src-tauri/target/release/bundle/appimage" \
+            "$GITHUB_WORKSPACE/target/release/bundle/appimage"
+          do
+            if [ -d "$DIR" ]; then
+              APPIMAGE=$(find "$DIR" -type f -name '*.AppImage' | head -n1 || true)
+              if [ -n "$APPIMAGE" ]; then
+                break
+              fi
+            fi
+          done
           if [ -z "$APPIMAGE" ]; then
             echo "No AppImage found; listing bundle outputs:" >&2
-            find "$CHAT_DIR/src-tauri/target/release/bundle" -type f >&2 || true
+            for DIR in \
+              "$CHAT_DIR/src-tauri/target/release/bundle" \
+              "$GITHUB_WORKSPACE/target/release/bundle"
+            do
+              if [ -d "$DIR" ]; then
+                echo "$DIR:" >&2
+                find "$DIR" -type f >&2
+              fi
+            done
             exit 1
           fi
           VERSION=$(python3 -c "import json; print(json.load(open('$CHAT_DIR/src-tauri/tauri.conf.json'))['version'])")
