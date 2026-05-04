@@ -412,6 +412,8 @@ jobs:
           fi
           ENCRYPTION=$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$APP_PATH/Contents/Info.plist")
           [ "$ENCRYPTION" = "false" ]
+          BLUETOOTH_USAGE=$(/usr/libexec/PlistBuddy -c 'Print :NSBluetoothAlwaysUsageDescription' "$APP_PATH/Contents/Info.plist")
+          [ -n "$BLUETOOTH_USAGE" ]
           chmod -R a+rX "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           ENTITLEMENTS="$RUNNER_TEMP/mas-entitlements.plist"
