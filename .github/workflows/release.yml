@@ -214,6 +214,11 @@ jobs:
           [ "$TEAM_ID" = "$APPLE_TEAM_ID" ]
           DEST="$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
           install -m 600 "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" "$DEST"
+          XCODE_ENV="$CHAT_DIR/src-tauri/gen/apple/.xcode.env"
+          {
+            printf 'export IOS_CODE_SIGN_IDENTITY=%q\n' "${{ steps.ios_identity.outputs.identity }}"
+            printf 'export IOS_PROVISIONING_PROFILE_SPECIFIER=%q\n' "$NAME"
+          } >> "$XCODE_ENV"
           echo "Installed profile: $NAME ($UUID)"
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
@@ -224,13 +229,10 @@ jobs:
           APPLE_API_ISSUER: ${{ env.APPSTORE_API_ISSUER_ID }}
           APPLE_API_KEY_PATH: ${{ env.SECRET_PATH_APPLE_API_KEY_P8 }}
           APPLE_DEVELOPMENT_TEAM: ${{ env.APPLE_TEAM_ID }}
+          IOS_CODE_SIGN_IDENTITY: ${{ steps.ios_identity.outputs.identity }}
+          IOS_PROVISIONING_PROFILE_SPECIFIER: ${{ steps.ios_profile.outputs.name }}
           IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-        run: |
-          mise exec -- pnpm tauri ios build --export-method app-store-connect --ci -- \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGN_IDENTITY="${{ steps.ios_identity.outputs.identity }}" \
-            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
-            PROVISIONING_PROFILE_SPECIFIER="${{ steps.ios_profile.outputs.name }}"
+        run: mise exec -- pnpm tauri ios build --export-method app-store-connect --ci
 
       - name: Upload IPA to TestFlight
         if: needs.plan.outputs.dry_run != 'true'
