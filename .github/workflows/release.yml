@@ -14,7 +14,7 @@ name: Release
 #
 # Triggered by:
 #   - Tag push matching `iroh-ble-chat-v*` → runs everything + creates a GitHub Release.
-#   - Manual dispatch with a `targets` input → runs the selected subset (no Release).
+#   - Manual dispatch with a `targets` input → runs the selected subset.
 #
 # See demos/iroh-ble-chat/RELEASE.md for the required secrets and one-time setup.
 
@@ -24,13 +24,13 @@ on:
       - "iroh-ble-chat-v*"
     # TEMP: branch trigger for pre-merge smoke testing. Revert before merging
     # to main — workflow_dispatch will work once the file lands on the default
-    # branch. See plan job: branch pushes upload only the macOS TestFlight build.
+    # branch. Publishing the GitHub Release remains tag-only.
     branches:
       - release-pipeline
   workflow_dispatch:
     inputs:
       targets:
-        description: "Which jobs to run (manual dispatch is always dry-run)"
+        description: "Which jobs to run"
         required: true
         default: "all"
         type: choice
@@ -72,27 +72,19 @@ jobs:
       run_ios_testflight: ${{ steps.decide.outputs.ios_testflight }}
       run_macos_testflight: ${{ steps.decide.outputs.macos_testflight }}
       run_android_release: ${{ steps.decide.outputs.android_release }}
-      dry_run: ${{ steps.decide.outputs.dry_run }}
-      macos_dry_run: ${{ steps.decide.outputs.macos_dry_run }}
     steps:
       - id: decide
         run: |
           target="${{ github.event.inputs.targets }}"
-          macos_dry_run="true"
-          # Only tag pushes publish. Everything else runs as a dry-run, except
-          # the temporary release-pipeline branch may upload the macOS build to
-          # TestFlight for smoke testing.
           if [ "${{ github.event_name }}" = "push" ]; then
             target="all"
             case "${{ github.ref }}" in
-              refs/tags/*)                  dry_run="false"; macos_dry_run="false" ;;
+              refs/tags/*)                  ;;
               # TEMP: branch-push smoke test. Revert this case + the
               # `on.push.branches` entry before merging.
-              refs/heads/release-pipeline)  dry_run="true"; macos_dry_run="false" ;;
+              refs/heads/release-pipeline)  ;;
               *) echo "Unexpected push ref: ${{ github.ref }}" >&2; exit 1 ;;
             esac
-          else
-            dry_run="true"
           fi
           case "$target" in
             all)                ios=1; mas=1; apk=1 ;;
@@ -105,9 +97,7 @@ jobs:
           echo "ios_testflight=$ios" >> "$GITHUB_OUTPUT"
           echo "macos_testflight=$mas" >> "$GITHUB_OUTPUT"
           echo "android_release=$apk" >> "$GITHUB_OUTPUT"
-          echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
-          echo "macos_dry_run=$macos_dry_run" >> "$GITHUB_OUTPUT"
-          echo "::notice::target=$target dry_run=$dry_run macos_dry_run=$macos_dry_run"
+          echo "::notice::target=$target"
 
   ios-testflight:
     name: iOS → TestFlight
@@ -232,10 +222,16 @@ jobs:
           IOS_CODE_SIGN_IDENTITY: ${{ steps.ios_identity.outputs.identity }}
           IOS_PROVISIONING_PROFILE_SPECIFIER: ${{ steps.ios_profile.outputs.name }}
           IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-        run: mise exec -- pnpm tauri ios build --export-method app-store-connect --ci
+        run: |
+          BASE_BUILD=$(node -e "console.log(require('./src-tauri/tauri.conf.json').bundle.iOS.bundleVersion)")
+          IOS_BUILD_NUMBER="$((BASE_BUILD + GITHUB_RUN_NUMBER)).${GITHUB_RUN_ATTEMPT}"
+          echo "Using iOS CI bundleVersion=$IOS_BUILD_NUMBER"
+          mise exec -- pnpm tauri ios build \
+            --export-method app-store-connect \
+            --ci \
+            --config "{\"bundle\":{\"iOS\":{\"bundleVersion\":\"$IOS_BUILD_NUMBER\"}}}"
 
       - name: Upload IPA to TestFlight
-        if: needs.plan.outputs.dry_run != 'true'
         run: |
           set -euo pipefail
           IPA=$(ls "$CHAT_DIR"/src-tauri/gen/apple/build/arm64/*.ipa | head -n1)
@@ -249,12 +245,6 @@ jobs:
           if grep -Eq 'UPLOAD FAILED|Validation failed|Failed to upload' "$LOG"; then
             exit 1
           fi
-
-      - name: Dry-run — skipping TestFlight upload
-        if: needs.plan.outputs.dry_run == 'true'
-        run: |
-          IPA=$(ls "$CHAT_DIR"/src-tauri/gen/apple/build/arm64/*.ipa | head -n1)
-          echo "::notice::Dry run: built $IPA but skipped App Store Connect upload."
 
       - uses: actions/upload-artifact@v7
         if: always()
@@ -400,7 +390,6 @@ jobs:
           echo "pkg_path=$PKG_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Upload PKG to TestFlight
-        if: needs.plan.outputs.macos_dry_run != 'true'
         env:
           PKG_PATH: ${{ steps.pkg.outputs.pkg_path }}
         run: |
@@ -414,13 +403,6 @@ jobs:
           if grep -Eq 'UPLOAD FAILED|Validation failed|Failed to upload' "$LOG"; then
             exit 1
           fi
-
-      - name: Dry-run — skipping TestFlight upload
-        if: needs.plan.outputs.macos_dry_run == 'true'
-        env:
-          PKG_PATH: ${{ steps.pkg.outputs.pkg_path }}
-        run: |
-          echo "::notice::Dry run: built $PKG_PATH but skipped App Store Connect upload."
 
       - uses: actions/upload-artifact@v7
         if: always()

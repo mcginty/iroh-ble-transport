@@ -20,8 +20,8 @@ Triggers:
 - Tag push `iroh-ble-chat-v*` → every build job runs, then `publish` collects the `release-*`
   artifacts and creates a single GitHub Release for the tag (with auto-generated notes).
   Tags containing `-alpha`, `-beta`, or `-rc` are marked prerelease.
-- `workflow_dispatch` → pick a subset via the `targets` input. Manual runs never create a
-  GitHub Release — they upload workflow artifacts for download/debugging.
+- `workflow_dispatch` → pick a subset via the `targets` input. TestFlight jobs upload to
+  App Store Connect; Android uploads a workflow artifact. Manual runs do not create a GitHub Release.
 
 ## Cutting a release
 
@@ -52,8 +52,9 @@ GitHub UI → Actions → "Release" → "Run workflow":
 | `macos-testflight`  | macOS MAS only                                                    |
 | `android-release`   | Android only                                                      |
 
-Manual runs reuse whatever `version`/`bundleVersion` is currently in `tauri.conf.json` — re-run
-`cargo release` (or edit the file by hand) if you need a bumped build number before re-uploading.
+Manual runs reuse the `version` in `tauri.conf.json`. iOS and macOS build numbers are
+overridden in CI from the checked-in `bundleVersion` plus the GitHub run number and attempt,
+so reruns do not require a version-bump commit.
 
 ## Secret management (age)
 
