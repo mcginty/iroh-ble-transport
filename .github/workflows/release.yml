@@ -379,6 +379,8 @@ jobs:
             echo "macOS CFBundleVersion must be a monotonically increasing build number, not the marketing version." >&2
             exit 1
           fi
+          ENCRYPTION=$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$APP_PATH/Contents/Info.plist")
+          [ "$ENCRYPTION" = "false" ]
           chmod -R a+rX "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           ENTITLEMENTS="$RUNNER_TEMP/mas-entitlements.plist"
