@@ -123,7 +123,7 @@ scripts/secrets.sh encrypt path/to/secrets.env
 | ---------------------------------------- | --------- | ------------------------------------------------------ |
 | `apple-api-key.p8.age`                   | required  | App Store Connect API key (.p8 downloaded from ASC).   |
 | `ios-dist.p12.age`                       | required  | iOS Distribution cert (.p12 with private key).         |
-| `ios-appstore.mobileprovision.age`       | optional  | iOS App Store provisioning profile (fallback only — see below). |
+| `ios-appstore.mobileprovision.age`       | required  | iOS App Store provisioning profile.                    |
 | `mas-app.p12.age`                        | required  | 3rd Party Mac Developer Application cert (.p12).       |
 | `mas-installer.p12.age`                  | required  | 3rd Party Mac Developer Installer cert (.p12).         |
 | `mas-appstore.provisionprofile.age`      | required  | Mac App Store provisioning profile.                    |
@@ -134,12 +134,9 @@ profiles via the API. Export `.p12` certs from Keychain Access (Export → "Pers
 Information Exchange (.p12)"). Provisioning profiles come from the
 [Apple Developer portal](https://developer.apple.com/account/resources/profiles/list).
 
-**iOS provisioning profile is optional.** With an App Manager-scope API key and
-`--export-method app-store-connect`, `xcodebuild -allowProvisioningUpdates` will
-create or fetch the profile at build time (same flow Xcode Cloud uses). Only
-supply `ios-appstore.mobileprovision.age` if automatic signing fails — for
-example, if your API key is capped at the Developer role, or the Apple Developer
-portal rate-limits profile creation.
+The iOS workflow uses manual signing for deterministic CI exports. The
+`ios-appstore.mobileprovision.age` profile must match `org.jakebot.iroh-ble-chat`
+and the team ID used by the iOS distribution certificate.
 
 Sandbox entitlements for MAS live in [src-tauri/Entitlements.mas.plist](src-tauri/Entitlements.mas.plist);
 the MAS bundle overlay is [src-tauri/tauri.mas.conf.json](src-tauri/tauri.mas.conf.json).

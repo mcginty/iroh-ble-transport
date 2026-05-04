@@ -166,6 +166,7 @@ jobs:
             "$HOME/.appstoreconnect/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
 
       - name: Import iOS distribution certificate
+        id: ios_identity
         run: |
           set -eu
           KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
@@ -178,20 +179,42 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | xargs)
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security find-identity -v -p codesigning "$KEYCHAIN"
+          IDENT=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F\" '/Apple Distribution/ {print $2; exit}')
+          if [ -z "$IDENT" ]; then
+            echo "No Apple Distribution identity found in ios-dist.p12.age" >&2
+            exit 1
+          fi
+          case "$IDENT" in
+            *"Tauri (unset)"*)
+              echo "ios-dist.p12.age contains the placeholder Tauri distribution certificate; replace it with this app's Apple Distribution certificate." >&2
+              exit 1
+              ;;
+          esac
+          echo "Using iOS distribution identity: $IDENT"
+          echo "identity=$IDENT" >> "$GITHUB_OUTPUT"
 
-      # Optional fallback. When no ios-appstore.mobileprovision.age is present in
-      # .github/secrets/, this step is skipped and xcodebuild relies on
-      # `-allowProvisioningUpdates` + the App Store Connect API key to fetch or
-      # create the profile at build time (same path Xcode Cloud uses).
-      - name: Install iOS provisioning profile (optional fallback)
-        if: env.SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION != ''
+      - name: Install iOS provisioning profile
+        id: ios_profile
         run: |
           set -eu
+          if [ -z "${SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION:-}" ]; then
+            echo "Missing .github/secrets/ios-appstore.mobileprovision.age; iOS App Store exports require a committed encrypted provisioning profile." >&2
+            exit 1
+          fi
           mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          DEST="$HOME/Library/MobileDevice/Provisioning Profiles/ios-appstore.mobileprovision"
+          PLIST="$RUNNER_TEMP/ios-appstore-profile.plist"
+          security cms -D -i "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" > "$PLIST"
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PLIST")
+          NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST")
+          APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PLIST")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PLIST")
+          [ "$APP_ID" = "$APPLE_TEAM_ID.$BUNDLE_ID" ]
+          [ "$TEAM_ID" = "$APPLE_TEAM_ID" ]
+          DEST="$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
           install -m 600 "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" "$DEST"
-          NAME=$(security cms -D -i "$DEST" | /usr/libexec/PlistBuddy -c 'Print :Name' /dev/stdin)
-          echo "Installed profile: $NAME"
+          echo "Installed profile: $NAME ($UUID)"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
 
       - name: Build iOS IPA (App Store Connect)
         working-directory: ${{ env.CHAT_DIR }}
@@ -199,8 +222,14 @@ jobs:
           APPLE_API_KEY: ${{ env.APPSTORE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ env.APPSTORE_API_ISSUER_ID }}
           APPLE_API_KEY_PATH: ${{ env.SECRET_PATH_APPLE_API_KEY_P8 }}
+          APPLE_DEVELOPMENT_TEAM: ${{ env.APPLE_TEAM_ID }}
           IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-        run: mise exec -- pnpm tauri ios build --export-method app-store-connect --ci
+        run: |
+          mise exec -- pnpm tauri ios build --export-method app-store-connect --ci -- \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="${{ steps.ios_identity.outputs.identity }}" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ steps.ios_profile.outputs.name }}"
 
       - name: Upload IPA to TestFlight
         if: needs.plan.outputs.dry_run != 'true'
