@@ -343,6 +343,12 @@ jobs:
           PKG_PATH="$RUNNER_TEMP/${APP_NAME}.pkg"
           chmod -R a+rX "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          ENTITLEMENTS="$RUNNER_TEMP/mas-entitlements.plist"
+          codesign -d --entitlements :- "$APP_PATH" > "$ENTITLEMENTS"
+          APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.application-identifier' "$ENTITLEMENTS")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")
+          [ "$APP_ID" = "$APPLE_TEAM_ID.$BUNDLE_ID" ]
+          [ "$TEAM_ID" = "$APPLE_TEAM_ID" ]
           echo "Building installer from $APP_PATH"
           xcrun productbuild \
             --sign "$INSTALLER_IDENT" \
