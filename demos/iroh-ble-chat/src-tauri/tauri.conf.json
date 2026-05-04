@@ -25,6 +25,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "category": "SocialNetworking",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -36,7 +37,11 @@
       "autoIncrementVersionCode": true
     },
     "iOS": {
+      "developmentTeam": "XG66F95CNS",
       "bundleVersion": "154"
+    },
+    "macOS": {
+      "bundleVersion": "192"
     }
   },
   "plugins": {

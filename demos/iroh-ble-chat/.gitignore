@@ -12,6 +12,11 @@ dist
 dist-ssr
 *.local
 
+# Apple signing artifacts (written by CI)
+src-tauri/embedded.provisionprofile
+src-tauri/*.p8
+src-tauri/*.p12
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

@@ -1,0 +1,514 @@
+name: Release
+
+# Publishes the iroh-ble-chat demo.
+#
+# Jobs:
+#   - macos-testflight     : sandboxed .pkg → App Store Connect (TestFlight).
+#   - linux-appimage-build : AppImage → workflow artifact / GitHub Release.
+#   - android-release-build: signed universal APK → workflow artifact.
+#   - publish              : collects release artifacts → single GitHub Release (tag push only).
+#
+# Secrets live in .github/secrets/ as age-encrypted files. A single repo secret
+# AGE_IDENTITY holds the private key that decrypts them. Local tooling:
+# scripts/secrets.sh {encrypt,decrypt,rekey}.
+#
+# Triggered by:
+#   - Tag push matching `iroh-ble-chat-v*` → runs everything + creates a GitHub Release.
+#   - Manual dispatch with a `targets` input → runs the selected subset.
+#
+# See demos/iroh-ble-chat/RELEASE.md for the required secrets and one-time setup.
+
+on:
+  push:
+    tags:
+      - "iroh-ble-chat-v*"
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "Which jobs to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - testflight-all
+          - macos-testflight
+          - linux-appimage
+          - android-release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: iroh-ble-chat
+  CHAT_DIR: demos/iroh-ble-chat
+  BUNDLE_ID: org.jakebot.iroh-ble-chat
+  APPLE_TEAM_ID: XG66F95CNS
+  # Pre-trust the repo's mise.toml for every shell on every runner — the
+  # Xcode preBuildScript in gen/apple/project.yml shells out to `pnpm`
+  # (a mise shim), which re-activates mise inside a subshell that doesn't
+  # inherit the trust state `jdx/mise-action@v4` configured at job start.
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+  # Force xcodebuild onto the default Xcode toolchain. Xcode 26.x runner
+  # images auto-overlay a MetalToolchain whose Swift stdlib is missing
+  # swiftCompatibility{50,51,56,Concurrency,Packs} — Tauri's pre-built
+  # Swift plugins still auto-link those compat libs, so the link step
+  # dies with undefined symbols. Pinning TOOLCHAINS sidesteps the overlay.
+  # See actions/runner-images#13135.
+  TOOLCHAINS: com.apple.dt.toolchain.XcodeDefault
+
+jobs:
+  plan:
+    name: Plan
+    runs-on: ubuntu-latest
+    outputs:
+      run_macos_testflight: ${{ steps.decide.outputs.macos_testflight }}
+      run_linux_appimage: ${{ steps.decide.outputs.linux_appimage }}
+      run_android_release: ${{ steps.decide.outputs.android_release }}
+    steps:
+      - id: decide
+        run: |
+          target="${{ github.event.inputs.targets }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            target="all"
+            case "${{ github.ref }}" in
+              refs/tags/*) ;;
+              *) echo "Unexpected push ref: ${{ github.ref }}" >&2; exit 1 ;;
+            esac
+          fi
+          case "$target" in
+            all)                mas=1; linux=1; apk=1 ;;
+            testflight-all)     mas=1; linux=0; apk=0 ;;
+            macos-testflight)   mas=1; linux=0; apk=0 ;;
+            linux-appimage)     mas=0; linux=1; apk=0 ;;
+            android-release)    mas=0; linux=0; apk=1 ;;
+            *) echo "Unknown target: $target" >&2; exit 1 ;;
+          esac
+          echo "macos_testflight=$mas" >> "$GITHUB_OUTPUT"
+          echo "linux_appimage=$linux" >> "$GITHUB_OUTPUT"
+          echo "android_release=$apk" >> "$GITHUB_OUTPUT"
+          echo "::notice::target=$target"
+
+  macos-testflight:
+    name: macOS → TestFlight
+    needs: plan
+    if: needs.plan.outputs.run_macos_testflight == '1'
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust node pnpm age
+
+      - uses: ./.github/actions/decrypt-secrets
+        with:
+          age-identity: ${{ secrets.AGE_IDENTITY }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: macos-mas-release
+
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install macOS system dependencies
+        # nasm is required by rav1e's build script (pulled in via ravif for
+        # image encoding). Only the x86_64-apple-darwin slice of the universal
+        # build hits the nasm code path; arm64 doesn't. Still needed on macos-15.
+        run: brew install nasm
+
+      - name: Select Xcode 26.3
+        run: sudo xcode-select -s /Applications/Xcode_26.3.app
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.CHAT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Stage App Store Connect API key
+        run: |
+          set -eu
+          mkdir -p "$HOME/.appstoreconnect/private_keys"
+          install -m 600 "$SECRET_PATH_APPLE_API_KEY_P8" \
+            "$HOME/.appstoreconnect/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+
+      - name: Import MAS signing certificates
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 7200 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$SECRET_PATH_MAS_APP_P12" \
+            -P "$APPLE_MAS_APP_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security import "$SECRET_PATH_MAS_INSTALLER_P12" \
+            -P "$APPLE_MAS_INSTALLER_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | xargs)
+          security set-key-partition-list -S apple-tool:,apple:,productbuild: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "--- codesigning identities ---"
+          security find-identity -v -p codesigning "$KEYCHAIN"
+          echo "--- all identities ---"
+          security find-identity -v "$KEYCHAIN"
+
+      - name: Resolve signing identity names
+        id: identities
+        run: |
+          set -eu
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          APP_IDENT=$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | awk -F\" '/3rd Party Mac Developer Application/ {print $2; exit}')
+          INSTALLER_IDENT=$(security find-identity -v "$KEYCHAIN" \
+            | awk -F\" '/3rd Party Mac Developer Installer/ {print $2; exit}')
+          if [ -z "$APP_IDENT" ] || [ -z "$INSTALLER_IDENT" ]; then
+            echo "Missing 3rd Party Mac Developer identity in keychain" >&2
+            exit 1
+          fi
+          echo "Application: $APP_IDENT"
+          echo "Installer:   $INSTALLER_IDENT"
+          echo "app=$APP_IDENT" >> "$GITHUB_OUTPUT"
+          echo "installer=$INSTALLER_IDENT" >> "$GITHUB_OUTPUT"
+
+      - name: Install MAS provisioning profile
+        run: |
+          set -eu
+          install -m 600 "$SECRET_PATH_MAS_APPSTORE_PROVISIONPROFILE" \
+            "$CHAT_DIR/src-tauri/embedded.provisionprofile"
+
+      - name: Build macOS app bundle (MAS)
+        working-directory: ${{ env.CHAT_DIR }}
+        # Intentionally NOT setting APPLE_API_KEY* env vars here: Tauri
+        # would otherwise try to notarize the output, but notarization
+        # only accepts Developer ID-signed binaries. MAS binaries are
+        # signed with the "3rd Party Mac Developer Application" identity
+        # and validated server-side by Apple when the .pkg is uploaded
+        # to App Store Connect — no notarization step involved.
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ steps.identities.outputs.app }}
+        run: |
+          BASE_BUILD=$(node -e "console.log(require('./src-tauri/tauri.conf.json').bundle.macOS.bundleVersion)")
+          MACOS_BUILD_NUMBER="$((BASE_BUILD + GITHUB_RUN_NUMBER)).${GITHUB_RUN_ATTEMPT}"
+          echo "Using macOS CI bundleVersion=$MACOS_BUILD_NUMBER"
+          pnpm tauri build \
+            --target universal-apple-darwin \
+            --bundles app \
+            --config src-tauri/tauri.mas.conf.json \
+            --config "{\"bundle\":{\"macOS\":{\"bundleVersion\":\"$MACOS_BUILD_NUMBER\"}}}"
+
+      - name: Wrap .app as signed .pkg
+        id: pkg
+        env:
+          INSTALLER_IDENT: ${{ steps.identities.outputs.installer }}
+        run: |
+          set -eu
+          APP_PATH=$(ls -d target/universal-apple-darwin/release/bundle/macos/*.app | head -n1)
+          PKG_PATH="$RUNNER_TEMP/${APP_NAME}.pkg"
+          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")
+          BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist")
+          echo "macOS CFBundleShortVersionString=$SHORT_VERSION CFBundleVersion=$BUNDLE_VERSION"
+          if [ "$BUNDLE_VERSION" = "$SHORT_VERSION" ]; then
+            echo "macOS CFBundleVersion must be a monotonically increasing build number, not the marketing version." >&2
+            exit 1
+          fi
+          ENCRYPTION=$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$APP_PATH/Contents/Info.plist")
+          [ "$ENCRYPTION" = "false" ]
+          BLUETOOTH_USAGE=$(/usr/libexec/PlistBuddy -c 'Print :NSBluetoothAlwaysUsageDescription' "$APP_PATH/Contents/Info.plist")
+          [ -n "$BLUETOOTH_USAGE" ]
+          chmod -R a+rX "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          ENTITLEMENTS="$RUNNER_TEMP/mas-entitlements.plist"
+          codesign -d --entitlements :- "$APP_PATH" > "$ENTITLEMENTS"
+          APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.application-identifier' "$ENTITLEMENTS")
+          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.developer.team-identifier' "$ENTITLEMENTS")
+          [ "$APP_ID" = "$APPLE_TEAM_ID.$BUNDLE_ID" ]
+          [ "$TEAM_ID" = "$APPLE_TEAM_ID" ]
+          echo "Building installer from $APP_PATH"
+          xcrun productbuild \
+            --sign "$INSTALLER_IDENT" \
+            --component "$APP_PATH" /Applications \
+            "$PKG_PATH"
+          echo "pkg_path=$PKG_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload PKG to TestFlight
+        env:
+          PKG_PATH: ${{ steps.pkg.outputs.pkg_path }}
+        run: |
+          set -euo pipefail
+          LOG="$RUNNER_TEMP/altool-macos.log"
+          xcrun altool --upload-app \
+            --type macos \
+            --file "$PKG_PATH" \
+            --apiKey "$APPSTORE_API_KEY_ID" \
+            --apiIssuer "$APPSTORE_API_ISSUER_ID" 2>&1 | tee "$LOG"
+          if grep -Eq 'UPLOAD FAILED|Validation failed|Failed to upload' "$LOG"; then
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: macos-mas-pkg
+          path: ${{ runner.temp }}/*.pkg
+          if-no-files-found: warn
+          retention-days: 14
+
+  linux-appimage-build:
+    name: Linux AppImage build
+    needs: plan
+    if: needs.plan.outputs.run_linux_appimage == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust node pnpm
+
+      - name: Install Linux system dependencies
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            libglib2.0-dev \
+            libgtk-3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            nasm \
+            patchelf \
+            pkg-config \
+            wget
+          if apt-cache show libfuse2 >/dev/null 2>&1; then
+            sudo apt-get install -y libfuse2
+          else
+            sudo apt-get install -y libfuse2t64
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: linux-appimage
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.CHAT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Build AppImage
+        working-directory: ${{ env.CHAT_DIR }}
+        run: pnpm tauri build --bundles appimage --ci
+
+      - name: Stage AppImage
+        run: |
+          set -eu
+          OUT="$RUNNER_TEMP/release"
+          mkdir -p "$OUT"
+          APPIMAGE=""
+          for DIR in \
+            "$CHAT_DIR/src-tauri/target/release/bundle/appimage" \
+            "$GITHUB_WORKSPACE/target/release/bundle/appimage"
+          do
+            if [ -d "$DIR" ]; then
+              APPIMAGE=$(find "$DIR" -type f -name '*.AppImage' | head -n1 || true)
+              if [ -n "$APPIMAGE" ]; then
+                break
+              fi
+            fi
+          done
+          if [ -z "$APPIMAGE" ]; then
+            echo "No AppImage found; listing bundle outputs:" >&2
+            for DIR in \
+              "$CHAT_DIR/src-tauri/target/release/bundle" \
+              "$GITHUB_WORKSPACE/target/release/bundle"
+            do
+              if [ -d "$DIR" ]; then
+                echo "$DIR:" >&2
+                find "$DIR" -type f >&2
+              fi
+            done
+            exit 1
+          fi
+          VERSION=$(python3 -c "import json; print(json.load(open('$CHAT_DIR/src-tauri/tauri.conf.json'))['version'])")
+          DEST="$OUT/${APP_NAME}-${VERSION}-linux-x86_64.AppImage"
+          cp "$APPIMAGE" "$DEST"
+          chmod +x "$DEST"
+          ls -lh "$OUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-linux-appimage
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  android-release-build:
+    name: Android release build
+    needs: plan
+    if: needs.plan.outputs.run_android_release == '1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # mise.toml declares `android-sdk` as a managed tool. On every pnpm
+      # invocation (pnpm is on PATH via mise shims), the shim re-activates
+      # mise and resets ANDROID_HOME to the mise install dir — which has
+      # no NDK, so Tauri's ensure_ndk() bails with "Android NDK not found".
+      # Disable the tool for this job so mise leaves ANDROID_HOME alone.
+      MISE_DISABLE_TOOLS: android-sdk
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust node pnpm java age
+
+      - uses: ./.github/actions/decrypt-secrets
+        with:
+          age-identity: ${{ secrets.AGE_IDENTITY }}
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          # nasm is required by the rav1e build script (pulled in via ravif
+          # for image encoding in the chat app).
+          sudo apt-get install -y libdbus-1-dev libglib2.0-dev pkg-config nasm
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: android-release
+
+      - name: Add Rust Android targets
+        run: |
+          rustup target add \
+            aarch64-linux-android \
+            armv7-linux-androideabi \
+            x86_64-linux-android
+
+      - name: Configure Android SDK + NDK
+        run: |
+          set -eu
+          # mise.toml declares `android-sdk = "latest"` which makes mise-action
+          # point ANDROID_HOME at an empty mise install dir. Override to the
+          # system Android SDK that ubuntu-latest actually ships with.
+          SDK="/usr/local/lib/android/sdk"
+          # Prefer the pre-installed NDKs over installing a new one via
+          # sdkmanager — the latter has historically produced incomplete
+          # installs when ANDROID_HOME writes need perms we don't have.
+          for candidate in \
+            "${ANDROID_NDK_LATEST_HOME:-}" \
+            "${ANDROID_NDK_HOME:-}" \
+            "${ANDROID_NDK:-}"; do
+            if [ -n "$candidate" ] && [ -f "$candidate/source.properties" ]; then
+              NDK="$candidate"
+              break
+            fi
+          done
+          if [ -z "${NDK:-}" ] && [ -d "$SDK/ndk" ]; then
+            NDK=$(ls -1d "$SDK"/ndk/*/ 2>/dev/null | sort -V | tail -n1 | sed 's:/$::')
+          fi
+          if [ -z "${NDK:-}" ] || [ ! -f "$NDK/source.properties" ]; then
+            echo "No usable pre-installed NDK found. Contents of $SDK/ndk:" >&2
+            ls -la "$SDK/ndk" 2>&1 || true
+            exit 1
+          fi
+          echo "Using pre-installed NDK at $NDK"
+          grep -E '^Pkg\.(Revision|Desc)' "$NDK/source.properties" || true
+          # Sanity-check the LLVM toolchain dir that cargo-mobile2 validates.
+          LLVM_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          [ -d "$LLVM_BIN" ] || { echo "NDK incomplete: missing $LLVM_BIN" >&2; exit 1; }
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
+          echo "NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+
+      - name: Install frontend dependencies
+        working-directory: ${{ env.CHAT_DIR }}
+        run: pnpm install --frozen-lockfile
+
+      - name: Configure Android signing
+        run: |
+          set -eu
+          ANDROID_DIR="$CHAT_DIR/src-tauri/gen/android"
+          {
+            echo "storeFile=$SECRET_PATH_ANDROID_RELEASE_JKS"
+            echo "keyAlias=$ANDROID_KEY_ALIAS"
+            echo "storePassword=$ANDROID_KEYSTORE_PASSWORD"
+            echo "keyPassword=$ANDROID_KEY_PASSWORD"
+          } > "$ANDROID_DIR/keystore.properties"
+
+      - name: Build universal APK
+        working-directory: ${{ env.CHAT_DIR }}
+        env:
+          ORG_GRADLE_PROJECT_androidTargetAbis: arm64-v8a,armeabi-v7a,x86_64
+          # Re-assert NDK paths inline so we don't rely on $GITHUB_ENV
+          # propagation from the "Set up Android NDK environment" step.
+          NDK_HOME: ${{ env.NDK_HOME }}
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+          ANDROID_NDK_ROOT: ${{ env.ANDROID_NDK_ROOT }}
+        run: |
+          echo "--- NDK env visible to this step ---"
+          env | grep -iE 'ndk|android' | sort || true
+          echo "---"
+          pnpm tauri android build --apk \
+            --target aarch64 \
+            --target armv7 \
+            --target x86_64
+
+      - name: Stage APK
+        run: |
+          set -eu
+          OUT="$RUNNER_TEMP/release"
+          mkdir -p "$OUT"
+          APK_SRC=$(find "$CHAT_DIR/src-tauri/gen/android/app/build/outputs/apk" \
+            -type f -name '*.apk' \
+            | grep -Ei '/release/|/universal/' \
+            | head -n1 || true)
+          if [ -z "$APK_SRC" ]; then
+            echo "No release APK found; listing outputs:" >&2
+            find "$CHAT_DIR/src-tauri/gen/android/app/build/outputs" -type f >&2 || true
+            exit 1
+          fi
+          VERSION=$(python3 -c "import json; print(json.load(open('$CHAT_DIR/src-tauri/tauri.conf.json'))['version'])")
+          DEST="$OUT/${APP_NAME}-${VERSION}-universal.apk"
+          cp "$APK_SRC" "$DEST"
+          ls -lh "$OUT"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-android
+          path: ${{ runner.temp }}/release/*
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish GitHub Release
+    needs: [plan, linux-appimage-build, android-release-build]
+    if: |
+      always()
+        && startsWith(github.ref, 'refs/tags/iroh-ble-chat-v')
+        && needs.linux-appimage-build.result == 'success'
+        && needs.android-release-build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: List release artifacts
+        run: ls -lh "$RUNNER_TEMP/artifacts"
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ runner.temp }}/artifacts/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-rc') }}

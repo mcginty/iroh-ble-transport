@@ -1,3 +1,12 @@
 /target
 .claude
 .worktrees
+/.secrets
+
+# .github/secrets/ accepts only age-encrypted blobs and the recipients/README
+# files. Everything else (stray .p12, .jks, plaintext .env, decrypt leftovers)
+# stays untracked to prevent accidental commits of plaintext secrets.
+/.github/secrets/*
+!/.github/secrets/*.age
+!/.github/secrets/recipients.txt
+!/.github/secrets/README.md

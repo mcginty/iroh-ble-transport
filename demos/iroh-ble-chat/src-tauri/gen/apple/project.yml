@@ -88,7 +88,10 @@ targets:
         ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES: true
         EXCLUDED_ARCHS[sdk=iphoneos*]: x86_64
         ASSETCATALOG_COMPILER_APPICON_NAME: "a blue tooth"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY[sdk=iphoneos*]: "$(IOS_CODE_SIGN_IDENTITY)"
         DEVELOPMENT_TEAM: XG66F95CNS
+        PROVISIONING_PROFILE_SPECIFIER[sdk=iphoneos*]: "$(IOS_PROVISIONING_PROFILE_SPECIFIER)"
       groups: [app]
     dependencies:
       - framework: libapp.a
