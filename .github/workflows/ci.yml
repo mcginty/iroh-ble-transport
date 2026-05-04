@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  NEXTEST_PROFILE: ci
   RUSTFLAGS: -Dwarnings
   LINUX_APT_DEPS: libdbus-1-dev libglib2.0-dev pkg-config libgtk-3-dev libssl-dev libjavascriptcoregtk-4.1-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libayatana-appindicator3-dev nasm
 

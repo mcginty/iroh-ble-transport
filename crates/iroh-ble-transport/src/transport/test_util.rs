@@ -42,8 +42,8 @@ struct Inner {
     is_powered: bool,
     connect_delay: Option<Duration>,
     next_channel_id: u64,
-    on_c2p_write: Option<Box<dyn Fn(DeviceId, Bytes) + Send + Sync>>,
-    on_p2c_notify: Option<Box<dyn Fn(DeviceId, Bytes) + Send + Sync>>,
+    on_c2p_write: Option<Arc<dyn Fn(DeviceId, Bytes) + Send + Sync>>,
+    on_p2c_notify: Option<Arc<dyn Fn(DeviceId, Bytes) + Send + Sync>>,
     psm_responses: VecDeque<Option<u16>>,
     version_responses: VecDeque<Option<u8>>,
     mtu_responses: VecDeque<u16>,
@@ -143,11 +143,11 @@ impl MockBleInterface {
     }
 
     pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
-        self.inner.lock().unwrap().on_c2p_write = Some(hook);
+        self.inner.lock().unwrap().on_c2p_write = Some(Arc::from(hook));
     }
 
     pub fn set_on_p2c_notify(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
-        self.inner.lock().unwrap().on_p2c_notify = Some(hook);
+        self.inner.lock().unwrap().on_p2c_notify = Some(Arc::from(hook));
     }
 
     /// Push MTU values to be returned on successive `mtu()` calls. When the
@@ -240,12 +240,9 @@ impl BleInterface for MockBleInterface {
         if let Some(result) = seeded {
             return result;
         }
-        let hook = self.inner.lock().unwrap().on_c2p_write.take();
+        let hook = self.inner.lock().unwrap().on_c2p_write.clone();
         if let Some(h) = hook.as_ref() {
             h(device_id.clone(), bytes);
-        }
-        if let Some(h) = hook {
-            self.inner.lock().unwrap().on_c2p_write = Some(h);
         }
         Ok(())
     }
@@ -266,12 +263,9 @@ impl BleInterface for MockBleInterface {
         if let Some(result) = seeded {
             return result;
         }
-        let hook = self.inner.lock().unwrap().on_p2c_notify.take();
+        let hook = self.inner.lock().unwrap().on_p2c_notify.clone();
         if let Some(h) = hook.as_ref() {
             h(device_id.clone(), bytes);
-        }
-        if let Some(h) = hook {
-            self.inner.lock().unwrap().on_p2c_notify = Some(h);
         }
         Ok(())
     }
@@ -550,6 +544,40 @@ mod tests {
         let got = captured.lock().unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(&got[0][..], b"payload");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_c2p_writes_both_see_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mock = MockBleInterface::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        mock.set_on_c2p_write(Box::new(move |_target, _bytes| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(());
+            std::thread::sleep(Duration::from_millis(50));
+        }));
+
+        let first = {
+            let mock = mock.clone();
+            tokio::spawn(async move {
+                mock.write_c2p(&DeviceId::from("peer"), Bytes::from_static(b"first"))
+                    .await
+                    .unwrap();
+            })
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first hook did not run");
+
+        mock.write_c2p(&DeviceId::from("peer"), Bytes::from_static(b"second"))
+            .await
+            .unwrap();
+        first.await.unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
