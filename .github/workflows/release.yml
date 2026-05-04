@@ -244,8 +244,7 @@ jobs:
           IPA=$(ls "$CHAT_DIR"/src-tauri/gen/apple/build/arm64/*.ipa | head -n1)
           WORK="$RUNNER_TEMP/ipa"
           FIXED="$RUNNER_TEMP/$(basename "$IPA")"
-          PROFILE_PLIST="$RUNNER_TEMP/ios-appstore-profile.plist"
-          ENTITLEMENTS="$RUNNER_TEMP/ios-appstore-entitlements.plist"
+          FINAL_ENTITLEMENTS="$RUNNER_TEMP/ios-final-entitlements.plist"
           rm -rf "$WORK"
           mkdir -p "$WORK"
           ditto -x -k "$IPA" "$WORK"
@@ -255,12 +254,14 @@ jobs:
             exit 1
           fi
           install -m 644 "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" "$APP/embedded.mobileprovision"
-          security cms -D -i "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" > "$PROFILE_PLIST"
-          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$PROFILE_PLIST" > "$ENTITLEMENTS"
           codesign --force --sign "$IOS_CODE_SIGN_IDENTITY" \
-            --entitlements "$ENTITLEMENTS" \
-            --preserve-metadata=identifier,flags \
+            --preserve-metadata=identifier,entitlements,flags \
             "$APP"
+          codesign -d --entitlements :- "$APP" > "$FINAL_ENTITLEMENTS" 2>/dev/null
+          if /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.usernotifications.communication' "$FINAL_ENTITLEMENTS" >/dev/null 2>&1; then
+            echo "Final iOS app signature includes the communication notifications entitlement, but this app does not use notifications. Disable that capability on the App ID and regenerate ios-appstore.mobileprovision.age." >&2
+            exit 1
+          fi
           codesign --verify --deep --strict --verbose=2 "$APP"
           test -f "$APP/embedded.mobileprovision"
           (cd "$WORK" && ditto -c -k --sequesterRsrc --keepParent Payload "$FIXED")
