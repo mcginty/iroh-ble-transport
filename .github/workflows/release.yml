@@ -236,6 +236,36 @@ jobs:
             --ci \
             --config "{\"bundle\":{\"iOS\":{\"bundleVersion\":\"$IOS_BUILD_NUMBER\"}}}"
 
+      - name: Embed provisioning profile in IPA
+        env:
+          IOS_CODE_SIGN_IDENTITY: ${{ steps.ios_identity.outputs.identity }}
+        run: |
+          set -euo pipefail
+          IPA=$(ls "$CHAT_DIR"/src-tauri/gen/apple/build/arm64/*.ipa | head -n1)
+          WORK="$RUNNER_TEMP/ipa"
+          FIXED="$RUNNER_TEMP/$(basename "$IPA")"
+          PROFILE_PLIST="$RUNNER_TEMP/ios-appstore-profile.plist"
+          ENTITLEMENTS="$RUNNER_TEMP/ios-appstore-entitlements.plist"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+          ditto -x -k "$IPA" "$WORK"
+          APP=$(find "$WORK/Payload" -maxdepth 1 -type d -name '*.app' | head -n1)
+          if [ -z "$APP" ]; then
+            echo "No .app found in IPA payload" >&2
+            exit 1
+          fi
+          install -m 644 "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" "$APP/embedded.mobileprovision"
+          security cms -D -i "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" > "$PROFILE_PLIST"
+          /usr/libexec/PlistBuddy -x -c 'Print :Entitlements' "$PROFILE_PLIST" > "$ENTITLEMENTS"
+          codesign --force --sign "$IOS_CODE_SIGN_IDENTITY" \
+            --entitlements "$ENTITLEMENTS" \
+            --preserve-metadata=identifier,flags \
+            "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          test -f "$APP/embedded.mobileprovision"
+          (cd "$WORK" && ditto -c -k --sequesterRsrc --keepParent Payload "$FIXED")
+          mv "$FIXED" "$IPA"
+
       - name: Upload IPA to TestFlight
         run: |
           set -euo pipefail
