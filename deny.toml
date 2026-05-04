@@ -4,7 +4,11 @@ all-features = true
 
 [advisories]
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # Temporary until iroh can move to hickory 0.26.1 or newer.
+    "RUSTSEC-2026-0119", # hickory-proto 0.26.0-beta.4
+    "RUSTSEC-2026-0120", # hickory-net 0.26.0-beta.4
+]
 
 [licenses]
 allow = [
