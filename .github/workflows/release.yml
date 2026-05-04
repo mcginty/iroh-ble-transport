@@ -360,10 +360,14 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ steps.identities.outputs.app }}
         run: |
+          BASE_BUILD=$(node -e "console.log(require('./src-tauri/tauri.conf.json').bundle.macOS.bundleVersion)")
+          MACOS_BUILD_NUMBER="$((BASE_BUILD + GITHUB_RUN_NUMBER)).${GITHUB_RUN_ATTEMPT}"
+          echo "Using macOS CI bundleVersion=$MACOS_BUILD_NUMBER"
           pnpm tauri build \
             --target universal-apple-darwin \
             --bundles app \
-            --config src-tauri/tauri.mas.conf.json
+            --config src-tauri/tauri.mas.conf.json \
+            --config "{\"bundle\":{\"macOS\":{\"bundleVersion\":\"$MACOS_BUILD_NUMBER\"}}}"
 
       - name: Wrap .app as signed .pkg
         id: pkg
