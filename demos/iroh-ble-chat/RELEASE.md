@@ -12,6 +12,7 @@ them at build time.
 | ----------------------- | ---------------------------------- | ---------------------------------- |
 | `ios-testflight`        | `.ipa`                             | App Store Connect → TestFlight     |
 | `macos-testflight`      | `.pkg` (sandboxed, MAS-signed)     | App Store Connect → TestFlight     |
+| `linux-appimage-build`  | `.AppImage`                        | GitHub Release (via `publish`)     |
 | `android-release-build` | universal `.apk` (signed)          | GitHub Release (via `publish`)     |
 | `publish`               | —                                  | Creates/updates the GitHub Release |
 
@@ -50,11 +51,13 @@ GitHub UI → Actions → "Release" → "Run workflow":
 | `testflight-all`    | iOS + macOS TestFlight uploads                                    |
 | `ios-testflight`    | iOS only                                                          |
 | `macos-testflight`  | macOS MAS only                                                    |
+| `linux-appimage`    | Linux AppImage only                                               |
 | `android-release`   | Android only                                                      |
 
 Manual runs reuse the `version` in `tauri.conf.json`. iOS and macOS build numbers are
 overridden in CI from the checked-in `bundleVersion` plus the GitHub run number and attempt,
-so reruns do not require a version-bump commit.
+so reruns do not require a version-bump commit. Linux AppImage and Android artifacts use
+the checked-in version in their filenames.
 
 ## Secret management (age)
 
