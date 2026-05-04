@@ -38,6 +38,9 @@
     },
     "iOS": {
       "bundleVersion": "154"
+    },
+    "macOS": {
+      "bundleVersion": "192"
     }
   },
   "plugins": {

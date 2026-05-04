@@ -341,6 +341,13 @@ jobs:
           set -eu
           APP_PATH=$(ls -d target/universal-apple-darwin/release/bundle/macos/*.app | head -n1)
           PKG_PATH="$RUNNER_TEMP/${APP_NAME}.pkg"
+          SHORT_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist")
+          BUNDLE_VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP_PATH/Contents/Info.plist")
+          echo "macOS CFBundleShortVersionString=$SHORT_VERSION CFBundleVersion=$BUNDLE_VERSION"
+          if [ "$BUNDLE_VERSION" = "$SHORT_VERSION" ]; then
+            echo "macOS CFBundleVersion must be a monotonically increasing build number, not the marketing version." >&2
+            exit 1
+          fi
           chmod -R a+rX "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
           ENTITLEMENTS="$RUNNER_TEMP/mas-entitlements.plist"
