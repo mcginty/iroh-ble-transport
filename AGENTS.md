@@ -57,6 +57,12 @@ cargo run --example peripheral -p iroh-ble-transport          # bare peripheral 
   - Body: bullet points with `-` for each logical change.
   - No `💘 Generated with Crush` or similar AI marker lines in commit messages.
 
+## Privacy / filesystem boundary
+
+- Do not inspect, search, or read files outside this repository unless the user explicitly asks for a specific path.
+- Do not search the user's home directory, package caches, global tool installs, shell history, config directories, or credential stores while debugging project issues.
+- If external tool implementation details are needed, use project-local files, checked-in documentation, or ask the user before looking elsewhere.
+
 ## Key dependencies
 
 | Crate | Role |

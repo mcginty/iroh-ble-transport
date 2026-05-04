@@ -3,7 +3,6 @@ name: Release
 # Publishes the iroh-ble-chat demo.
 #
 # Jobs:
-#   - ios-testflight       : signed IPA → App Store Connect (TestFlight).
 #   - macos-testflight     : sandboxed .pkg → App Store Connect (TestFlight).
 #   - linux-appimage-build : AppImage → workflow artifact / GitHub Release.
 #   - android-release-build: signed universal APK → workflow artifact.
@@ -23,11 +22,6 @@ on:
   push:
     tags:
       - "iroh-ble-chat-v*"
-    # TEMP: branch trigger for pre-merge smoke testing. Revert before merging
-    # to main — workflow_dispatch will work once the file lands on the default
-    # branch. Publishing the GitHub Release remains tag-only.
-    branches:
-      - release-pipeline
   workflow_dispatch:
     inputs:
       targets:
@@ -38,7 +32,6 @@ on:
         options:
           - all
           - testflight-all
-          - ios-testflight
           - macos-testflight
           - linux-appimage
           - android-release
@@ -71,7 +64,6 @@ jobs:
     name: Plan
     runs-on: ubuntu-latest
     outputs:
-      run_ios_testflight: ${{ steps.decide.outputs.ios_testflight }}
       run_macos_testflight: ${{ steps.decide.outputs.macos_testflight }}
       run_linux_appimage: ${{ steps.decide.outputs.linux_appimage }}
       run_android_release: ${{ steps.decide.outputs.android_release }}
@@ -82,213 +74,22 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ]; then
             target="all"
             case "${{ github.ref }}" in
-              refs/tags/*)                  ;;
-              # TEMP: branch-push smoke test. Revert this case + the
-              # `on.push.branches` entry before merging.
-              refs/heads/release-pipeline)  ;;
+              refs/tags/*) ;;
               *) echo "Unexpected push ref: ${{ github.ref }}" >&2; exit 1 ;;
             esac
           fi
           case "$target" in
-            all)                ios=1; mas=1; linux=1; apk=1 ;;
-            testflight-all)     ios=1; mas=1; linux=0; apk=0 ;;
-            ios-testflight)     ios=1; mas=0; linux=0; apk=0 ;;
-            macos-testflight)   ios=0; mas=1; linux=0; apk=0 ;;
-            linux-appimage)     ios=0; mas=0; linux=1; apk=0 ;;
-            android-release)    ios=0; mas=0; linux=0; apk=1 ;;
+            all)                mas=1; linux=1; apk=1 ;;
+            testflight-all)     mas=1; linux=0; apk=0 ;;
+            macos-testflight)   mas=1; linux=0; apk=0 ;;
+            linux-appimage)     mas=0; linux=1; apk=0 ;;
+            android-release)    mas=0; linux=0; apk=1 ;;
             *) echo "Unknown target: $target" >&2; exit 1 ;;
           esac
-          echo "ios_testflight=$ios" >> "$GITHUB_OUTPUT"
           echo "macos_testflight=$mas" >> "$GITHUB_OUTPUT"
           echo "linux_appimage=$linux" >> "$GITHUB_OUTPUT"
           echo "android_release=$apk" >> "$GITHUB_OUTPUT"
           echo "::notice::target=$target"
-
-  ios-testflight:
-    name: iOS → TestFlight
-    needs: plan
-    if: needs.plan.outputs.run_ios_testflight == '1'
-    runs-on: macos-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-      - uses: jdx/mise-action@v4
-      - run: mise install --force rust node pnpm age
-
-      - uses: ./.github/actions/decrypt-secrets
-        with:
-          age-identity: ${{ secrets.AGE_IDENTITY }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: . -> target
-          key: ios-release
-
-      - run: rustup target add aarch64-apple-ios
-
-      - name: Install frontend dependencies
-        working-directory: ${{ env.CHAT_DIR }}
-        run: pnpm install --frozen-lockfile
-
-      - name: Select Xcode 26.3
-        # macos-latest defaults to Xcode 16.4 which doesn't understand
-        # the Icon Composer `.icon` file referenced by project.yml.
-        # Xcode 26.3 does — it's pre-installed, just needs to be active.
-        run: sudo xcode-select -s /Applications/Xcode_26.3.app
-
-      - name: Seed .xcode.env so preBuildScript inherits mise trust + toolchain
-        # The iOS Xcode project's preBuildScript (gen/apple/project.yml)
-        # sources $SRCROOT/.xcode.env before invoking `pnpm tauri ios
-        # xcode-script`. xcodebuild sanitizes env for phase scripts, so the
-        # workflow-level MISE_TRUSTED_CONFIG_PATHS + TOOLCHAINS never reach
-        # the mise shim / cargo / Swift compiler inside pnpm. Write them
-        # into .xcode.env explicitly.
-        run: |
-          set -eu
-          XCODE_ENV="$CHAT_DIR/src-tauri/gen/apple/.xcode.env"
-          mkdir -p "$(dirname "$XCODE_ENV")"
-          {
-            printf 'export MISE_TRUSTED_CONFIG_PATHS=%q\n' "$GITHUB_WORKSPACE"
-            printf 'export TOOLCHAINS=%q\n' "com.apple.dt.toolchain.XcodeDefault"
-            printf 'export APPLE_DEVELOPMENT_TEAM=%q\n' "$APPLE_TEAM_ID"
-          } > "$XCODE_ENV"
-          cat "$XCODE_ENV"
-
-      - name: Stage App Store Connect API key
-        run: |
-          set -eu
-          mkdir -p "$HOME/.appstoreconnect/private_keys"
-          install -m 600 "$SECRET_PATH_APPLE_API_KEY_P8" \
-            "$HOME/.appstoreconnect/private_keys/AuthKey_${APPSTORE_API_KEY_ID}.p8"
-
-      - name: Import iOS distribution certificate
-        id: ios_identity
-        run: |
-          set -eu
-          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
-          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 7200 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security import "$SECRET_PATH_IOS_DIST_P12" \
-            -P "$APPLE_IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
-          security list-keychain -d user -s "$KEYCHAIN" $(security list-keychain -d user | xargs)
-          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security find-identity -v -p codesigning "$KEYCHAIN"
-          IDENT=$(security find-identity -v -p codesigning "$KEYCHAIN" \
-            | awk -F\" '/Apple Distribution/ {print $2; exit}')
-          if [ -z "$IDENT" ]; then
-            echo "No Apple Distribution identity found in ios-dist.p12.age" >&2
-            exit 1
-          fi
-          case "$IDENT" in
-            *"Tauri (unset)"*)
-              echo "ios-dist.p12.age contains the placeholder Tauri distribution certificate; replace it with this app's Apple Distribution certificate." >&2
-              exit 1
-              ;;
-          esac
-          echo "Using iOS distribution identity: $IDENT"
-          echo "identity=$IDENT" >> "$GITHUB_OUTPUT"
-
-      - name: Install iOS provisioning profile
-        id: ios_profile
-        run: |
-          set -eu
-          if [ -z "${SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION:-}" ]; then
-            echo "Missing .github/secrets/ios-appstore.mobileprovision.age; iOS App Store exports require a committed encrypted provisioning profile." >&2
-            exit 1
-          fi
-          mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
-          PLIST="$RUNNER_TEMP/ios-appstore-profile.plist"
-          security cms -D -i "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" > "$PLIST"
-          UUID=$(/usr/libexec/PlistBuddy -c 'Print :UUID' "$PLIST")
-          NAME=$(/usr/libexec/PlistBuddy -c 'Print :Name' "$PLIST")
-          APP_ID=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PLIST")
-          TEAM_ID=$(/usr/libexec/PlistBuddy -c 'Print :TeamIdentifier:0' "$PLIST")
-          [ "$APP_ID" = "$APPLE_TEAM_ID.$BUNDLE_ID" ]
-          [ "$TEAM_ID" = "$APPLE_TEAM_ID" ]
-          DEST="$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
-          install -m 600 "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" "$DEST"
-          XCODE_ENV="$CHAT_DIR/src-tauri/gen/apple/.xcode.env"
-          {
-            printf 'export IOS_CODE_SIGN_IDENTITY=%q\n' "${{ steps.ios_identity.outputs.identity }}"
-            printf 'export IOS_PROVISIONING_PROFILE_SPECIFIER=%q\n' "$NAME"
-          } >> "$XCODE_ENV"
-          echo "Installed profile: $NAME ($UUID)"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Build iOS IPA (App Store Connect)
-        working-directory: ${{ env.CHAT_DIR }}
-        env:
-          APPLE_API_KEY: ${{ env.APPSTORE_API_KEY_ID }}
-          APPLE_API_ISSUER: ${{ env.APPSTORE_API_ISSUER_ID }}
-          APPLE_API_KEY_PATH: ${{ env.SECRET_PATH_APPLE_API_KEY_P8 }}
-          APPLE_DEVELOPMENT_TEAM: ${{ env.APPLE_TEAM_ID }}
-          IOS_CODE_SIGN_IDENTITY: ${{ steps.ios_identity.outputs.identity }}
-          IOS_PROVISIONING_PROFILE_SPECIFIER: ${{ steps.ios_profile.outputs.name }}
-          IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-        run: |
-          BASE_BUILD=$(node -e "console.log(require('./src-tauri/tauri.conf.json').bundle.iOS.bundleVersion)")
-          IOS_BUILD_NUMBER="$((BASE_BUILD + GITHUB_RUN_NUMBER)).${GITHUB_RUN_ATTEMPT}"
-          echo "Using iOS CI bundleVersion=$IOS_BUILD_NUMBER"
-          mise exec -- pnpm tauri ios build \
-            --export-method app-store-connect \
-            --ci \
-            --config "{\"bundle\":{\"iOS\":{\"bundleVersion\":\"$IOS_BUILD_NUMBER\"}}}"
-
-      - name: Embed provisioning profile in IPA
-        env:
-          IOS_CODE_SIGN_IDENTITY: ${{ steps.ios_identity.outputs.identity }}
-        run: |
-          set -euo pipefail
-          IPA=$(ls "$CHAT_DIR"/src-tauri/gen/apple/build/arm64/*.ipa | head -n1)
-          WORK="$RUNNER_TEMP/ipa"
-          FIXED="$RUNNER_TEMP/$(basename "$IPA")"
-          FINAL_ENTITLEMENTS="$RUNNER_TEMP/ios-final-entitlements.plist"
-          rm -rf "$WORK"
-          mkdir -p "$WORK"
-          ditto -x -k "$IPA" "$WORK"
-          APP=$(find "$WORK/Payload" -maxdepth 1 -type d -name '*.app' | head -n1)
-          if [ -z "$APP" ]; then
-            echo "No .app found in IPA payload" >&2
-            exit 1
-          fi
-          install -m 644 "$SECRET_PATH_IOS_APPSTORE_MOBILEPROVISION" "$APP/embedded.mobileprovision"
-          codesign --force --sign "$IOS_CODE_SIGN_IDENTITY" \
-            --preserve-metadata=identifier,entitlements,flags \
-            "$APP"
-          codesign -d --entitlements :- "$APP" > "$FINAL_ENTITLEMENTS" 2>/dev/null
-          if /usr/libexec/PlistBuddy -c 'Print :com.apple.developer.usernotifications.communication' "$FINAL_ENTITLEMENTS" >/dev/null 2>&1; then
-            echo "Final iOS app signature includes the communication notifications entitlement, but this app does not use notifications. Disable that capability on the App ID and regenerate ios-appstore.mobileprovision.age." >&2
-            exit 1
-          fi
-          codesign --verify --deep --strict --verbose=2 "$APP"
-          test -f "$APP/embedded.mobileprovision"
-          (cd "$WORK" && ditto -c -k --sequesterRsrc --keepParent Payload "$FIXED")
-          mv "$FIXED" "$IPA"
-
-      - name: Upload IPA to TestFlight
-        run: |
-          set -euo pipefail
-          IPA=$(ls "$CHAT_DIR"/src-tauri/gen/apple/build/arm64/*.ipa | head -n1)
-          LOG="$RUNNER_TEMP/altool-ios.log"
-          echo "Uploading $IPA"
-          xcrun altool --upload-app \
-            --type ios \
-            --file "$IPA" \
-            --apiKey "$APPSTORE_API_KEY_ID" \
-            --apiIssuer "$APPSTORE_API_ISSUER_ID" 2>&1 | tee "$LOG"
-          if grep -Eq 'UPLOAD FAILED|Validation failed|Failed to upload' "$LOG"; then
-            exit 1
-          fi
-
-      - uses: actions/upload-artifact@v7
-        if: always()
-        with:
-          name: ios-ipa
-          path: ${{ env.CHAT_DIR }}/src-tauri/gen/apple/build/arm64/*.ipa
-          if-no-files-found: warn
-          retention-days: 14
 
   macos-testflight:
     name: macOS → TestFlight

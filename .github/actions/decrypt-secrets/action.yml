@@ -89,7 +89,7 @@ runs:
           [ -f "$f" ] || continue
           name=$(basename "$f")
           [ "$name" = "secrets.env" ] && continue
-          # Path var name: e.g. IOS_DIST_P12 -> /path/to/ios-dist.p12
+          # Path var name: e.g. MAS_APP_P12 -> /path/to/mas-app.p12
           var=$(printf '%s' "$name" | tr '[:lower:].-' '[:upper:]__')
           printf 'SECRET_PATH_%s=%s\n' "$var" "$f" >> "$GITHUB_ENV"
         done

@@ -9,8 +9,6 @@ Age-encrypted secrets consumed by [.github/workflows/release.yml](../workflows/r
 | `recipients.txt`                       | age public keys that can decrypt (unencrypted — commit it).  |
 | `secrets.env.age`                      | Shell-sourceable `KEY=VALUE` pairs for all string secrets.   |
 | `apple-api-key.p8.age`                 | App Store Connect API private key.                           |
-| `ios-dist.p12.age`                     | iOS Distribution certificate.                                |
-| `ios-appstore.mobileprovision.age`     | iOS App Store provisioning profile.                          |
 | `mas-app.p12.age`                      | 3rd Party Mac Developer Application cert.                    |
 | `mas-installer.p12.age`                | 3rd Party Mac Developer Installer cert.                      |
 | `mas-appstore.provisionprofile.age`    | Mac App Store provisioning profile.                          |
@@ -21,7 +19,6 @@ Age-encrypted secrets consumed by [.github/workflows/release.yml](../workflows/r
 ```
 APPSTORE_API_KEY_ID=ABCD12EF34
 APPSTORE_API_ISSUER_ID=00000000-0000-0000-0000-000000000000
-APPLE_IOS_CERTIFICATE_PASSWORD=...
 APPLE_MAS_APP_CERTIFICATE_PASSWORD=...
 APPLE_MAS_INSTALLER_CERTIFICATE_PASSWORD=...
 ANDROID_KEY_ALIAS=release
