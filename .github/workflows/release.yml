@@ -155,6 +155,7 @@ jobs:
           {
             printf 'export MISE_TRUSTED_CONFIG_PATHS=%q\n' "$GITHUB_WORKSPACE"
             printf 'export TOOLCHAINS=%q\n' "com.apple.dt.toolchain.XcodeDefault"
+            printf 'export APPLE_DEVELOPMENT_TEAM=%q\n' "$APPLE_TEAM_ID"
           } > "$XCODE_ENV"
           cat "$XCODE_ENV"
 

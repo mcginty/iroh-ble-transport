@@ -37,6 +37,7 @@
       "autoIncrementVersionCode": true
     },
     "iOS": {
+      "developmentTeam": "XG66F95CNS",
       "bundleVersion": "154"
     },
     "macOS": {
