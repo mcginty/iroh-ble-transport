@@ -24,8 +24,7 @@ on:
       - "iroh-ble-chat-v*"
     # TEMP: branch trigger for pre-merge smoke testing. Revert before merging
     # to main — workflow_dispatch will work once the file lands on the default
-    # branch. See plan job: branch pushes default to `android-release` only to
-    # avoid duplicate-build-number rejections on TestFlight.
+    # branch. See plan job: branch pushes upload only the macOS TestFlight build.
     branches:
       - release-pipeline
   workflow_dispatch:
@@ -74,19 +73,22 @@ jobs:
       run_macos_testflight: ${{ steps.decide.outputs.macos_testflight }}
       run_android_release: ${{ steps.decide.outputs.android_release }}
       dry_run: ${{ steps.decide.outputs.dry_run }}
+      macos_dry_run: ${{ steps.decide.outputs.macos_dry_run }}
     steps:
       - id: decide
         run: |
           target="${{ github.event.inputs.targets }}"
-          # Only tag pushes publish. Everything else (branch push, manual
-          # dispatch) runs as a dry-run: full build + sign, no uploads.
+          macos_dry_run="true"
+          # Only tag pushes publish. Everything else runs as a dry-run, except
+          # the temporary release-pipeline branch may upload the macOS build to
+          # TestFlight for smoke testing.
           if [ "${{ github.event_name }}" = "push" ]; then
             target="all"
             case "${{ github.ref }}" in
-              refs/tags/*)                  dry_run="false" ;;
+              refs/tags/*)                  dry_run="false"; macos_dry_run="false" ;;
               # TEMP: branch-push smoke test. Revert this case + the
               # `on.push.branches` entry before merging.
-              refs/heads/release-pipeline)  dry_run="true" ;;
+              refs/heads/release-pipeline)  dry_run="true"; macos_dry_run="false" ;;
               *) echo "Unexpected push ref: ${{ github.ref }}" >&2; exit 1 ;;
             esac
           else
@@ -104,7 +106,8 @@ jobs:
           echo "macos_testflight=$mas" >> "$GITHUB_OUTPUT"
           echo "android_release=$apk" >> "$GITHUB_OUTPUT"
           echo "dry_run=$dry_run" >> "$GITHUB_OUTPUT"
-          echo "::notice::target=$target dry_run=$dry_run"
+          echo "macos_dry_run=$macos_dry_run" >> "$GITHUB_OUTPUT"
+          echo "::notice::target=$target dry_run=$dry_run macos_dry_run=$macos_dry_run"
 
   ios-testflight:
     name: iOS → TestFlight
@@ -342,7 +345,7 @@ jobs:
           echo "pkg_path=$PKG_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Upload PKG to TestFlight
-        if: needs.plan.outputs.dry_run != 'true'
+        if: needs.plan.outputs.macos_dry_run != 'true'
         env:
           PKG_PATH: ${{ steps.pkg.outputs.pkg_path }}
         run: |
@@ -353,7 +356,7 @@ jobs:
             --apiIssuer "$APPSTORE_API_ISSUER_ID"
 
       - name: Dry-run — skipping TestFlight upload
-        if: needs.plan.outputs.dry_run == 'true'
+        if: needs.plan.outputs.macos_dry_run == 'true'
         env:
           PKG_PATH: ${{ steps.pkg.outputs.pkg_path }}
         run: |
