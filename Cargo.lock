@@ -6290,9 +6290,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a7b11533d3d38dba7f11d8128d770a72e636ad2458bfb923e8334f9ea8b8dfc"
+checksum = "eb38668d67fdcb3922eaa47210030be265f7c39ed47cd5f50f551423e04da8b3"
 dependencies = [
  "blew",
  "jni 0.22.4",
