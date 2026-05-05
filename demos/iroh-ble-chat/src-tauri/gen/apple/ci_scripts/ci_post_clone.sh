@@ -48,7 +48,7 @@ export PATH="$HOME/.local/bin:$PATH"
 echo "==> Installing toolchain via mise (iOS subset only — skip android-sdk/java/ktlint)"
 export MISE_COLOR=false
 export MISE_HTTP_TIMEOUT=120
-retry mise install rust node pnpm
+retry mise install rust node github:pnpm/pnpm
 export PATH="$HOME/.local/share/mise/shims:$HOME/.cargo/bin:$PATH"
 
 echo "==> Adding iOS target"
