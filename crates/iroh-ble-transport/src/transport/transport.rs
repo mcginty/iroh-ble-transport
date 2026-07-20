@@ -1592,7 +1592,7 @@ mod tests {
 
         let transmit = test_transmit(b"hello");
         assert!(matches!(
-            CustomSender::poll_send(&sender, &mut cx, &token_custom_addr(token), &transmit),
+            CustomSender::poll_send(&sender, &mut cx, &token_custom_addr(token), None, &transmit),
             Poll::Ready(Ok(()))
         ));
 
