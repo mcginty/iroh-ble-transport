@@ -22,11 +22,11 @@ tokio = { version = "1", features = ["sync", "rt", "time"] }
 tokio-stream = "0.1"
 bytes = "1"
 atomic-waker = "1"
-iroh = { version = "0.98.2", features = ["unstable-custom-transports"] }
-iroh-base = "0.98"
-n0-watcher = "0.6"
+iroh = { version = "1.0.2", features = ["unstable-custom-transports"] }
+iroh-base = "1.0.2"
+n0-watcher = "1.0.0"
 n0-future = "0.3"
-noq-udp = "0.10"
+noq-udp = "1.1.0"
 # Used for `VarInt`, which iroh 0.98 takes in `AfterHandshakeOutcome::Reject`
 # but does not re-export from its public API. iroh's internal `quic` module
 # re-exports it from noq-proto, so depending on noq-proto directly is the

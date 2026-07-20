@@ -13,8 +13,11 @@ use blew::gatt::service::{GattCharacteristic, GattService};
 use blew::peripheral::AdvertisingConfig;
 use blew::{BlewError, Central, Peripheral};
 use bytes::Bytes;
-use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
-use iroh::endpoint::transports::{Addr, CustomEndpoint, CustomSender, CustomTransport, Transmit};
+use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, Transmit};
+use iroh::{
+    address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item},
+    endpoint::transports::RecvInfo,
+};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_watcher::Watchable;
 use parking_lot::Mutex;
@@ -717,12 +720,12 @@ impl CustomEndpoint for BleEndpoint {
     // iroh. See https://github.com/mcginty/iroh-ble-transport/issues/4.
     fn poll_recv(
         &mut self,
-        cx: &mut Context<'_>,
+        cx: &mut Context,
         bufs: &mut [io::IoSliceMut<'_>],
         metas: &mut [noq_udp::RecvMeta],
-        source_addrs: &mut [Addr],
+        recv_infos: &mut [RecvInfo],
     ) -> Poll<io::Result<usize>> {
-        let n = bufs.len().min(metas.len()).min(source_addrs.len());
+        let n = bufs.len().min(metas.len()).min(recv_infos.len());
         if n == 0 {
             return Poll::Ready(Ok(0));
         }
@@ -765,7 +768,7 @@ impl CustomEndpoint for BleEndpoint {
                     bufs[filled][..packet.data.len()].copy_from_slice(&packet.data);
                     metas[filled].len = packet.data.len();
                     metas[filled].stride = packet.data.len();
-                    source_addrs[filled] = Addr::Custom(token_custom_addr(token));
+                    RecvInfo::new(token_custom_addr(token), None);
                     self.rx_bytes
                         .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
                     filled += 1;
@@ -801,8 +804,9 @@ impl CustomSender for BleSender {
 
     fn poll_send(
         &self,
-        cx: &mut Context<'_>,
+        cx: &mut std::task::Context,
         dst: &CustomAddr,
+        _src: Option<&CustomAddr>,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let token = match parse_token_addr(dst) {
