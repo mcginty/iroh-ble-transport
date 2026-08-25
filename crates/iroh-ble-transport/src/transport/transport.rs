@@ -14,7 +14,9 @@ use blew::peripheral::AdvertisingConfig;
 use blew::{BlewError, Central, Peripheral};
 use bytes::Bytes;
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
-use iroh::endpoint::transports::{Addr, CustomEndpoint, CustomSender, CustomTransport, Transmit};
+use iroh::endpoint::transports::{
+    CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
+};
 use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_watcher::Watchable;
 use parking_lot::Mutex;
@@ -30,7 +32,9 @@ use crate::transport::events::{
 use crate::transport::hook::{BleDedupHook, HookEvent};
 use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
-use crate::transport::routing::{TOKEN_LEN, parse_token_addr, token_custom_addr};
+use crate::transport::routing::{
+    TOKEN_LEN, local_custom_addr, parse_token_addr, token_custom_addr,
+};
 use crate::transport::store::{InMemoryPeerStore, PeerStore};
 use crate::transport::watchdog::run_watchdog;
 
@@ -662,8 +666,7 @@ impl CustomTransport for BleTransport {
             .take()
             .ok_or_else(|| io::Error::other("BleTransport bind() already called"))?;
 
-        let local_addr = token_custom_addr(0);
-        let watchable = Watchable::new(vec![local_addr]);
+        let watchable = Watchable::new(vec![local_custom_addr()]);
         let sender = Arc::new(BleSender {
             inbox: self.handle.inbox.clone(),
             snapshots: Arc::clone(&self.handle.snapshots),
@@ -720,9 +723,9 @@ impl CustomEndpoint for BleEndpoint {
         cx: &mut Context<'_>,
         bufs: &mut [io::IoSliceMut<'_>],
         metas: &mut [noq_udp::RecvMeta],
-        source_addrs: &mut [Addr],
+        recv_infos: &mut [RecvInfo],
     ) -> Poll<io::Result<usize>> {
-        let n = bufs.len().min(metas.len()).min(source_addrs.len());
+        let n = bufs.len().min(metas.len()).min(recv_infos.len());
         if n == 0 {
             return Poll::Ready(Ok(0));
         }
@@ -765,7 +768,8 @@ impl CustomEndpoint for BleEndpoint {
                     bufs[filled][..packet.data.len()].copy_from_slice(&packet.data);
                     metas[filled].len = packet.data.len();
                     metas[filled].stride = packet.data.len();
-                    source_addrs[filled] = Addr::Custom(token_custom_addr(token));
+                    recv_infos[filled] =
+                        RecvInfo::new(token_custom_addr(token), Some(local_custom_addr()));
                     self.rx_bytes
                         .fetch_add(packet.data.len() as u64, Ordering::Relaxed);
                     filled += 1;
@@ -803,6 +807,7 @@ impl CustomSender for BleSender {
         &self,
         cx: &mut Context<'_>,
         dst: &CustomAddr,
+        _src: Option<&CustomAddr>,
         transmit: &Transmit<'_>,
     ) -> Poll<io::Result<()>> {
         let token = match parse_token_addr(dst) {
@@ -1549,9 +1554,10 @@ mod tests {
         use crate::transport::test_util::MockBleInterface;
 
         fn test_transmit(contents: &[u8]) -> Transmit<'_> {
-            // iroh 0.98 keeps `ecn` private but `poll_send` only reads the
-            // public payload fields. Mirror the current layout in tests so the
-            // real `BleSender::poll_send` path can still be exercised.
+            // iroh keeps `Transmit::ecn` private and offers no public
+            // constructor, but `poll_send` only reads the public payload
+            // fields. Mirror the current layout in tests so the real
+            // `BleSender::poll_send` path can still be exercised.
             unsafe {
                 std::mem::transmute::<
                     (Option<noq_udp::EcnCodepoint>, &[u8], Option<usize>),
@@ -1588,7 +1594,7 @@ mod tests {
 
         let transmit = test_transmit(b"hello");
         assert!(matches!(
-            CustomSender::poll_send(&sender, &mut cx, &token_custom_addr(token), &transmit),
+            CustomSender::poll_send(&sender, &mut cx, &token_custom_addr(token), None, &transmit),
             Poll::Ready(Ok(()))
         ));
 

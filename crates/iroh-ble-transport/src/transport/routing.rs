@@ -65,6 +65,16 @@ pub fn token_custom_addr(token: u64) -> CustomAddr {
     CustomAddr::from_parts(BLE_TRANSPORT_ID, &token.to_le_bytes())
 }
 
+/// Token reserved as the `local_addr` sentinel. Never minted for a peer.
+pub const LOCAL_ADDR_TOKEN: u64 = 0;
+
+/// The single `CustomAddr` the BLE transport publishes as its local
+/// address, and reports as the receiving address of every inbound packet.
+#[must_use]
+pub fn local_custom_addr() -> CustomAddr {
+    token_custom_addr(LOCAL_ADDR_TOKEN)
+}
+
 /// Parse a `CustomAddr` as a BLE-transport token. Returns an error
 /// if the address is for a different transport or has the wrong
 /// length.
