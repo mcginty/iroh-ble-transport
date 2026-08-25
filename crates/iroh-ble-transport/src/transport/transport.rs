@@ -1545,6 +1545,128 @@ mod tests {
         assert!(wakers.lock().is_empty(), "drain must clear the list");
     }
 
+    fn test_ble_endpoint(
+        receiver: mpsc::Receiver<IncomingPacket>,
+        rx_bytes: Arc<AtomicU64>,
+    ) -> BleEndpoint {
+        let (inbox_tx, _inbox_rx) = mpsc::channel(8);
+        BleEndpoint {
+            receiver,
+            watchable: Watchable::new(vec![local_custom_addr()]),
+            sender: Arc::new(BleSender {
+                inbox: inbox_tx,
+                snapshots: Arc::new(ArcSwap::from_pointee(SnapshotMaps::default())),
+                routing: Arc::new(Routing::new()),
+                tx_bytes: Arc::new(AtomicU64::new(0)),
+                inbox_capacity_wakers: Arc::new(Mutex::new(Vec::new())),
+            }),
+            rx_bytes,
+        }
+    }
+
+    /// `RecvInfo`'s accessors are `pub(crate)` in iroh, so the only way to
+    /// inspect what we wrote is `Debug`. That is enough to catch the failure
+    /// this test exists for: a `RecvInfo` that never lands in the slot leaves
+    /// the default `Addr::Ip(..)` behind, and iroh's `process_datagrams`
+    /// silently takes its IP branch instead of resolving the BLE token.
+    fn recv_info_debug(remote_token: u64) -> String {
+        format!(
+            "{:?}",
+            RecvInfo::new(token_custom_addr(remote_token), Some(local_custom_addr()))
+        )
+    }
+
+    #[tokio::test]
+    async fn poll_recv_stamps_each_packet_with_its_stable_conn_token() {
+        let (tx, rx) = mpsc::channel(4);
+        let rx_bytes = Arc::new(AtomicU64::new(0));
+        let mut endpoint = test_ble_endpoint(rx, Arc::clone(&rx_bytes));
+
+        for (stable_id, payload) in [(7u64, &b"first"[..]), (9u64, &b"second-one"[..])] {
+            tx.send(IncomingPacket {
+                device_id: dev("recv-device"),
+                stable_conn_id: StableConnId::for_test(stable_id),
+                data: Bytes::copy_from_slice(payload),
+            })
+            .await
+            .expect("send");
+        }
+
+        let mut storage = [[0u8; 64]; 2];
+        let (first, second) = storage.split_at_mut(1);
+        let mut bufs = [
+            io::IoSliceMut::new(&mut first[0]),
+            io::IoSliceMut::new(&mut second[0]),
+        ];
+        let mut metas = [noq_udp::RecvMeta::default(); 2];
+        let mut recv_infos = [RecvInfo::default(), RecvInfo::default()];
+
+        let (_counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let filled = match endpoint.poll_recv(&mut cx, &mut bufs, &mut metas, &mut recv_infos) {
+            Poll::Ready(Ok(n)) => n,
+            other => panic!("expected two packets, got {other:?}"),
+        };
+        assert_eq!(filled, 2);
+
+        assert_eq!(&bufs[0][..metas[0].len], b"first");
+        assert_eq!(&bufs[1][..metas[1].len], b"second-one");
+        assert_eq!(metas[0].stride, b"first".len());
+        assert_eq!(metas[1].stride, b"second-one".len());
+
+        // The point of the test: each slot carries its own peer's token, not
+        // a default-constructed `RecvInfo`.
+        assert_eq!(format!("{:?}", recv_infos[0]), recv_info_debug(7));
+        assert_eq!(format!("{:?}", recv_infos[1]), recv_info_debug(9));
+        assert_ne!(
+            format!("{:?}", recv_infos[0]),
+            format!("{:?}", RecvInfo::default()),
+            "a dropped RecvInfo would leave the default in place"
+        );
+
+        assert_eq!(
+            rx_bytes.load(Ordering::Relaxed),
+            (b"first".len() + b"second-one".len()) as u64
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_recv_is_pending_until_a_packet_arrives() {
+        let (tx, rx) = mpsc::channel(4);
+        let mut endpoint = test_ble_endpoint(rx, Arc::new(AtomicU64::new(0)));
+
+        let mut storage = [0u8; 64];
+        let mut bufs = [io::IoSliceMut::new(&mut storage)];
+        let mut metas = [noq_udp::RecvMeta::default(); 1];
+        let mut recv_infos = [RecvInfo::default()];
+
+        let (counter, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            endpoint
+                .poll_recv(&mut cx, &mut bufs, &mut metas, &mut recv_infos)
+                .is_pending()
+        );
+
+        tx.send(IncomingPacket {
+            device_id: dev("recv-device"),
+            stable_conn_id: StableConnId::for_test(3),
+            data: Bytes::from_static(b"late"),
+        })
+        .await
+        .expect("send");
+        assert!(
+            counter.0.load(AtomicOrdering::SeqCst) >= 1,
+            "sender must wake the parked poll"
+        );
+
+        match endpoint.poll_recv(&mut cx, &mut bufs, &mut metas, &mut recv_infos) {
+            Poll::Ready(Ok(1)) => {}
+            other => panic!("expected one packet, got {other:?}"),
+        }
+        assert_eq!(format!("{:?}", recv_infos[0]), recv_info_debug(3));
+    }
+
     #[cfg(feature = "testing")]
     #[tokio::test]
     async fn resolve_poll_send_and_start_data_pipe_preserve_reserved_token_after_scan_hint_flip() {
