@@ -39,7 +39,7 @@ const BLE_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20)
 /// Map a blew/transport error string onto a message worth showing a tester.
 fn ble_init_error_message(msg: &str) -> String {
     if msg.contains("adapter not found") || msg.contains("AdapterNotFound") {
-        "Bluetooth is not available on this device. A physical Bluetooth adapter is required — simulators and emulators are not supported.".to_string()
+        BLUETOOTH_UNAVAILABLE_MESSAGE.to_string()
     } else if msg.contains("not powered")
         || msg.contains("timed out waiting for Bluetooth")
         || msg.contains("power on")
@@ -54,19 +54,36 @@ fn ble_init_error_message(msg: &str) -> String {
 const BLUETOOTH_OFF_MESSAGE: &str =
     "Bluetooth is turned off. Please enable Bluetooth in Settings and restart the app.";
 
-/// Run one adapter-touching init step under `BLE_INIT_TIMEOUT`. A timeout is
-/// reported as "Bluetooth is off" because that is what wedges these calls in
-/// practice — an adapter that is present and powered returns promptly.
+/// blew reports a denied Bluetooth permission and a genuinely absent adapter as
+/// the same `AdapterNotFound`, so this has to stay true for both. Android never
+/// reaches it — `are_ble_permissions_granted` gates that case earlier.
+const BLUETOOTH_UNAVAILABLE_MESSAGE: &str =
+    "Bluetooth is unavailable. Check that this app is allowed to use Bluetooth in \
+     Settings — simulators and emulators have no Bluetooth adapter.";
+
+/// `BleTransport::build` runs its own 5 s `wait_ready` on both roles and reports
+/// a powered-off adapter as `AdapterOff`, so an outer timeout means a later step
+/// (advertising, scan, or the L2CAP listener) wedged with the adapter powered on.
+const BLE_STACK_STUCK_MESSAGE: &str =
+    "Bluetooth did not finish starting up. Toggle Bluetooth off and on, then restart the app.";
+
+/// Run one adapter-touching init step under `BLE_INIT_TIMEOUT`. `on_timeout` is
+/// per step: what a hang implies differs between the blew constructors (the
+/// stack is down) and `BleTransport::build` (which diagnoses a down stack itself).
 async fn ble_init_step<T>(
     what: &str,
+    on_timeout: &str,
     fut: impl std::future::Future<Output = Result<T, impl std::fmt::Display>>,
 ) -> Result<T, String> {
     match tokio::time::timeout(BLE_INIT_TIMEOUT, fut).await {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(ble_init_error_message(&e.to_string())),
+        Ok(Err(e)) => {
+            tracing::warn!("{what} failed: {e}");
+            Err(ble_init_error_message(&e.to_string()))
+        }
         Err(_) => {
-            tracing::warn!("{what} timed out after {BLE_INIT_TIMEOUT:?}; assuming adapter is off");
-            Err(BLUETOOTH_OFF_MESSAGE.to_string())
+            tracing::warn!("{what} timed out after {BLE_INIT_TIMEOUT:?}");
+            Err(on_timeout.to_string())
         }
     }
 }
@@ -289,11 +306,19 @@ async fn start_node(
             ..Default::default()
         };
         let central = Arc::new(
-            ble_init_step("Central::with_config", Central::with_config(central_config)).await?,
+            ble_init_step(
+                "Central::with_config",
+                BLUETOOTH_OFF_MESSAGE,
+                Central::with_config(central_config),
+            )
+            .await?,
         );
-        let peripheral = Arc::new(ble_init_step("Peripheral::new", Peripheral::new()).await?);
+        let peripheral = Arc::new(
+            ble_init_step("Peripheral::new", BLUETOOTH_OFF_MESSAGE, Peripheral::new()).await?,
+        );
         ble_init_step(
             "BleTransport::build",
+            BLE_STACK_STUCK_MESSAGE,
             BleTransport::builder()
                 .l2cap_policy(L2capPolicy::PreferL2cap)
                 .central(central)
