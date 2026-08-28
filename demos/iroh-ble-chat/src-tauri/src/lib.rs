@@ -29,11 +29,10 @@ mod key_utils;
 #[cfg(target_os = "ios")]
 mod webview_helper;
 
-/// Backstop deadline for each adapter-touching init step. `Central::with_config`
-/// / `Peripheral::new` can block indefinitely when the adapter is powered off,
-/// so without this `start_node` hangs and the UI never sees an error. Kept well
-/// above `BleTransport::build`'s own budget (5 s `wait_ready` on the central plus
-/// 5 s on the peripheral) so that its more specific error wins the race.
+/// Backstop deadline for the two blew constructors, which can block
+/// indefinitely when the adapter is powered off; without this `start_node`
+/// hangs and the UI never sees an error. `BleTransport::build` is deliberately
+/// *not* wrapped — it bounds its own steps internally and is not cancel-safe.
 const BLE_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Map a blew/transport error string onto a message worth showing a tester.
@@ -46,6 +45,8 @@ fn ble_init_error_message(msg: &str) -> String {
         || msg.contains("adapter is off")
     {
         BLUETOOTH_OFF_MESSAGE.to_string()
+    } else if msg.contains("timed out at stage") {
+        BLE_STACK_STUCK_MESSAGE.to_string()
     } else {
         msg.to_string()
     }
@@ -61,15 +62,14 @@ const BLUETOOTH_UNAVAILABLE_MESSAGE: &str =
     "Bluetooth is unavailable. Check that this app is allowed to use Bluetooth in \
      Settings — simulators and emulators have no Bluetooth adapter.";
 
-/// `BleTransport::build` runs its own 5 s `wait_ready` on both roles and reports
-/// a powered-off adapter as `AdapterOff`, so an outer timeout means a later step
-/// (advertising, scan, or the L2CAP listener) wedged with the adapter powered on.
+/// `BleTransport::build` reports a powered-off adapter as `AdapterOff` from its
+/// own `wait_ready`, so its `Timeout { stage }` means a later step (advertising,
+/// scan, or the L2CAP listener) wedged with the adapter powered on.
 const BLE_STACK_STUCK_MESSAGE: &str =
     "Bluetooth did not finish starting up. Toggle Bluetooth off and on, then restart the app.";
 
-/// Run one adapter-touching init step under `BLE_INIT_TIMEOUT`. `on_timeout` is
-/// per step: what a hang implies differs between the blew constructors (the
-/// stack is down) and `BleTransport::build` (which diagnoses a down stack itself).
+/// Run one blew constructor under `BLE_INIT_TIMEOUT`. Cancelling these is safe:
+/// neither has started anything that needs tearing down by the time it returns.
 async fn ble_init_step<T>(
     what: &str,
     on_timeout: &str,
@@ -316,16 +316,19 @@ async fn start_node(
         let peripheral = Arc::new(
             ble_init_step("Peripheral::new", BLUETOOTH_OFF_MESSAGE, Peripheral::new()).await?,
         );
-        ble_init_step(
-            "BleTransport::build",
-            BLE_STACK_STUCK_MESSAGE,
-            BleTransport::builder()
-                .l2cap_policy(L2capPolicy::PreferL2cap)
-                .central(central)
-                .peripheral(peripheral)
-                .build(st.secret_key.public()),
-        )
-        .await?
+        // Not wrapped in a timeout: `build` is not cancel-safe, and dropping it
+        // part-way leaves the adapter advertising and scanning with no owner. It
+        // bounds each of its own steps instead, so it always returns on its own.
+        BleTransport::builder()
+            .l2cap_policy(L2capPolicy::PreferL2cap)
+            .central(central)
+            .peripheral(peripheral)
+            .build(st.secret_key.public())
+            .await
+            .map_err(|e| {
+                tracing::warn!("BleTransport::build failed: {e}");
+                ble_init_error_message(&e.to_string())
+            })?
     };
 
     // BLE-tuned QUIC idle timeout. The default (30s) is too lax because
