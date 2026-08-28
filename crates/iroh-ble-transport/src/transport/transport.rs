@@ -325,6 +325,18 @@ async fn handle_hook_event(
     }
 }
 
+/// `Central::wait_ready` / `Peripheral::wait_ready` resolve as soon as the
+/// adapter reports powered, so the only way they time out is an adapter that
+/// never powers on — report that as [`BleError::AdapterOff`] rather than a
+/// generic stage timeout. Any other failure (a closed event stream) is a
+/// distinct condition and propagates unchanged.
+fn adapter_wait_error(err: BlewError) -> BleError {
+    match err {
+        BlewError::Timeout => BleError::AdapterOff,
+        other => BleError::Blew(other),
+    }
+}
+
 impl BleTransport {
     /// Start configuring a new transport. See [`BleTransportBuilder`].
     #[must_use]
@@ -342,15 +354,11 @@ impl BleTransport {
         central
             .wait_ready(std::time::Duration::from_secs(5))
             .await
-            .map_err(|_| BleError::Timeout {
-                stage: "wait_ready",
-            })?;
+            .map_err(adapter_wait_error)?;
         peripheral
             .wait_ready(std::time::Duration::from_secs(5))
             .await
-            .map_err(|_| BleError::Timeout {
-                stage: "wait_ready",
-            })?;
+            .map_err(adapter_wait_error)?;
 
         let key_uuid = iroh_key_uuid(&local_id);
         let services = build_gatt_services(key_uuid);
