@@ -138,6 +138,15 @@ impl BleTransportBuilder {
     ///
     /// Propagates errors from bringing up the BLE radio (adapter not
     /// powered, GATT registration, advertising start).
+    ///
+    /// # Cancellation
+    ///
+    /// This future is **not** cancel-safe and must not be wrapped in a
+    /// `tokio::time::timeout`. Dropping it part-way can leave the adapter
+    /// advertising and scanning with no owner, because the registry actor that
+    /// holds the only teardown path is spawned last. Every step that can hang
+    /// is already bounded internally by `CONSTRUCT_STEP_TIMEOUT`, so a wedged
+    /// Bluetooth stack surfaces as `BleError::Timeout { stage }` instead.
     pub async fn build(self, endpoint_id: EndpointId) -> BleResult<Arc<BleTransport>> {
         let central = match self.central {
             Some(c) => c,
@@ -337,6 +346,53 @@ fn adapter_wait_error(err: BlewError) -> BleError {
     }
 }
 
+/// Per-step deadline for the adapter-touching parts of [`BleTransport::construct`].
+/// Each of these calls into the platform stack and can hang there indefinitely
+/// when that stack is wedged. They are bounded here rather than by the caller
+/// because `construct` cannot be rescued from outside: cancelling it drops the
+/// future mid-way, and everything it has already started is only reachable for
+/// teardown through the registry actor, which is spawned last.
+const CONSTRUCT_STEP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn construct_step<T>(
+    stage: &'static str,
+    fut: impl std::future::Future<Output = BleResult<T>>,
+) -> BleResult<T> {
+    tokio::time::timeout(CONSTRUCT_STEP_TIMEOUT, fut)
+        .await
+        .unwrap_or(Err(BleError::Timeout { stage }))
+}
+
+/// What `construct` has switched on so far, so that a failure part-way through
+/// can switch it back off. Without this a failed `construct` leaves the adapter
+/// advertising and scanning with no owner — `Driver::stop_scan` and
+/// `stop_advertising` are reachable only through the registry actor, and on the
+/// error paths that actor never gets spawned.
+#[derive(Default)]
+struct ConstructRollback {
+    advertising: bool,
+    scanning: bool,
+    l2cap_accept: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ConstructRollback {
+    async fn run(self, central: &Central, peripheral: &Peripheral) {
+        if let Some(task) = self.l2cap_accept {
+            task.abort();
+        }
+        if self.scanning
+            && let Err(e) = central.stop_scan().await
+        {
+            warn!(error = %e, "construct rollback: stop_scan failed");
+        }
+        if self.advertising
+            && let Err(e) = peripheral.stop_advertising().await
+        {
+            warn!(error = %e, "construct rollback: stop_advertising failed");
+        }
+    }
+}
+
 impl BleTransport {
     /// Start configuring a new transport. See [`BleTransportBuilder`].
     #[must_use]
@@ -351,6 +407,37 @@ impl BleTransport {
         store: Arc<dyn PeerStore>,
         l2cap_policy: L2capPolicy,
     ) -> BleResult<Arc<Self>> {
+        let central_for_rollback = Arc::clone(&central);
+        let peripheral_for_rollback = Arc::clone(&peripheral);
+        let mut rollback = ConstructRollback::default();
+        match Self::construct_inner(
+            local_id,
+            central,
+            peripheral,
+            store,
+            l2cap_policy,
+            &mut rollback,
+        )
+        .await
+        {
+            Ok(transport) => Ok(transport),
+            Err(e) => {
+                rollback
+                    .run(&central_for_rollback, &peripheral_for_rollback)
+                    .await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn construct_inner(
+        local_id: EndpointId,
+        central: Arc<Central>,
+        peripheral: Arc<Peripheral>,
+        store: Arc<dyn PeerStore>,
+        l2cap_policy: L2capPolicy,
+        rollback: &mut ConstructRollback,
+    ) -> BleResult<Arc<Self>> {
         central
             .wait_ready(std::time::Duration::from_secs(5))
             .await
@@ -362,23 +449,41 @@ impl BleTransport {
 
         let key_uuid = iroh_key_uuid(&local_id);
         let services = build_gatt_services(key_uuid);
-        register_gatt_services(&peripheral, &services).await?;
+        construct_step(
+            "register_gatt_services",
+            register_gatt_services(&peripheral, &services),
+        )
+        .await?;
         let advertising_config = AdvertisingConfig {
             local_name: "iroh".to_string(),
             service_uuids: vec![key_uuid],
         };
-        peripheral.start_advertising(&advertising_config).await?;
+        construct_step("start_advertising", async {
+            peripheral
+                .start_advertising(&advertising_config)
+                .await
+                .map_err(BleError::from)
+        })
+        .await?;
+        rollback.advertising = true;
         info!(key_uuid = %key_uuid, "advertising started");
 
-        match central
-            .start_scan(blew::central::ScanFilter::default())
-            .await
-        {
-            Ok(()) => info!("scanning for iroh-ble peers"),
-            Err(BlewError::NotSupported) => {
-                warn!("central start_scan not supported; discovery disabled");
+        let scanning = construct_step("start_scan", async {
+            match central
+                .start_scan(blew::central::ScanFilter::default())
+                .await
+            {
+                Ok(()) => Ok(true),
+                Err(BlewError::NotSupported) => Ok(false),
+                Err(e) => Err(BleError::from(e)),
             }
-            Err(e) => return Err(e.into()),
+        })
+        .await?;
+        if scanning {
+            rollback.scanning = true;
+            info!("scanning for iroh-ble peers");
+        } else {
+            warn!("central start_scan not supported; discovery disabled");
         }
 
         let (inbox_tx, inbox_rx) = mpsc::channel::<PeerCommand>(256);
@@ -414,12 +519,17 @@ impl BleTransport {
         );
 
         if l2cap_policy == L2capPolicy::PreferL2cap {
-            match peripheral.l2cap_listener().await {
+            match construct_step("l2cap_listener", async {
+                peripheral.l2cap_listener().await.map_err(BleError::from)
+            })
+            .await
+            {
                 Ok((assigned_psm, listener)) => {
                     let val = assigned_psm.value();
                     info!(psm = val, "L2CAP listener started");
                     psm_atomic.store(val, Ordering::Relaxed);
-                    tokio::spawn(run_l2cap_accept(listener, inbox_tx.clone()));
+                    rollback.l2cap_accept =
+                        Some(tokio::spawn(run_l2cap_accept(listener, inbox_tx.clone())));
                 }
                 Err(e) => {
                     warn!(error = %e, "L2CAP listener failed, falling back to GATT-only");
