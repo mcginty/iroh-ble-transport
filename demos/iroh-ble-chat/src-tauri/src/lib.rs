@@ -29,6 +29,48 @@ mod key_utils;
 #[cfg(target_os = "ios")]
 mod webview_helper;
 
+/// Backstop deadline for each adapter-touching init step. `Central::with_config`
+/// / `Peripheral::new` can block indefinitely when the adapter is powered off,
+/// so without this `start_node` hangs and the UI never sees an error. Kept well
+/// above `BleTransport::build`'s own budget (5 s `wait_ready` on the central plus
+/// 5 s on the peripheral) so that its more specific error wins the race.
+const BLE_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Map a blew/transport error string onto a message worth showing a tester.
+fn ble_init_error_message(msg: &str) -> String {
+    if msg.contains("adapter not found") || msg.contains("AdapterNotFound") {
+        "Bluetooth is not available on this device. A physical Bluetooth adapter is required — simulators and emulators are not supported.".to_string()
+    } else if msg.contains("not powered")
+        || msg.contains("timed out waiting for Bluetooth")
+        || msg.contains("power on")
+        || msg.contains("adapter is off")
+    {
+        BLUETOOTH_OFF_MESSAGE.to_string()
+    } else {
+        msg.to_string()
+    }
+}
+
+const BLUETOOTH_OFF_MESSAGE: &str =
+    "Bluetooth is turned off. Please enable Bluetooth in Settings and restart the app.";
+
+/// Run one adapter-touching init step under `BLE_INIT_TIMEOUT`. A timeout is
+/// reported as "Bluetooth is off" because that is what wedges these calls in
+/// practice — an adapter that is present and powered returns promptly.
+async fn ble_init_step<T>(
+    what: &str,
+    fut: impl std::future::Future<Output = Result<T, impl std::fmt::Display>>,
+) -> Result<T, String> {
+    match tokio::time::timeout(BLE_INIT_TIMEOUT, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(ble_init_error_message(&e.to_string())),
+        Err(_) => {
+            tracing::warn!("{what} timed out after {BLE_INIT_TIMEOUT:?}; assuming adapter is off");
+            Err(BLUETOOTH_OFF_MESSAGE.to_string())
+        }
+    }
+}
+
 fn chat_topic_id() -> TopicId {
     let hash = blake3::hash(b"iroh-ble-chat-v1");
     TopicId::from_bytes(*hash.as_bytes())
@@ -247,31 +289,18 @@ async fn start_node(
             ..Default::default()
         };
         let central = Arc::new(
-            Central::with_config(central_config)
-                .await
-                .map_err(|e| e.to_string())?,
+            ble_init_step("Central::with_config", Central::with_config(central_config)).await?,
         );
-        let peripheral = Arc::new(Peripheral::new().await.map_err(|e| e.to_string())?);
-        BleTransport::builder()
-            .l2cap_policy(L2capPolicy::PreferL2cap)
-            .central(central)
-            .peripheral(peripheral)
-            .build(st.secret_key.public())
-            .await
-            .map_err(|e| {
-                let msg = e.to_string();
-                if msg.contains("adapter not found") || msg.contains("AdapterNotFound") {
-                    "Bluetooth is not available on this device. A physical Bluetooth adapter is required — simulators and emulators are not supported.".to_string()
-                } else if msg.contains("not powered")
-                    || msg.contains("timed out waiting for Bluetooth")
-                    || msg.contains("power on")
-                {
-                    "Bluetooth is turned off. Please enable Bluetooth in Settings and restart the app."
-                        .to_string()
-                } else {
-                    msg
-                }
-            })?
+        let peripheral = Arc::new(ble_init_step("Peripheral::new", Peripheral::new()).await?);
+        ble_init_step(
+            "BleTransport::build",
+            BleTransport::builder()
+                .l2cap_policy(L2capPolicy::PreferL2cap)
+                .central(central)
+                .peripheral(peripheral)
+                .build(st.secret_key.public()),
+        )
+        .await?
     };
 
     // BLE-tuned QUIC idle timeout. The default (30s) is too lax because
