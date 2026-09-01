@@ -368,6 +368,13 @@ async fn construct_step<T>(
 /// advertising and scanning with no owner — `Driver::stop_scan` and
 /// `stop_advertising` are reachable only through the registry actor, and on the
 /// error paths that actor never gets spawned.
+///
+/// Each flag is armed *before* its step runs, not after it succeeds: a step
+/// that trips `CONSTRUCT_STEP_TIMEOUT` has its future dropped mid-call, and the
+/// platform may well have started advertising or scanning before the call it
+/// was waiting on came back. Rolling back something that never started costs a
+/// warning; not rolling back something that did is the leak this exists to
+/// prevent.
 #[derive(Default)]
 struct ConstructRollback {
     advertising: bool,
@@ -458,6 +465,7 @@ impl BleTransport {
             local_name: "iroh".to_string(),
             service_uuids: vec![key_uuid],
         };
+        rollback.advertising = true;
         construct_step("start_advertising", async {
             peripheral
                 .start_advertising(&advertising_config)
@@ -465,9 +473,9 @@ impl BleTransport {
                 .map_err(BleError::from)
         })
         .await?;
-        rollback.advertising = true;
         info!(key_uuid = %key_uuid, "advertising started");
 
+        rollback.scanning = true;
         let scanning = construct_step("start_scan", async {
             match central
                 .start_scan(blew::central::ScanFilter::default())
@@ -480,9 +488,9 @@ impl BleTransport {
         })
         .await?;
         if scanning {
-            rollback.scanning = true;
             info!("scanning for iroh-ble peers");
         } else {
+            rollback.scanning = false;
             warn!("central start_scan not supported; discovery disabled");
         }
 
