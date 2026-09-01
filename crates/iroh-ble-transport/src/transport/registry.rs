@@ -125,8 +125,8 @@ impl Registry {
             PeerCommand::Forget { device_id } => {
                 self.handle_forget(&mut actions, now, device_id);
             }
-            PeerCommand::Stalled { device_id } => {
-                self.handle_stalled(&mut actions, now, device_id);
+            PeerCommand::Stalled { device_id, cause } => {
+                self.handle_stalled(&mut actions, now, device_id, cause);
             }
             PeerCommand::Shutdown => self.handle_shutdown(&mut actions),
             PeerCommand::DataPipeReady {
@@ -423,14 +423,23 @@ impl Registry {
         let _ = rssi;
         let device_id = device.id.clone();
 
-        let has_verified_live = self.peers.values().any(|e| {
-            e.verified_endpoint
-                .map(|eid| crate::transport::routing::prefix_from_endpoint(&eid) == prefix)
-                .unwrap_or(false)
-                && matches!(e.phase, PeerPhase::Connected { .. })
-        });
+        let mut has_verified_live = false;
+        let mut verified_before = false;
+        for e in self.peers.values() {
+            if e.verified_endpoint
+                .is_some_and(|eid| crate::transport::routing::prefix_from_endpoint(&eid) == prefix)
+            {
+                verified_before = true;
+                if matches!(e.phase, PeerPhase::Connected { .. }) {
+                    has_verified_live = true;
+                }
+            }
+        }
         let i_am_lower = self.my_prefix < prefix;
-        let already_verified_peer = self.verified_prefixes.contains_key(&prefix);
+        // An entry that still remembers a completed handshake is itself proof
+        // we've verified this prefix, even when the tick pruned
+        // `verified_prefixes` because the entry had gone `Dead`.
+        let already_verified_peer = verified_before || self.verified_prefixes.contains_key(&prefix);
         let should_defer = i_am_lower && !already_verified_peer;
 
         if has_verified_live {
@@ -455,46 +464,33 @@ impl Registry {
         entry.last_adv = Some(now);
         entry.prefix = Some(prefix);
         entry.verified_live_suppressed_logged = false;
+        let defer_prefix = should_defer.then_some(prefix);
+        let mut resurrected_endpoint = None;
         match &entry.phase {
             PeerPhase::Unknown => {
-                if entry.pending_sends.is_empty() {
-                    entry.phase = PeerPhase::Discovered { since: now };
-                } else if should_defer {
-                    entry.phase = PeerPhase::PendingDial {
-                        since: now,
-                        deadline: pending_dial_deadline(now, prefix),
-                        prefix,
-                    };
-                } else {
-                    entry.phase = PeerPhase::Connecting {
-                        attempt: 0,
-                        started: now,
-                        path: crate::transport::peer::ConnectPath::Gatt,
-                    };
-                    actions.push(PeerAction::StartConnect {
-                        device_id: device_id.clone(),
-                        attempt: 0,
-                    });
-                }
+                Self::arm_for_dial(actions, entry, now, defer_prefix);
             }
             PeerPhase::Discovered { .. } if !entry.pending_sends.is_empty() => {
-                if should_defer {
-                    entry.phase = PeerPhase::PendingDial {
-                        since: now,
-                        deadline: pending_dial_deadline(now, prefix),
-                        prefix,
-                    };
-                } else {
-                    entry.phase = PeerPhase::Connecting {
-                        attempt: 0,
-                        started: now,
-                        path: crate::transport::peer::ConnectPath::Gatt,
-                    };
-                    actions.push(PeerAction::StartConnect {
-                        device_id: device_id.clone(),
-                        attempt: 0,
-                    });
-                }
+                Self::arm_for_dial(actions, entry, now, defer_prefix);
+            }
+            // `Dead` means we had reason to believe this peer was gone. An
+            // advertisement received now is direct evidence to the contrary,
+            // and it outranks the reason we tombstoned it — otherwise a peer
+            // sitting a foot away is ignored until DEAD_GC_TTL expires.
+            //
+            // Not every tombstone: `ProtocolMismatch` is a determinate
+            // property of the peer's build, so redialing it buys a connect
+            // plus a version read per advertisement, and `Forgotten` is an
+            // explicit application decision we have no business overriding.
+            PeerPhase::Dead {
+                reason:
+                    crate::transport::peer::DeadReason::MaxRetries
+                    | crate::transport::peer::DeadReason::Drained,
+                ..
+            } => {
+                Self::clear_connection_state(entry);
+                resurrected_endpoint = entry.verified_endpoint;
+                Self::arm_for_dial(actions, entry, now, defer_prefix);
             }
             PeerPhase::Reconnecting {
                 attempt, next_at, ..
@@ -511,6 +507,15 @@ impl Registry {
                 });
             }
             _ => {}
+        }
+        // The peer's identity was proven once and that hasn't expired with
+        // the tombstone, so restore the entry in `verified_prefixes` (pruned
+        // by the tick while it was `Dead`). Without this a peer we just had
+        // verified is treated as a stranger and takes the fairness defer.
+        if let Some(endpoint) = resurrected_endpoint
+            && crate::transport::routing::prefix_from_endpoint(&endpoint) == prefix
+        {
+            self.verified_prefixes.insert(prefix, endpoint);
         }
     }
 
@@ -538,6 +543,7 @@ impl Registry {
         }
         let entry_phase_kind = PhaseKind::from(&entry.phase);
         let entry_tx_gen = entry.tx_gen;
+        let resume_after_drain = entry.resume_after_drain;
         let decision = match &entry.phase {
             PeerPhase::Connected {
                 tx_gen: live_gen, ..
@@ -555,6 +561,11 @@ impl Registry {
             | PeerPhase::Handshaking { .. }
             | PeerPhase::Reconnecting { .. }
             | PeerPhase::Restoring { .. } => SendDecision::Buffer,
+            // A drain we asked for ends in a live entry again, so hold the
+            // datagram instead of failing it — otherwise reconnect latency
+            // depends on where the application's redial lands relative to
+            // the drain window.
+            PeerPhase::Draining { .. } if resume_after_drain => SendDecision::Buffer,
             PeerPhase::Draining { .. } | PeerPhase::Dead { .. } => SendDecision::Reject,
         };
         let decision_tag = match &decision {
@@ -1028,6 +1039,15 @@ impl Registry {
             return;
         };
         let reason = crate::transport::peer::DisconnectReason::from(cause);
+        if entry.resume_after_drain && matches!(entry.phase, PeerPhase::Draining { .. }) {
+            // The disconnect callback is the signal our own CloseChannel
+            // actually landed, so the drain is done — resolving here instead
+            // of idling out DRAINING_TIMEOUT is the difference between a ~2 s
+            // and a 5 s reconnect floor. Re-draining would be worse than a
+            // no-op: it resets `since` and extends the window.
+            Self::resume_drained_entry(actions, entry, now);
+            return;
+        }
         // A DeviceDisconnected for a peer we were in the middle of
         // dialing IS the connect failure — there is no live pipe to
         // drain. Historically this arm raced with `ConnectFailed`
@@ -1197,22 +1217,28 @@ impl Registry {
                     });
                 }
                 TickAction::DrainingToDead => {
-                    // After the drain window, stop trying to rescue
-                    // this DeviceId. Reconnection is driven by fresh
-                    // advertising creating a new entry (common case:
-                    // Android MAC randomization on peer restart) or by
-                    // iroh issuing a new SendDatagram, not by the
-                    // registry's own retry loop.
-                    entry.target_endpoint = None;
-                    entry.phase = PeerPhase::Dead {
-                        reason: crate::transport::peer::DeadReason::Forgotten,
-                        at: tick_now,
-                    };
+                    if entry.resume_after_drain {
+                        // Backstop for the peripheral role, where no
+                        // disconnect callback arrives to resolve the drain.
+                        Self::resume_drained_entry(actions, entry, tick_now);
+                    } else {
+                        // After the drain window, stop trying to rescue
+                        // this DeviceId. Reconnection is driven by fresh
+                        // advertising creating a new entry (common case:
+                        // Android MAC randomization on peer restart) or by
+                        // iroh issuing a new SendDatagram, not by the
+                        // registry's own retry loop.
+                        entry.target_endpoint = None;
+                        entry.phase = PeerPhase::Dead {
+                            reason: crate::transport::peer::DeadReason::Drained,
+                            at: tick_now,
+                        };
+                    }
                 }
                 TickAction::RestoringToDead => {
                     entry.target_endpoint = None;
                     entry.phase = PeerPhase::Dead {
-                        reason: crate::transport::peer::DeadReason::Forgotten,
+                        reason: crate::transport::peer::DeadReason::Drained,
                         at: tick_now,
                     };
                 }
@@ -1313,6 +1339,7 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        cause: crate::transport::peer::StallCause,
     ) {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
@@ -1324,8 +1351,20 @@ impl Registry {
         }) else {
             return;
         };
-        let reason = crate::transport::peer::DisconnectReason::LinkDead;
+        let reason = match cause {
+            crate::transport::peer::StallCause::LinkDead => {
+                crate::transport::peer::DisconnectReason::LinkDead
+            }
+            crate::transport::peer::StallCause::LocalClose => {
+                crate::transport::peer::DisconnectReason::LocalClose
+            }
+        };
         let broken_pipe_acks = Self::drain_to_draining(entry, now, reason.clone());
+        // Hanging up is a local decision, not evidence about the radio: drain
+        // the pipe, but let the entry come back once the close has landed
+        // instead of tombstoning it for DEAD_GC_TTL. Set after the drain,
+        // which clears the flag.
+        entry.resume_after_drain = matches!(cause, crate::transport::peer::StallCause::LocalClose);
         actions.extend(broken_pipe_acks);
         actions.push(PeerAction::CloseChannel {
             device_id: device_id.clone(),
@@ -1707,6 +1746,61 @@ impl Registry {
         self.peers.iter()
     }
 
+    /// Wipe the leftovers of a connection that is definitively gone, so the
+    /// entry can be reused for a fresh one.
+    fn clear_connection_state(entry: &mut PeerEntry) {
+        entry.consecutive_failures = 0;
+        entry.pipe = None;
+        entry.l2cap_channel = None;
+        entry.l2cap_upgrade_failed = false;
+        entry.subscribed_chars.clear();
+        entry.rx_backlog.clear();
+        entry.resume_after_drain = false;
+        entry.verified_live_suppressed_logged = false;
+    }
+
+    /// Park an entry that is ready to be dialled again: idle in `Discovered`
+    /// unless datagrams are already queued, in which case dial — or, when
+    /// `defer_prefix` is set, let the peer dial us first under the fairness
+    /// rule.
+    fn arm_for_dial(
+        actions: &mut Vec<PeerAction>,
+        entry: &mut PeerEntry,
+        now: std::time::Instant,
+        defer_prefix: Option<crate::transport::peer::KeyPrefix>,
+    ) {
+        if entry.pending_sends.is_empty() {
+            entry.phase = PeerPhase::Discovered { since: now };
+        } else if let Some(prefix) = defer_prefix {
+            entry.phase = PeerPhase::PendingDial {
+                since: now,
+                deadline: pending_dial_deadline(now, prefix),
+                prefix,
+            };
+        } else {
+            entry.phase = PeerPhase::Connecting {
+                attempt: 0,
+                started: now,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            };
+            actions.push(PeerAction::StartConnect {
+                device_id: entry.device_id.clone(),
+                attempt: 0,
+            });
+        }
+    }
+
+    /// Finish a drain we asked for ourselves. The peer was never presumed
+    /// gone, so it goes back to being dialable instead of `Dead`.
+    fn resume_drained_entry(
+        actions: &mut Vec<PeerAction>,
+        entry: &mut PeerEntry,
+        now: std::time::Instant,
+    ) {
+        Self::clear_connection_state(entry);
+        Self::arm_for_dial(actions, entry, now, None);
+    }
+
     fn drain_to_draining(
         entry: &mut PeerEntry,
         now: std::time::Instant,
@@ -1715,6 +1809,10 @@ impl Registry {
         let mut out = Vec::new();
         let was_connected = matches!(entry.phase, PeerPhase::Connected { .. });
         entry.pipe = None;
+        // Every path into `Draining` lands here, so clearing the resume intent
+        // by default keeps it scoped to the one teardown that asked for it —
+        // `handle_stalled` re-arms it immediately afterwards.
+        entry.resume_after_drain = false;
         // Scope the no-retry sticky bit to the current connection: future
         // reconnects start fresh and are allowed to attempt L2CAP again.
         entry.l2cap_upgrade_failed = false;
@@ -3381,7 +3479,7 @@ mod tests {
         assert!(actions.is_empty(), "Draining->Dead does not emit actions");
         match &reg.peer(&device_id).unwrap().phase {
             PeerPhase::Dead { reason, .. } => {
-                assert_eq!(*reason, crate::transport::peer::DeadReason::Forgotten);
+                assert_eq!(*reason, crate::transport::peer::DeadReason::Drained);
             }
             other => panic!("wrong phase: {other:?}"),
         }
@@ -3401,7 +3499,7 @@ mod tests {
         assert!(matches!(
             reg.peer(&device_id).unwrap().phase,
             PeerPhase::Dead {
-                reason: crate::transport::peer::DeadReason::Forgotten,
+                reason: crate::transport::peer::DeadReason::Drained,
                 ..
             }
         ));
@@ -3453,6 +3551,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::Stalled {
             device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LinkDead,
         });
         assert!(
             actions
@@ -3466,6 +3565,366 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn connected_entry(reg: &mut Registry, device_id: &DeviceId) {
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: crate::transport::peer::ChannelHandle {
+                    id: 1,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: false,
+            };
+            e
+        });
+    }
+
+    fn advertise(reg: &mut Registry, device_id: &DeviceId, prefix: [u8; 12]) -> Vec<PeerAction> {
+        reg.handle(PeerCommand::Advertised {
+            prefix,
+            device: blew::BleDevice {
+                id: device_id.clone(),
+                name: None,
+                rssi: None,
+                services: vec![],
+            },
+            rssi: None,
+        })
+    }
+
+    fn dead_entry(
+        reg: &mut Registry,
+        device_id: &DeviceId,
+        reason: crate::transport::peer::DeadReason,
+    ) {
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.phase = PeerPhase::Dead {
+                reason,
+                at: std::time::Instant::now(),
+            };
+            e
+        });
+    }
+
+    fn queue_send(reg: &mut Registry, device_id: &DeviceId) {
+        reg.peers
+            .get_mut(device_id)
+            .unwrap()
+            .pending_sends
+            .push_back(crate::transport::peer::PendingSend {
+                tx_gen: 0,
+                datagram: bytes::Bytes::from_static(b"hi"),
+                waker: noop_waker(),
+            });
+    }
+
+    #[test]
+    fn stalled_local_close_drains_and_marks_entry_for_resume() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-local-close");
+        connected_entry(&mut reg, &device_id);
+
+        let actions = reg.handle(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LocalClose,
+        });
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::CloseChannel { .. })),
+            "the BLE channel is still closed on a local teardown"
+        );
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(matches!(
+            entry.phase,
+            PeerPhase::Draining {
+                reason: crate::transport::peer::DisconnectReason::LocalClose,
+                ..
+            }
+        ));
+        assert!(entry.resume_after_drain);
+    }
+
+    #[test]
+    fn resumable_drain_returns_to_discovered_instead_of_dead() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-resume-tick");
+        connected_entry(&mut reg, &device_id);
+        reg.handle(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LocalClose,
+        });
+
+        let past_drain = std::time::Instant::now() + DRAINING_TIMEOUT + Duration::from_secs(1);
+        reg.handle(PeerCommand::Tick(past_drain));
+
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(
+            matches!(entry.phase, PeerPhase::Discovered { .. }),
+            "expected Discovered, got {:?}",
+            entry.phase
+        );
+        assert!(!entry.resume_after_drain, "resume intent is consumed once");
+    }
+
+    #[test]
+    fn link_dead_drain_still_tombstones() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-link-dead-tick");
+        connected_entry(&mut reg, &device_id);
+        reg.handle(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LinkDead,
+        });
+
+        let past_drain = std::time::Instant::now() + DRAINING_TIMEOUT + Duration::from_secs(1);
+        reg.handle(PeerCommand::Tick(past_drain));
+
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Dead {
+                reason: crate::transport::peer::DeadReason::Drained,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn central_disconnected_resolves_resumable_drain_immediately() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-resume-callback");
+        connected_entry(&mut reg, &device_id);
+        reg.handle(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LocalClose,
+        });
+
+        // No tick: the disconnect callback alone resolves the drain, which is
+        // what keeps the reconnect floor at the callback latency (~2 s on
+        // hardware) rather than DRAINING_TIMEOUT.
+        reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::LocalClose,
+        });
+
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Discovered { .. }
+        ));
+    }
+
+    #[test]
+    fn send_during_resumable_drain_buffers_then_dials() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-resume-send");
+        connected_entry(&mut reg, &device_id);
+        reg.handle(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LocalClose,
+        });
+
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: None,
+            tx_gen: 2,
+            datagram: bytes::Bytes::from_static(b"redial"),
+            waker: noop_waker(),
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::AckSend { result: Ok(()), .. })),
+            "a redial during our own teardown is accepted, not failed"
+        );
+        assert_eq!(reg.peer(&device_id).unwrap().pending_sends.len(), 1);
+
+        let past_drain = std::time::Instant::now() + DRAINING_TIMEOUT + Duration::from_secs(1);
+        let actions = reg.handle(PeerCommand::Tick(past_drain));
+        assert!(
+            actions.iter().any(
+                |a| matches!(a, PeerAction::StartConnect { device_id: d, .. } if *d == device_id)
+            ),
+            "the buffered datagram dials as soon as the drain resolves"
+        );
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Connecting { .. }
+        ));
+    }
+
+    #[test]
+    fn resume_intent_does_not_survive_into_the_next_teardown() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-resume-scope");
+        connected_entry(&mut reg, &device_id);
+        reg.handle(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LocalClose,
+        });
+        reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::LocalClose,
+        });
+
+        // Same entry reconnects, then the radio genuinely goes away. The
+        // earlier local teardown must not make this one resumable too.
+        reg.peers.get_mut(&device_id).unwrap().phase = PeerPhase::Connected {
+            since: std::time::Instant::now(),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 2,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+            tx_gen: 2,
+            upgrading: false,
+        };
+        reg.handle(PeerCommand::Stalled {
+            device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LinkDead,
+        });
+        assert!(!reg.peer(&device_id).unwrap().resume_after_drain);
+
+        let past_drain = std::time::Instant::now() + DRAINING_TIMEOUT + Duration::from_secs(1);
+        reg.handle(PeerCommand::Tick(past_drain));
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Dead { .. }
+        ));
+    }
+
+    #[test]
+    fn advertisement_resurrects_drained_dead_entry() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-resurrect");
+        dead_entry(
+            &mut reg,
+            &device_id,
+            crate::transport::peer::DeadReason::Drained,
+        );
+
+        let actions = advertise(&mut reg, &device_id, [0u8; 12]);
+
+        assert!(actions.is_empty(), "no queued sends, so no dial");
+        assert!(
+            matches!(
+                reg.peer(&device_id).unwrap().phase,
+                PeerPhase::Discovered { .. }
+            ),
+            "a live advertisement outranks the tombstone"
+        );
+    }
+
+    #[test]
+    fn advertisement_resurrects_max_retries_entry_and_dials_queued_sends() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-resurrect-dial");
+        dead_entry(
+            &mut reg,
+            &device_id,
+            crate::transport::peer::DeadReason::MaxRetries,
+        );
+        reg.peers.get_mut(&device_id).unwrap().consecutive_failures = MAX_CONNECT_ATTEMPTS;
+        queue_send(&mut reg, &device_id);
+
+        // [0u8; 12] sorts below any real pubkey prefix, so `should_defer` is
+        // false and this dials rather than waiting out the fairness window.
+        let actions = advertise(&mut reg, &device_id, [0u8; 12]);
+
+        assert!(actions.iter().any(
+            |a| matches!(a, PeerAction::StartConnect { device_id: d, .. } if *d == device_id)
+        ));
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(matches!(entry.phase, PeerPhase::Connecting { .. }));
+        assert_eq!(
+            entry.consecutive_failures, 0,
+            "a resurrected peer gets a fresh retry budget"
+        );
+    }
+
+    #[test]
+    fn advertisement_does_not_resurrect_protocol_mismatch() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-mismatch");
+        dead_entry(
+            &mut reg,
+            &device_id,
+            crate::transport::peer::DeadReason::ProtocolMismatch { got: 9, want: 1 },
+        );
+
+        advertise(&mut reg, &device_id, [0u8; 12]);
+
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Dead {
+                reason: crate::transport::peer::DeadReason::ProtocolMismatch { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn advertisement_does_not_resurrect_forgotten_peer() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-forgotten");
+        dead_entry(
+            &mut reg,
+            &device_id,
+            crate::transport::peer::DeadReason::Forgotten,
+        );
+
+        advertise(&mut reg, &device_id, [0u8; 12]);
+
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Dead {
+                reason: crate::transport::peer::DeadReason::Forgotten,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resurrected_entry_restores_verified_prefix() {
+        use crate::transport::routing::prefix_from_endpoint;
+
+        // We must be the lower prefix for `should_defer` to be live at all;
+        // pubkey ordering doesn't follow seed ordering, so sort them.
+        let (my_ep, peer_ep) = {
+            let a = endpoint_from_seed(0x01);
+            let b = endpoint_from_seed(0xFF);
+            if a.as_bytes() < b.as_bytes() {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        };
+        let peer_prefix = prefix_from_endpoint(&peer_ep);
+
+        let mut reg = Registry::new_for_test_with_endpoint(my_ep);
+        let device_id = blew::DeviceId::from("dev-reverify");
+        dead_entry(
+            &mut reg,
+            &device_id,
+            crate::transport::peer::DeadReason::Drained,
+        );
+        reg.peers.get_mut(&device_id).unwrap().verified_endpoint = Some(peer_ep);
+        queue_send(&mut reg, &device_id);
+
+        advertise(&mut reg, &device_id, peer_prefix);
+
+        assert_eq!(reg.verified_prefixes.get(&peer_prefix), Some(&peer_ep));
+        assert!(
+            matches!(
+                reg.peer(&device_id).unwrap().phase,
+                PeerPhase::Connecting { .. }
+            ),
+            "a peer we already verified should not take the fairness defer again"
+        );
     }
 
     fn tick_wedged_pipe_test_body(path: crate::transport::peer::ConnectPath) {
@@ -3611,6 +4070,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::Stalled {
             device_id: device_id.clone(),
+            cause: crate::transport::peer::StallCause::LinkDead,
         });
         assert!(actions.is_empty());
         assert!(matches!(

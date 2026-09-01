@@ -157,6 +157,117 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
     );
 }
 
+/// A teardown we asked for ourselves (the last watched iroh connection closed,
+/// so `handle_hook_event` raises `Stalled { LocalClose }`) must not tombstone
+/// the peer. Before this, the entry went `Draining` → `Dead` and sat there for
+/// `DEAD_GC_TTL`, giving a hard 65 s floor on redialing a peer a foot away.
+#[tokio::test]
+async fn local_teardown_lets_the_peer_be_redialed_immediately() {
+    let iface = Arc::new(MockBleInterface::new());
+    let device_id = blew::DeviceId::from("dev-teardown");
+    for id in [1u64, 2] {
+        iface.on_connect(
+            device_id.clone(),
+            Ok(ChannelHandle {
+                id,
+                path: ConnectPath::Gatt,
+            }),
+        );
+    }
+
+    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+        empty_frames,
+        Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
+    );
+    let reg = Registry::new_for_test_with_policy(L2capPolicy::Disabled);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
+    });
+
+    let prefix: KeyPrefix = [7u8; KEY_PREFIX_LEN];
+    let advertise = || PeerCommand::Advertised {
+        prefix,
+        device: blew::BleDevice {
+            id: device_id.clone(),
+            name: None,
+            rssi: None,
+            services: vec![],
+        },
+        rssi: None,
+    };
+    let (waker_tx, _waker_rx) = mpsc::channel::<()>(4);
+    let send = |datagram: &'static [u8]| PeerCommand::SendDatagram {
+        device_id: device_id.clone(),
+        target_endpoint: None,
+        tx_gen: 0,
+        datagram: bytes::Bytes::from_static(datagram),
+        waker: waker_from_channel(waker_tx.clone()),
+    };
+
+    tx.send(advertise()).await.unwrap();
+    tx.send(send(b"ping")).await.unwrap();
+    wait_for_call_count(
+        &iface,
+        CallKindMatcher::Connect,
+        1,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+
+    // The application hangs up: the pipe is torn down on purpose.
+    tx.send(PeerCommand::Stalled {
+        device_id: device_id.clone(),
+        cause: iroh_ble_transport::transport::peer::StallCause::LocalClose,
+    })
+    .await
+    .unwrap();
+    wait_for_call_count(
+        &iface,
+        CallKindMatcher::Disconnect,
+        1,
+        std::time::Duration::from_secs(2),
+    )
+    .await;
+    // The disconnect callback confirms the close landed, which resolves the
+    // drain without waiting out DRAINING_TIMEOUT.
+    tx.send(PeerCommand::CentralDisconnected {
+        device_id: device_id.clone(),
+        cause: blew::DisconnectCause::LocalClose,
+    })
+    .await
+    .unwrap();
+
+    // The application redials. No tick, no GC wait: the entry is dialable now.
+    tx.send(advertise()).await.unwrap();
+    tx.send(send(b"ping-again")).await.unwrap();
+    wait_for_call_count(
+        &iface,
+        CallKindMatcher::Connect,
+        2,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
     let iface = Arc::new(MockBleInterface::new());

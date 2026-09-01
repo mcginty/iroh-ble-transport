@@ -174,16 +174,34 @@ Key constants (registry.rs):
 
 ```
 Unknown → Discovered → Connecting → Handshaking → Connected
+             ▲                                        │
+             │                                        ▼
+             └────────────────────────────────── Draining ──→ Dead
+                                                      │          │
+                                                      ▼          ▼
+                                                Reconnecting  Discovered
+                                                      │       (on advertisement)
+                                                      ▼
+                                                  Connecting
                                                       │
                                                       ▼
-                                                   Draining ──→ Dead
-                                                      │
-                                                      ▼
-                                                Reconnecting ──→ Connecting
-                                                                    │
-                                                                    ▼
-                                                                 Restoring
+                                                   Restoring
 ```
+
+Two edges keep a present peer out of the `Dead` tombstone:
+
+- **`Draining → Discovered`** when the teardown was our own decision. The
+  `ConnectionClosed` hook raises `PeerCommand::Stalled { cause: LocalClose }`, which
+  sets `PeerEntry::resume_after_drain`; the drain then resolves back to `Discovered`
+  instead of `Dead`. It resolves on the peer's disconnect callback (~2 s) with the
+  `DRAINING_TIMEOUT` tick as a backstop for the peripheral role, and sends arriving
+  during the window are buffered rather than rejected. A `LinkDead` stall (a wedged
+  pipe, a dedup loser) still tombstones as before.
+- **`Dead → Discovered`** when the peer advertises again. An advertisement is direct
+  evidence the peer is present, so it outranks a `MaxRetries` or `Drained` tombstone
+  rather than waiting out `DEAD_GC_TTL`. `ProtocolMismatch` and `Forgotten`
+  tombstones are not resurrected — the first is a property of the peer's build, the
+  second an explicit application decision.
 
 Key constants (registry.rs):
 
@@ -194,7 +212,7 @@ Key constants (registry.rs):
 | `RESTORING_TIMEOUT` | 120 s | Max time after adapter-restore before giving up |
 | `DEAD_GC_TTL` | 60 s | How long a `Dead` entry sticks around for dedup |
 
-The transport itself is **passive**: once a peer ends up in `Dead`, the registry will not auto-retry. Reconnect policy lives in the application (see chat-app `reconnect_tick`).
+The transport itself is **passive**: it never dials on its own. Both resume edges above land in `Discovered`, which only dials when a datagram is already queued for that peer — reconnect policy stays in the application (see chat-app `reconnect_tick`).
 
 ### Routing table (`TransportRouting`)
 

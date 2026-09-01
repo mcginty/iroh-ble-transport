@@ -30,7 +30,7 @@ use crate::transport::events::{
     run_central_events, run_l2cap_accept, run_peripheral_requests, run_peripheral_state_events,
 };
 use crate::transport::hook::{BleDedupHook, HookEvent};
-use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand};
+use crate::transport::peer::{ConnectPath, KEY_PREFIX_LEN, PeerCommand, StallCause};
 use crate::transport::registry::{PhaseKind, Registry, RegistryHandle, SnapshotMaps};
 use crate::transport::routing::{
     TOKEN_LEN, local_custom_addr, parse_token_addr, token_custom_addr,
@@ -294,7 +294,12 @@ async fn handle_hook_event(
             // pipe worker then exits, which evicts the lingering routing
             // pipe record.
             for device_id in evicted_devices {
-                inbox.send(PeerCommand::Stalled { device_id }).await?;
+                inbox
+                    .send(PeerCommand::Stalled {
+                        device_id,
+                        cause: StallCause::LinkDead,
+                    })
+                    .await?;
             }
             inbox
                 .send(PeerCommand::VerifiedEndpoint { endpoint_id, token })
@@ -317,7 +322,12 @@ async fn handle_hook_event(
                         device = %device_id,
                         "all watched iroh connections closed; tearing BLE pipe down"
                     );
-                    inbox.send(PeerCommand::Stalled { device_id }).await?;
+                    inbox
+                        .send(PeerCommand::Stalled {
+                            device_id,
+                            cause: StallCause::LocalClose,
+                        })
+                        .await?;
                 }
             }
             Ok(())
@@ -1131,8 +1141,9 @@ mod tests {
         .expect("hook event should forward");
 
         match rx.try_recv().expect("Stalled emitted first") {
-            PeerCommand::Stalled { device_id } => {
+            PeerCommand::Stalled { device_id, cause } => {
                 assert_eq!(device_id, evicted);
+                assert_eq!(cause, StallCause::LinkDead);
             }
             other => panic!("expected Stalled, got {other:?}"),
         }
@@ -1169,8 +1180,9 @@ mod tests {
 
         assert_eq!(routing.routable_pipe_for(&endpoint_id), None);
         match rx.try_recv().expect("Stalled emitted") {
-            PeerCommand::Stalled { device_id } => {
+            PeerCommand::Stalled { device_id, cause } => {
                 assert_eq!(device_id, dev("close-current"));
+                assert_eq!(cause, StallCause::LocalClose);
             }
             other => panic!("expected Stalled, got {other:?}"),
         }
