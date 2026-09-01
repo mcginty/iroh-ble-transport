@@ -112,6 +112,11 @@ pub struct PeerEntry {
     pub verified_at: Option<Instant>,
     pub l2cap_upgrade_failed: bool,
     pub verified_live_suppressed_logged: bool,
+    /// This drain was our own decision, so rebuild the peer on demand when it
+    /// finishes instead of tombstoning it. Scoped to a single teardown: every
+    /// entry into `Draining` clears it, only a `StallCause::LocalClose` sets
+    /// it, and resolving the drain consumes it.
+    pub resume_after_drain: bool,
 }
 
 impl PeerEntry {
@@ -136,6 +141,7 @@ impl PeerEntry {
             verified_at: None,
             l2cap_upgrade_failed: false,
             verified_live_suppressed_logged: false,
+            resume_after_drain: false,
         }
     }
 }
@@ -151,6 +157,18 @@ pub struct PendingSend {
 pub enum ConnectPath {
     L2cap,
     Gatt,
+}
+
+/// Why a `PeerCommand::Stalled` was raised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallCause {
+    /// The pipe stopped making progress, or a duplicate connection lost the
+    /// dedup race. The peer is presumed gone until it advertises again.
+    LinkDead,
+    /// We tore the pipe down ourselves — the last watched iroh connection
+    /// closed. Says nothing about the radio, so the entry is rebuilt on
+    /// demand rather than tombstoned.
+    LocalClose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,7 +202,15 @@ impl From<DisconnectCause> for DisconnectReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeadReason {
     MaxRetries,
-    ProtocolMismatch { got: u8, want: u8 },
+    /// A drain or adapter-restore window expired without the entry coming
+    /// back. Distinct from `Forgotten`, which is an explicit application
+    /// decision: a `Drained` tombstone may be resurrected by a fresh
+    /// advertisement, a `Forgotten` one may not.
+    Drained,
+    ProtocolMismatch {
+        got: u8,
+        want: u8,
+    },
     Forgotten,
 }
 
@@ -299,8 +325,12 @@ pub enum PeerCommand {
         got: u8,
         want: u8,
     },
+    /// A live pipe is going away. `cause` says whether the radio stopped
+    /// answering (`LinkDead`) or we hung up on purpose (`LocalClose`); only
+    /// the former is evidence the peer is gone.
     Stalled {
         device_id: DeviceId,
+        cause: StallCause,
     },
     /// Tell the registry to evict this DeviceId entirely. Used when the
     /// routing layer detects that a known prefix has flipped to a new
