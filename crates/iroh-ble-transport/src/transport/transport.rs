@@ -55,6 +55,8 @@ pub const PROTOCOL_VERSION: u8 = 1;
 
 const KEY_UUID_PREFIX: [u8; 4] = [0x69, 0x72, 0x6f, 0x00];
 
+const DEFAULT_LOCAL_NAME: &str = "iroh";
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum L2capPolicy {
     Disabled,
@@ -73,11 +75,13 @@ pub enum L2capPolicy {
 /// - [`Central::new`] + [`Peripheral::new`] are constructed with
 ///   default config at `build` time
 /// - [`InMemoryPeerStore`] (non-durable across restarts)
+/// - advertised local name `"iroh"`
 pub struct BleTransportBuilder {
     l2cap_policy: L2capPolicy,
     central: Option<Arc<Central>>,
     peripheral: Option<Arc<Peripheral>>,
     peer_store: Option<Arc<dyn PeerStore>>,
+    local_name: Option<String>,
 }
 
 impl BleTransportBuilder {
@@ -87,6 +91,7 @@ impl BleTransportBuilder {
             central: None,
             peripheral: None,
             peer_store: None,
+            local_name: None,
         }
     }
 
@@ -128,6 +133,14 @@ impl BleTransportBuilder {
         self
     }
 
+    /// The name advertised in the BLE `Complete Local Name` field. Defaults to
+    /// `"iroh"`.
+    #[must_use]
+    pub fn local_name(mut self, name: impl Into<String>) -> Self {
+        self.local_name = Some(name.into());
+        self
+    }
+
     /// Construct the transport. `endpoint_id` is the local node's iroh
     /// `EndpointId` — the advertising-service UUID embeds its first 12
     /// bytes so peers discover each other without coordination. This
@@ -159,7 +172,15 @@ impl BleTransportBuilder {
         let store = self
             .peer_store
             .unwrap_or_else(|| Arc::new(InMemoryPeerStore::new()));
-        BleTransport::construct(endpoint_id, central, peripheral, store, self.l2cap_policy).await
+        BleTransport::construct(
+            endpoint_id,
+            central,
+            peripheral,
+            store,
+            self.l2cap_policy,
+            self.local_name,
+        )
+        .await
     }
 }
 
@@ -170,6 +191,7 @@ impl std::fmt::Debug for BleTransportBuilder {
             .field("central", &self.central.is_some())
             .field("peripheral", &self.peripheral.is_some())
             .field("peer_store", &self.peer_store.is_some())
+            .field("local_name", &self.local_name)
             .finish()
     }
 }
@@ -423,6 +445,7 @@ impl BleTransport {
         peripheral: Arc<Peripheral>,
         store: Arc<dyn PeerStore>,
         l2cap_policy: L2capPolicy,
+        local_name: Option<String>,
     ) -> BleResult<Arc<Self>> {
         let central_for_rollback = Arc::clone(&central);
         let peripheral_for_rollback = Arc::clone(&peripheral);
@@ -433,6 +456,7 @@ impl BleTransport {
             peripheral,
             store,
             l2cap_policy,
+            local_name,
             &mut rollback,
         )
         .await
@@ -453,6 +477,7 @@ impl BleTransport {
         peripheral: Arc<Peripheral>,
         store: Arc<dyn PeerStore>,
         l2cap_policy: L2capPolicy,
+        local_name: Option<String>,
         rollback: &mut ConstructRollback,
     ) -> BleResult<Arc<Self>> {
         central
@@ -472,7 +497,7 @@ impl BleTransport {
         )
         .await?;
         let advertising_config = AdvertisingConfig {
-            local_name: "iroh".to_string(),
+            local_name: local_name.unwrap_or_else(|| DEFAULT_LOCAL_NAME.to_string()),
             service_uuids: vec![key_uuid],
         };
         rollback.advertising = true;
