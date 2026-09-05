@@ -23,6 +23,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use iroh::endpoint::{VarInt, WeakConnectionHandle};
 use iroh_base::{EndpointId, TransportAddr};
@@ -86,23 +87,73 @@ impl ConnHandle for WeakConnectionHandle {
     }
 }
 
+/// How long a closed pipe is remembered, so a handshake that completes
+/// just after its pipe died still gets closed. Generous next to the
+/// window it covers (a `promote()` that raced the pipe worker's exit),
+/// and bounded below by [`MAX_CLOSED_PIPES`].
+const CLOSED_PIPE_TTL: Duration = Duration::from_secs(30);
+const MAX_CLOSED_PIPES: usize = 128;
+
 type ActiveConnectionKey = (EndpointId, StableConnId);
 
 /// The connections in one (endpoint, pipe) bucket, by watch id.
 type WatchedConns = HashMap<u64, Arc<dyn ConnHandle>>;
 
+/// Why and when a pipe was closed, kept so late registrations on it can
+/// be closed the same way.
+#[derive(Clone)]
+struct ClosedPipe {
+    code: VarInt,
+    reason: Vec<u8>,
+    closed_at: Instant,
+    /// Insertion order, so overflow always drops the oldest close and
+    /// never the one being recorded right now (`closed_at` ties when
+    /// several pipes die inside the same instant).
+    seq: u64,
+}
+
+#[derive(Default)]
+struct RegistryInner {
+    buckets: HashMap<ActiveConnectionKey, WatchedConns>,
+    closed: HashMap<StableConnId, ClosedPipe>,
+    next_close_seq: u64,
+}
+
+impl RegistryInner {
+    fn prune_closed(&mut self, now: Instant) {
+        self.closed
+            .retain(|_, closed| now.saturating_duration_since(closed.closed_at) <= CLOSED_PIPE_TTL);
+        if self.closed.len() <= MAX_CLOSED_PIPES {
+            return;
+        }
+        let mut by_age: Vec<(StableConnId, u64)> = self
+            .closed
+            .iter()
+            .map(|(id, closed)| (*id, closed.seq))
+            .collect();
+        by_age.sort_by_key(|(_, seq)| *seq);
+        let overflow = self.closed.len() - MAX_CLOSED_PIPES;
+        for (id, _) in by_age.into_iter().take(overflow) {
+            self.closed.remove(&id);
+        }
+    }
+}
+
 /// Live connections, bucketed by the peer they authenticated as and the
-/// pipe they route over.
+/// pipe they route over, plus a short memory of the pipes that have
+/// already been closed.
 #[derive(Default)]
 pub struct ConnectionRegistry {
     next_id: AtomicU64,
-    inner: parking_lot::Mutex<HashMap<ActiveConnectionKey, WatchedConns>>,
+    inner: parking_lot::Mutex<RegistryInner>,
 }
 
 impl std::fmt::Debug for ConnectionRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.lock();
         f.debug_struct("ConnectionRegistry")
-            .field("buckets", &self.inner.lock().len())
+            .field("buckets", &inner.buckets.len())
+            .field("closed_pipes", &inner.closed.len())
             .finish()
     }
 }
@@ -110,6 +161,14 @@ impl std::fmt::Debug for ConnectionRegistry {
 impl ConnectionRegistry {
     /// Register a connection and return the watch id its `closed()`
     /// watcher must hand back to [`Self::remove_and_is_empty`].
+    ///
+    /// A handshake can complete on a pipe that is already gone: the pipe
+    /// worker may exit between `promote()` accepting the connection and
+    /// this call, in which case [`Self::close_pipe`] has already run and
+    /// found an empty bucket. Registration and teardown therefore agree
+    /// under one lock — a connection arriving on a closed pipe is not
+    /// registered at all, and is closed on the spot with the reason that
+    /// pipe was closed for.
     pub fn insert(
         &self,
         endpoint_id: EndpointId,
@@ -117,11 +176,31 @@ impl ConnectionRegistry {
         handle: Arc<dyn ConnHandle>,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.inner
-            .lock()
-            .entry((endpoint_id, stable_id))
-            .or_default()
-            .insert(id, handle);
+        let late = {
+            let mut inner = self.inner.lock();
+            inner.prune_closed(Instant::now());
+            match inner.closed.get(&stable_id).cloned() {
+                Some(closed) => Some(closed),
+                None => {
+                    inner
+                        .buckets
+                        .entry((endpoint_id, stable_id))
+                        .or_default()
+                        .insert(id, Arc::clone(&handle));
+                    None
+                }
+            }
+        };
+        // Close outside the lock, as `close_pipe` does.
+        if let Some(closed) = late
+            && handle.close_if_only_path(stable_id, closed.code, &closed.reason)
+        {
+            tracing::info!(
+                %endpoint_id,
+                pipe = %stable_id,
+                "closed an iroh connection that handshook on an already-dead BLE pipe"
+            );
+        }
         id
     }
 
@@ -135,12 +214,12 @@ impl ConnectionRegistry {
     ) -> bool {
         let mut inner = self.inner.lock();
         let key = (endpoint_id, stable_id);
-        let Some(ids) = inner.get_mut(&key) else {
+        let Some(ids) = inner.buckets.get_mut(&key) else {
             return true;
         };
         ids.remove(&watch_id);
         if ids.is_empty() {
-            inner.remove(&key);
+            inner.buckets.remove(&key);
             true
         } else {
             false
@@ -153,14 +232,31 @@ impl ConnectionRegistry {
     ///
     /// Entries are left in place — the `closed()` watcher the hook
     /// installed is the sole owner of removal, and closing here is what
-    /// makes it fire.
+    /// makes it fire. The pipe is also remembered as closed, so a
+    /// connection registered after this point (a handshake that raced
+    /// the pipe worker's exit) is closed by [`Self::insert`] rather than
+    /// stranded on a dead pipe.
     pub fn close_pipe(&self, pipe: StableConnId, code: VarInt, reason: &[u8]) -> usize {
         // Collect under the lock, close outside it: closing wakes the
         // watcher tasks, which come straight back here to remove
         // themselves.
         let handles: Vec<Arc<dyn ConnHandle>> = {
-            let inner = self.inner.lock();
+            let mut inner = self.inner.lock();
+            let now = Instant::now();
+            let seq = inner.next_close_seq;
+            inner.next_close_seq += 1;
+            inner.closed.insert(
+                pipe,
+                ClosedPipe {
+                    code,
+                    reason: reason.to_vec(),
+                    closed_at: now,
+                    seq,
+                },
+            );
+            inner.prune_closed(now);
             inner
+                .buckets
                 .iter()
                 .filter(|((_, id), _)| *id == pipe)
                 .flat_map(|(_, watches)| watches.values().cloned())
@@ -356,6 +452,73 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn a_connection_registered_after_its_pipe_closed_is_closed_at_once() {
+        // The pipe worker can exit between `promote()` accepting a
+        // handshake and the hook registering it, so `close_pipe` sees an
+        // empty bucket. Without the closed-pipe memory the connection
+        // would sit on a dead pipe with nothing left to close it — the
+        // original hanging read, one race narrower.
+        let registry = ConnectionRegistry::default();
+        let pipe = StableConnId::for_test(1);
+
+        assert_eq!(
+            registry.close_pipe(
+                pipe,
+                VarInt::from_u32(BLE_CLOSE_CODE_RETRY),
+                BLE_CLOSE_REASON_PIPE_CLOSED
+            ),
+            0,
+            "nothing registered yet"
+        );
+
+        let late = FakeConn::new();
+        let watch = registry.insert(endpoint(1), pipe, Arc::clone(&late) as Arc<dyn ConnHandle>);
+
+        assert_eq!(
+            late.closes(),
+            vec![(
+                u64::from(BLE_CLOSE_CODE_RETRY),
+                BLE_CLOSE_REASON_PIPE_CLOSED.to_vec()
+            )],
+            "the late registration is closed with the reason its pipe died for"
+        );
+        assert!(
+            registry.remove_and_is_empty(endpoint(1), pipe, watch),
+            "it is never added to the bucket, so its watcher reports empty"
+        );
+    }
+
+    #[test]
+    fn closing_one_pipe_does_not_taint_registrations_on_another() {
+        let registry = ConnectionRegistry::default();
+        let dead = StableConnId::for_test(1);
+        let live = StableConnId::for_test(2);
+        registry.close_pipe(
+            dead,
+            VarInt::from_u32(BLE_CLOSE_CODE_RETRY),
+            BLE_CLOSE_REASON_PIPE_CLOSED,
+        );
+
+        let conn = FakeConn::new();
+        registry.insert(endpoint(1), live, Arc::clone(&conn) as Arc<dyn ConnHandle>);
+
+        assert!(conn.closes().is_empty());
+    }
+
+    #[test]
+    fn closed_pipe_memory_stays_bounded() {
+        let registry = ConnectionRegistry::default();
+        for n in 0..(MAX_CLOSED_PIPES as u64 * 2) {
+            registry.close_pipe(
+                StableConnId::for_test(n),
+                VarInt::from_u32(BLE_CLOSE_CODE_RETRY),
+                BLE_CLOSE_REASON_PIPE_CLOSED,
+            );
+        }
+        assert!(registry.inner.lock().closed.len() <= MAX_CLOSED_PIPES);
     }
 
     #[test]
