@@ -539,7 +539,8 @@ impl BleTransport {
             Arc::clone(&empty_frames),
             Arc::clone(&store),
             Arc::clone(&routing),
-        );
+        )
+        .with_connections(Arc::clone(&connections));
 
         if l2cap_policy == L2capPolicy::PreferL2cap {
             match construct_step("l2cap_listener", async {
