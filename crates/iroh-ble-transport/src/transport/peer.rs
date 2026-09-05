@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::task::Waker;
 use std::time::Instant;
 
-use blew::{BleDevice, DeviceId, DisconnectCause, L2capChannel};
+use blew::{DeviceId, DisconnectCause, L2capChannel};
 use bytes::Bytes;
 
 pub const KEY_PREFIX_LEN: usize = 12;
@@ -270,7 +270,7 @@ pub struct ChannelHandle {
 pub enum PeerCommand {
     Advertised {
         prefix: KeyPrefix,
-        device: BleDevice,
+        device_id: DeviceId,
         rssi: Option<i16>,
     },
     CentralConnected {

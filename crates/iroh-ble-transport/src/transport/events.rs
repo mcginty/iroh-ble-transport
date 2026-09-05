@@ -92,7 +92,7 @@ pub async fn run_central_events(
                 }
                 PeerCommand::Advertised {
                     prefix,
-                    device,
+                    device_id: device.id,
                     rssi,
                 }
             }

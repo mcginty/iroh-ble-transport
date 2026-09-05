@@ -86,9 +86,9 @@ impl Registry {
         match cmd {
             PeerCommand::Advertised {
                 prefix,
-                device,
+                device_id,
                 rssi,
-            } => self.handle_advertised(&mut actions, now, prefix, device, rssi),
+            } => self.handle_advertised(&mut actions, now, prefix, device_id, rssi),
             PeerCommand::SendDatagram {
                 device_id,
                 target_endpoint,
@@ -417,11 +417,10 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         prefix: crate::transport::peer::KeyPrefix,
-        device: blew::BleDevice,
+        device_id: blew::DeviceId,
         rssi: Option<i16>,
     ) {
         let _ = rssi;
-        let device_id = device.id.clone();
 
         let mut has_verified_live = false;
         let mut verified_before = false;
@@ -2150,12 +2149,7 @@ mod tests {
                         let endpoint = iroh_base::SecretKey::from_bytes(&[endpoint_seed; 32]).public();
                         reg.handle(PeerCommand::Advertised {
                             prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
-                            device: blew::BleDevice {
-                                id: device_id.clone(),
-                                name: None,
-                                rssi: None,
-                                services: vec![],
-                            },
+                            device_id: device_id.clone(),
                             rssi: None,
                         })
                     }
@@ -2309,12 +2303,7 @@ mod tests {
                         let endpoint = endpoint_from_seed(endpoint_seed);
                         reg.handle(PeerCommand::Advertised {
                             prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
-                            device: blew::BleDevice {
-                                id: device_id,
-                                name: None,
-                                rssi: None,
-                                services: vec![],
-                            },
+                            device_id,
                             rssi: None,
                         })
                     }
@@ -2459,38 +2448,28 @@ mod tests {
     #[test]
     fn advertised_new_peer_creates_discovered_entry() {
         let mut reg = Registry::new_for_test();
-        let device = blew::BleDevice {
-            id: blew::DeviceId::from("dev-1"),
-            name: None,
-            rssi: Some(-60),
-            services: vec![],
-        };
+        let device_id = blew::DeviceId::from("dev-1");
         let actions = reg.handle(PeerCommand::Advertised {
             prefix: [1u8; 12],
-            device: device.clone(),
+            device_id: device_id.clone(),
             rssi: Some(-60),
         });
         assert!(actions.is_empty(), "no actions for first advertisement");
-        let entry = reg.peer(&device.id).unwrap();
+        let entry = reg.peer(&device_id).unwrap();
         assert!(matches!(entry.phase, PeerPhase::Discovered { .. }));
-        assert_eq!(entry.device_id, device.id);
+        assert_eq!(entry.device_id, device_id);
     }
 
     #[test]
     fn advertised_duplicate_in_connecting_is_noop() {
         let mut reg = Registry::new_for_test();
-        let device = blew::BleDevice {
-            id: blew::DeviceId::from("dev-2"),
-            name: None,
-            rssi: None,
-            services: vec![],
-        };
+        let device_id = blew::DeviceId::from("dev-2");
         reg.handle(PeerCommand::Advertised {
             prefix: [2u8; 12],
-            device: device.clone(),
+            device_id: device_id.clone(),
             rssi: None,
         });
-        if let Some(entry) = reg.peers.get_mut(&device.id) {
+        if let Some(entry) = reg.peers.get_mut(&device_id) {
             entry.phase = PeerPhase::Connecting {
                 attempt: 0,
                 started: std::time::Instant::now(),
@@ -2499,12 +2478,12 @@ mod tests {
         }
         let actions = reg.handle(PeerCommand::Advertised {
             prefix: [2u8; 12],
-            device: device.clone(),
+            device_id: device_id.clone(),
             rssi: None,
         });
         assert!(actions.is_empty());
         assert!(matches!(
-            reg.peer(&device.id).unwrap().phase,
+            reg.peer(&device_id).unwrap().phase,
             PeerPhase::Connecting { .. }
         ));
     }
@@ -3075,12 +3054,7 @@ mod tests {
         let device_id = blew::DeviceId::from("dev-3");
         reg.handle(PeerCommand::Advertised {
             prefix: [3u8; 12],
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         });
         let actions = reg.handle(PeerCommand::SendDatagram {
@@ -3108,12 +3082,7 @@ mod tests {
         let endpoint = iroh_base::SecretKey::from_bytes(&[0x5Au8; 32]).public();
         reg.handle(PeerCommand::Advertised {
             prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         });
 
@@ -3153,12 +3122,7 @@ mod tests {
         let endpoint = iroh_base::SecretKey::from_bytes(&[0x61u8; 32]).public();
         reg.handle(PeerCommand::Advertised {
             prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         });
 
@@ -3219,12 +3183,7 @@ mod tests {
         let endpoint = iroh_base::SecretKey::from_bytes(&[0x62u8; 32]).public();
         reg.handle(PeerCommand::Advertised {
             prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         });
 
@@ -3276,12 +3235,7 @@ mod tests {
         let endpoint = iroh_base::SecretKey::from_bytes(&[0x63u8; 32]).public();
         reg.handle(PeerCommand::Advertised {
             prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         });
 
@@ -3335,12 +3289,7 @@ mod tests {
         let endpoint = iroh_base::SecretKey::from_bytes(&[0x64u8; 32]).public();
         reg.handle(PeerCommand::Advertised {
             prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         });
         let _ = reg.handle(PeerCommand::SendDatagram {
@@ -3586,12 +3535,7 @@ mod tests {
     fn advertise(reg: &mut Registry, device_id: &DeviceId, prefix: [u8; 12]) -> Vec<PeerAction> {
         reg.handle(PeerCommand::Advertised {
             prefix,
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         })
     }
@@ -4187,12 +4131,7 @@ mod tests {
         let device_id = blew::DeviceId::from("dev-30");
         reg.handle(PeerCommand::Advertised {
             prefix: [30u8; 12],
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         });
         assert_eq!(
@@ -6015,19 +5954,14 @@ mod tests {
     #[test]
     fn advertised_records_prefix_on_peer_entry() {
         let mut reg = Registry::new_for_test();
-        let device = blew::BleDevice {
-            id: blew::DeviceId::from("dev-prefix"),
-            name: None,
-            rssi: None,
-            services: vec![],
-        };
+        let device_id = blew::DeviceId::from("dev-prefix");
         let prefix: crate::transport::peer::KeyPrefix = [0xAB; 12];
         reg.handle(PeerCommand::Advertised {
             prefix,
-            device: device.clone(),
+            device_id: device_id.clone(),
             rssi: None,
         });
-        assert_eq!(reg.peer(&device.id).unwrap().prefix, Some(prefix));
+        assert_eq!(reg.peer(&device_id).unwrap().prefix, Some(prefix));
     }
 
     #[test]
@@ -6276,12 +6210,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::Advertised {
             prefix,
-            device: blew::BleDevice {
-                id: new_dev.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: new_dev.clone(),
             rssi: None,
         });
 
@@ -6330,12 +6259,7 @@ mod tests {
         assert!(before_phase_disc);
         let _ = reg.handle(PeerCommand::Advertised {
             prefix,
-            device: blew::BleDevice {
-                id: alive_dev.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: alive_dev.clone(),
             rssi: None,
         });
         let after = &reg.peers[&alive_dev];
@@ -6366,12 +6290,7 @@ mod tests {
 
         let _ = reg.handle(PeerCommand::Advertised {
             prefix,
-            device: blew::BleDevice {
-                id: dev_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: dev_id.clone(),
             rssi: None,
         });
 
@@ -6392,12 +6311,7 @@ mod tests {
 
         let _ = reg.handle(PeerCommand::Advertised {
             prefix,
-            device: blew::BleDevice {
-                id: dev_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: dev_id.clone(),
             rssi: None,
         });
 
@@ -6443,12 +6357,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::Advertised {
             prefix: peer_prefix,
-            device: blew::BleDevice {
-                id: peer_dev.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: peer_dev.clone(),
             rssi: None,
         });
 
@@ -6499,12 +6408,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::Advertised {
             prefix: peer_prefix,
-            device: blew::BleDevice {
-                id: peer_dev.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: peer_dev.clone(),
             rssi: None,
         });
 
@@ -6556,12 +6460,7 @@ mod tests {
 
         let _ = reg.handle(PeerCommand::Advertised {
             prefix: peer_prefix,
-            device: blew::BleDevice {
-                id: peer_dev.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: peer_dev.clone(),
             rssi: None,
         });
         let deadline = match reg.peers[&peer_dev].phase {
@@ -6612,12 +6511,7 @@ mod tests {
             });
         let _ = reg.handle(PeerCommand::Advertised {
             prefix: peer_prefix,
-            device: blew::BleDevice {
-                id: pending_dev.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: pending_dev.clone(),
             rssi: None,
         });
         assert!(matches!(

@@ -1,12 +1,14 @@
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use blew::DeviceId;
 use iroh::endpoint::{AfterHandshakeOutcome, Connection, EndpointHooks, VarInt};
 use iroh_base::{EndpointId, TransportAddr};
 use tokio::sync::mpsc;
 
+use crate::transport::conns::{
+    BLE_CLOSE_CODE_CONFLICT, BLE_CLOSE_REASON_CONFLICT, ConnHandle, ConnectionRegistry,
+    close_evicted_pipes,
+};
 use crate::transport::routing::parse_token_addr;
 use crate::transport::routing::{PromoteOutcome, Routing, StableConnId};
 use crate::transport::transport::BLE_TRANSPORT_ID;
@@ -64,7 +66,7 @@ pub struct BleDedupHook {
     self_endpoint: EndpointId,
     routing: Arc<Routing>,
     tx: mpsc::UnboundedSender<HookEvent>,
-    active_connections: Arc<ActiveConnections>,
+    connections: Arc<ConnectionRegistry>,
 }
 
 impl BleDedupHook {
@@ -73,52 +75,13 @@ impl BleDedupHook {
         self_endpoint: EndpointId,
         routing: Arc<Routing>,
         tx: mpsc::UnboundedSender<HookEvent>,
+        connections: Arc<ConnectionRegistry>,
     ) -> Self {
         Self {
             self_endpoint,
             routing,
             tx,
-            active_connections: Arc::new(ActiveConnections::default()),
-        }
-    }
-}
-
-type ActiveConnectionKey = (EndpointId, StableConnId);
-
-#[derive(Debug, Default)]
-struct ActiveConnections {
-    next_id: AtomicU64,
-    inner: parking_lot::Mutex<HashMap<ActiveConnectionKey, HashSet<u64>>>,
-}
-
-impl ActiveConnections {
-    fn insert(&self, endpoint_id: EndpointId, stable_id: StableConnId) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        self.inner
-            .lock()
-            .entry((endpoint_id, stable_id))
-            .or_default()
-            .insert(id);
-        id
-    }
-
-    fn remove_and_is_empty(
-        &self,
-        endpoint_id: EndpointId,
-        stable_id: StableConnId,
-        watch_id: u64,
-    ) -> bool {
-        let mut inner = self.inner.lock();
-        let key = (endpoint_id, stable_id);
-        let Some(ids) = inner.get_mut(&key) else {
-            return true;
-        };
-        ids.remove(&watch_id);
-        if ids.is_empty() {
-            inner.remove(&key);
-            true
-        } else {
-            false
+            connections,
         }
     }
 }
@@ -164,8 +127,8 @@ impl EndpointHooks for BleDedupHook {
                         evicted_devices: Vec::new(),
                     });
                     return AfterHandshakeOutcome::Reject {
-                        error_code: VarInt::from_u32(0),
-                        reason: b"ble_conflict".to_vec(),
+                        error_code: VarInt::from_u32(BLE_CLOSE_CODE_CONFLICT),
+                        reason: BLE_CLOSE_REASON_CONFLICT.to_vec(),
                     };
                 }
                 PromoteOutcome::Accepted { evicted } => {
@@ -186,7 +149,16 @@ impl EndpointHooks for BleDedupHook {
                         evicted_devices = evicted_devices.len(),
                         "BleDedupHook: promoted to routable"
                     );
-                    let watch_id = self.active_connections.insert(remote_endpoint, stable_id);
+                    // Close the connections riding the evicted pipes
+                    // before the BLE teardown the forwarder kicks off
+                    // below: the pipe under them is about to disappear,
+                    // and iroh has no way to observe that.
+                    close_evicted_pipes(&self.connections, &evicted);
+                    let watch_id = self.connections.insert(
+                        remote_endpoint,
+                        stable_id,
+                        Arc::new(conn.weak_handle()) as Arc<dyn ConnHandle>,
+                    );
                     close_watch = Some((stable_id, watch_id));
                 }
             }
@@ -205,10 +177,10 @@ impl EndpointHooks for BleDedupHook {
             // keeps it alive and disables close-on-drop for its real owner.
             let closed = conn.weak_handle().closed();
             let tx = self.tx.clone();
-            let active_connections = Arc::clone(&self.active_connections);
+            let connections = Arc::clone(&self.connections);
             tokio::spawn(async move {
                 let _ = closed.await;
-                if active_connections.remove_and_is_empty(remote_endpoint, stable_id, watch_id) {
+                if connections.remove_and_is_empty(remote_endpoint, stable_id, watch_id) {
                     let _ = tx.send(HookEvent::ConnectionClosed {
                         endpoint_id: remote_endpoint,
                         stable_id,
@@ -217,49 +189,5 @@ impl EndpointHooks for BleDedupHook {
             });
         }
         AfterHandshakeOutcome::Accept
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn endpoint(seed: u8) -> EndpointId {
-        iroh_base::SecretKey::from_bytes(&[seed; 32]).public()
-    }
-
-    #[test]
-    fn active_connections_only_reports_empty_after_last_watch_is_removed() {
-        let active = ActiveConnections::default();
-        let endpoint_id = endpoint(1);
-        let stable_id = StableConnId::for_test(7);
-
-        let first = active.insert(endpoint_id, stable_id);
-        let second = active.insert(endpoint_id, stable_id);
-
-        assert!(
-            !active.remove_and_is_empty(endpoint_id, stable_id, first),
-            "first close must not report empty while another connection is active"
-        );
-        assert!(
-            active.remove_and_is_empty(endpoint_id, stable_id, second),
-            "last close reports the peer/stable-id bucket empty"
-        );
-    }
-
-    #[test]
-    fn active_connections_buckets_by_stable_id() {
-        let active = ActiveConnections::default();
-        let endpoint_id = endpoint(2);
-        let old_id = StableConnId::for_test(8);
-        let new_id = StableConnId::for_test(9);
-
-        let old_watch = active.insert(endpoint_id, old_id);
-        let _new_watch = active.insert(endpoint_id, new_id);
-
-        assert!(
-            active.remove_and_is_empty(endpoint_id, old_id, old_watch),
-            "old stable-id bucket is empty even if replacement stable-id has an active connection"
-        );
     }
 }

@@ -505,9 +505,9 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.3.0"
+version = "0.4.0-beta.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fc26017c8941f033a5555555e12a69cfd7c6eb0353c5bc012eb3cabaa8e5490"
+checksum = "d38b8b4db9c6a804d3a83e806fb30dab64f61f5d1110748967e6daf1dcaacac1"
 dependencies = [
  "bitflags 2.13.1",
  "bluer",
@@ -518,6 +518,7 @@ dependencies = [
  "ndk-context",
  "objc2",
  "objc2-core-bluetooth",
+ "objc2-core-foundation",
  "objc2-foundation",
  "parking_lot",
  "serde_json",
@@ -6299,9 +6300,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.3.1"
+version = "0.4.0-beta.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb38668d67fdcb3922eaa47210030be265f7c39ed47cd5f50f551423e04da8b3"
+checksum = "d92355c06894b718340114feee779ad7930183be984b6eea14e5291c6d283dbd"
 dependencies = [
  "blew",
  "jni 0.22.4",

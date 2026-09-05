@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::task::Waker;
 
 use arc_swap::ArcSwap;
-use blew::{BleDevice, DeviceId};
+use blew::DeviceId;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
@@ -31,15 +31,6 @@ fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
     )
-}
-
-fn ble_device(id: &DeviceId) -> BleDevice {
-    BleDevice {
-        id: id.clone(),
-        name: None,
-        rssi: None,
-        services: vec![],
-    }
 }
 
 fn waker_from_channel(tx: mpsc::Sender<()>) -> std::task::Waker {
@@ -217,7 +208,7 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     a.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_b,
-            device: ble_device(&dev_b),
+            device_id: dev_b.clone(),
             rssi: None,
         })
         .await
@@ -241,7 +232,7 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     b.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_a,
-            device: ble_device(&dev_a),
+            device_id: dev_a.clone(),
             rssi: None,
         })
         .await
@@ -384,7 +375,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
     a.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_b,
-            device: ble_device(&dev_b),
+            device_id: dev_b.clone(),
             rssi: None,
         })
         .await
@@ -457,7 +448,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
         a.inbox_tx
             .send(PeerCommand::Advertised {
                 prefix: prefix_b,
-                device: ble_device(&dev_b),
+                device_id: dev_b.clone(),
                 rssi: None,
             })
             .await
@@ -543,7 +534,7 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
     node.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_peer,
-            device: ble_device(&dev_peer),
+            device_id: dev_peer.clone(),
             rssi: None,
         })
         .await
@@ -683,5 +674,66 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
     assert!(
         peer_state.l2cap_upgrade_failed,
         "l2cap_upgrade_failed must be true after handover timeout"
+    );
+}
+
+/// Issue #17: when the promotion rule evicts a pipe, the iroh
+/// connections riding it must be closed. Their only path is about to
+/// disappear and iroh cannot observe that — a `CustomEndpoint` has no
+/// way to report a path as dead — so an application blocked on a read
+/// would otherwise hang until its own deadline fired.
+#[test]
+fn evicting_a_pipe_closes_the_iroh_connections_riding_it() {
+    use iroh_ble_transport::transport::conns::{
+        BLE_CLOSE_CODE_RETRY, BLE_CLOSE_REASON_EVICTED, ConnHandle, ConnectionRegistry,
+        RecordingConn, close_evicted_pipes,
+    };
+    use iroh_ble_transport::transport::routing::{Direction, PromoteOutcome, Routing};
+
+    let routing = Routing::new();
+    let connections = ConnectionRegistry::default();
+    let me = endpoint_with_byte(0xFF);
+    let peer = endpoint_with_byte(0x01);
+
+    // The peer's first MAC: we dialed it, it handshook, it is routable.
+    let first = routing.register_pipe(DeviceId::from("73:EA:12:0E:B6:16"), Direction::Outbound);
+    routing.register_pending(first, Some(peer));
+    assert!(matches!(
+        routing.promote(first, &me, peer),
+        PromoteOutcome::Accepted { .. }
+    ));
+
+    // An application connection is live on that pipe...
+    let stale = RecordingConn::new();
+    connections.insert(peer, first, Arc::clone(&stale) as Arc<dyn ConnHandle>);
+
+    // ...when the same peer, having rotated its MAC, handshakes again.
+    let second = routing.register_pipe(DeviceId::from("49:73:AA:8F:3A:78"), Direction::Outbound);
+    routing.register_pending(second, Some(peer));
+    let PromoteOutcome::Accepted { evicted } = routing.promote(second, &me, peer) else {
+        panic!("a fresh handshake from the same peer must win");
+    };
+    assert_eq!(evicted, vec![first], "the old pipe is the one evicted");
+
+    let survivor = RecordingConn::new();
+    connections.insert(peer, second, Arc::clone(&survivor) as Arc<dyn ConnHandle>);
+
+    assert_eq!(close_evicted_pipes(&connections, &evicted), 1);
+    assert_eq!(
+        stale.closes(),
+        vec![(
+            u64::from(BLE_CLOSE_CODE_RETRY),
+            BLE_CLOSE_REASON_EVICTED.to_vec()
+        )],
+        "the connection on the evicted pipe is closed as retryable"
+    );
+    assert!(
+        survivor.closes().is_empty(),
+        "the connection on the winning pipe is untouched"
+    );
+    assert_eq!(
+        routing.routable_pipe_for(&peer),
+        Some(second),
+        "the surviving pipe is already routable, so a redial lands on it"
     );
 }

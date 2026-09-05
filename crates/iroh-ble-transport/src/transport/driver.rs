@@ -129,6 +129,11 @@ pub struct Driver<I: BleInterface> {
     /// pipe open (or reuses a reservation's id) and evicts on pipe
     /// close. `poll_send` and `poll_recv` both resolve via this.
     routing: Arc<crate::transport::routing::Routing>,
+    /// Live iroh connections indexed by pipe. Closed when their pipe
+    /// dies — iroh cannot observe that on its own. Defaults to an empty
+    /// registry so tests that build a `Driver` directly need not supply
+    /// one; the real transport installs its own via `with_connections`.
+    connections: Arc<crate::transport::conns::ConnectionRegistry>,
 }
 
 impl<I: BleInterface> Driver<I> {
@@ -152,7 +157,19 @@ impl<I: BleInterface> Driver<I> {
             empty_frames_counter,
             store,
             routing,
+            connections: Arc::new(crate::transport::conns::ConnectionRegistry::default()),
         }
+    }
+
+    /// Install the transport's connection registry. Separate from `new`
+    /// so the many test call sites don't all have to pass one.
+    #[must_use]
+    pub fn with_connections(
+        mut self,
+        connections: Arc<crate::transport::conns::ConnectionRegistry>,
+    ) -> Self {
+        self.connections = connections;
+        self
     }
 
     pub async fn execute(&self, action: PeerAction) {
@@ -312,6 +329,7 @@ impl<I: BleInterface> Driver<I> {
                 // across the dial — only outbound pipes match
                 // reservations (inbound accepts have no resolver).
                 let routing = Arc::clone(&self.routing);
+                let connections = Arc::clone(&self.connections);
                 let direction = direction_for_role(role);
                 let (stable_id, reservation_endpoint) = match target_endpoint
                     .and_then(|endpoint| routing.consume_reservation_for_endpoint(&endpoint))
@@ -356,6 +374,27 @@ impl<I: BleInterface> Driver<I> {
                     // Drop the pool entry before the pipe itself so
                     // the pool never references a non-existent pipe.
                     routing.evict_pipe_state(stable_id);
+                    // The pipe is gone and iroh has no way to learn that:
+                    // a connection whose only path was this pipe would
+                    // otherwise sit there until the application's own
+                    // deadline. Close after `evict_pipe_state` so the
+                    // `ConnectionClosed` events these closes provoke find
+                    // no routable entry and don't loop back as a fresh
+                    // `Stalled` for a pipe that is already dead.
+                    let closed = connections.close_pipe(
+                        stable_id,
+                        iroh::endpoint::VarInt::from_u32(
+                            crate::transport::conns::BLE_CLOSE_CODE_RETRY,
+                        ),
+                        crate::transport::conns::BLE_CLOSE_REASON_PIPE_CLOSED,
+                    );
+                    if closed > 0 {
+                        tracing::info!(
+                            %stable_id,
+                            closed,
+                            "closed iroh connections riding a BLE pipe that went away"
+                        );
+                    }
                     routing.evict_pipe(stable_id);
                 });
                 let ready = PeerCommand::DataPipeReady {
@@ -877,6 +916,88 @@ mod tests {
             }
             other => panic!("expected DataPipeReady, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn pipe_exit_closes_the_iroh_connections_riding_that_pipe() {
+        // A pipe going away is invisible to iroh: it cannot report a
+        // path as dead, and it never migrates an existing Connection
+        // onto a newly resolved CustomAddr. Left alone, a connection
+        // whose only path was this pipe sits there until the
+        // application's own deadline fires.
+        use crate::transport::conns::{
+            BLE_CLOSE_CODE_RETRY, BLE_CLOSE_REASON_PIPE_CLOSED, ConnHandle, ConnectionRegistry,
+            RecordingConn,
+        };
+        use crate::transport::peer::{ConnectPath, ConnectRole};
+
+        let iface = Arc::new(MockBleInterface::new());
+        let (tx, mut rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let routing = Arc::new(crate::transport::routing::Routing::new());
+        let connections = Arc::new(ConnectionRegistry::default());
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::clone(&routing),
+        )
+        .with_connections(Arc::clone(&connections));
+
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: blew::DeviceId::from("dying-pipe"),
+                tx_gen: 1,
+                role: ConnectRole::Central,
+                target_endpoint: None,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let pipes = routing.pipes_for_debug();
+        assert_eq!(pipes.len(), 1);
+        let stable_id = pipes[0].id;
+
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x59u8; 32]).public();
+        let conn = RecordingConn::new();
+        connections.insert(
+            endpoint,
+            stable_id,
+            Arc::clone(&conn) as Arc<dyn ConnHandle>,
+        );
+
+        // Dropping DataPipeReady drops the outbound sender, which is how
+        // the registry signals a pipe is done: the supervisor exits.
+        drop(ready);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while conn.closes().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("pipe exit must close the connections riding it");
+
+        assert_eq!(
+            conn.closes(),
+            vec![(
+                u64::from(BLE_CLOSE_CODE_RETRY),
+                BLE_CLOSE_REASON_PIPE_CLOSED.to_vec()
+            )]
+        );
+        assert!(
+            routing.pipes_for_debug().is_empty(),
+            "the pipe is evicted from routing as before"
+        );
     }
 
     #[tokio::test]
