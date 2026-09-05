@@ -10,7 +10,7 @@ use std::time::Duration;
 use std::task::Waker;
 
 use arc_swap::ArcSwap;
-use blew::{BleDevice, DeviceId};
+use blew::DeviceId;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
@@ -31,15 +31,6 @@ fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
         Arc::new(AtomicU64::new(0)),
         Arc::new(AtomicU64::new(0)),
     )
-}
-
-fn ble_device(id: &DeviceId) -> BleDevice {
-    BleDevice {
-        id: id.clone(),
-        name: None,
-        rssi: None,
-        services: vec![],
-    }
 }
 
 fn waker_from_channel(tx: mpsc::Sender<()>) -> std::task::Waker {
@@ -217,7 +208,7 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     a.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_b,
-            device: ble_device(&dev_b),
+            device_id: dev_b.clone(),
             rssi: None,
         })
         .await
@@ -241,7 +232,7 @@ async fn symmetric_dial_resolves_to_one_pipe_per_side() {
     b.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_a,
-            device: ble_device(&dev_a),
+            device_id: dev_a.clone(),
             rssi: None,
         })
         .await
@@ -384,7 +375,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
     a.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_b,
-            device: ble_device(&dev_b),
+            device_id: dev_b.clone(),
             rssi: None,
         })
         .await
@@ -457,7 +448,7 @@ async fn advertising_flood_does_not_redial_after_verified() {
         a.inbox_tx
             .send(PeerCommand::Advertised {
                 prefix: prefix_b,
-                device: ble_device(&dev_b),
+                device_id: dev_b.clone(),
                 rssi: None,
             })
             .await
@@ -543,7 +534,7 @@ async fn l2cap_handover_timeout_reverts_to_gatt() {
     node.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_peer,
-            device: ble_device(&dev_peer),
+            device_id: dev_peer.clone(),
             rssi: None,
         })
         .await

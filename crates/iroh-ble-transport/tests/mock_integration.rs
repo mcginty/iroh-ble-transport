@@ -94,12 +94,7 @@ async fn mid_session_disconnect_drains_and_closes_channel() {
     let prefix: KeyPrefix = [2u8; KEY_PREFIX_LEN];
     tx.send(PeerCommand::Advertised {
         prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
+        device_id: device_id.clone(),
         rssi: None,
     })
     .await
@@ -206,12 +201,7 @@ async fn local_teardown_lets_the_peer_be_redialed_immediately() {
     let prefix: KeyPrefix = [7u8; KEY_PREFIX_LEN];
     let advertise = || PeerCommand::Advertised {
         prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
+        device_id: device_id.clone(),
         rssi: None,
     };
     let (waker_tx, _waker_rx) = mpsc::channel::<()>(4);
@@ -325,12 +315,7 @@ async fn adapter_toggle_reconnects_all_peers_with_single_purge() {
         let device_id = blew::DeviceId::from(format!("dev-{i}").as_str());
         tx.send(PeerCommand::Advertised {
             prefix,
-            device: blew::BleDevice {
-                id: device_id.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: device_id.clone(),
             rssi: None,
         })
         .await
@@ -472,12 +457,7 @@ async fn version_mismatch_deads_peer_and_closes_channel() {
     let prefix: KeyPrefix = [0x77; KEY_PREFIX_LEN];
     tx.send(PeerCommand::Advertised {
         prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
+        device_id: device_id.clone(),
         rssi: None,
     })
     .await
@@ -570,12 +550,7 @@ async fn version_match_lets_data_pipe_start() {
     let prefix: KeyPrefix = [0x78; KEY_PREFIX_LEN];
     tx.send(PeerCommand::Advertised {
         prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
+        device_id: device_id.clone(),
         rssi: None,
     })
     .await
@@ -671,12 +646,7 @@ async fn mock_fabric_handles_bidirectional_traffic() {
     central_inbox_tx
         .send(PeerCommand::Advertised {
             prefix,
-            device: blew::BleDevice {
-                id: fabric.peripheral_as_device.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: fabric.peripheral_as_device.clone(),
             rssi: None,
         })
         .await
@@ -814,12 +784,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     let prefix: KeyPrefix = [7u8; KEY_PREFIX_LEN];
     tx.send(PeerCommand::Advertised {
         prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
+        device_id: device_id.clone(),
         rssi: None,
     })
     .await
@@ -865,12 +830,7 @@ async fn forget_then_gc_then_rediscover_creates_fresh_peer() {
     // get blocked by any stale state.
     tx.send(PeerCommand::Advertised {
         prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
+        device_id: device_id.clone(),
         rssi: None,
     })
     .await
@@ -939,12 +899,7 @@ async fn connect_failure_retries_on_next_tick() {
     let prefix: KeyPrefix = [9u8; KEY_PREFIX_LEN];
     tx.send(PeerCommand::Advertised {
         prefix,
-        device: blew::BleDevice {
-            id: device_id.clone(),
-            name: None,
-            rssi: None,
-            services: vec![],
-        },
+        device_id: device_id.clone(),
         rssi: None,
     })
     .await

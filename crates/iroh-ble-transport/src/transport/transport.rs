@@ -1869,12 +1869,7 @@ mod tests {
         let mut reg = Registry::new_for_test();
         reg.handle(PeerCommand::Advertised {
             prefix,
-            device: blew::BleDevice {
-                id: old_device.clone(),
-                name: None,
-                rssi: None,
-                services: vec![],
-            },
+            device_id: old_device.clone(),
             rssi: None,
         });
 

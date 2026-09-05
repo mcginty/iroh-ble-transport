@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicU64;
 use std::task::Waker;
 
 use arc_swap::ArcSwap;
-use blew::{BleDevice, DeviceId};
+use blew::DeviceId;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
@@ -34,15 +34,6 @@ fn zero_counters() -> (Arc<AtomicU64>, Arc<AtomicU64>, Arc<AtomicU64>) {
 
 fn prefix_for(byte: u8) -> KeyPrefix {
     [byte; KEY_PREFIX_LEN]
-}
-
-fn ble_device(id: &DeviceId) -> BleDevice {
-    BleDevice {
-        id: id.clone(),
-        name: None,
-        rssi: None,
-        services: vec![],
-    }
 }
 
 fn waker_from_channel(tx: mpsc::Sender<()>) -> std::task::Waker {
@@ -108,7 +99,7 @@ async fn triangle_send_fans_out_to_both_peers() {
     a.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_for(0xB1),
-            device: ble_device(&b.device_id),
+            device_id: b.device_id.clone(),
             rssi: None,
         })
         .await
@@ -116,7 +107,7 @@ async fn triangle_send_fans_out_to_both_peers() {
     a.inbox_tx
         .send(PeerCommand::Advertised {
             prefix: prefix_for(0xC1),
-            device: ble_device(&c.device_id),
+            device_id: c.device_id.clone(),
             rssi: None,
         })
         .await
@@ -182,7 +173,7 @@ async fn symmetric_connect_converges_to_one_channel() {
             a.inbox_tx
                 .send(PeerCommand::Advertised {
                     prefix: prefix_for(0xB1),
-                    device: ble_device(&b.device_id),
+                    device_id: b.device_id.clone(),
                     rssi: None,
                 })
                 .await
@@ -202,7 +193,7 @@ async fn symmetric_connect_converges_to_one_channel() {
             b.inbox_tx
                 .send(PeerCommand::Advertised {
                     prefix: prefix_for(0xA1),
-                    device: ble_device(&a.device_id),
+                    device_id: a.device_id.clone(),
                     rssi: None,
                 })
                 .await
@@ -272,7 +263,7 @@ async fn one_peer_flapping_does_not_disturb_others() {
         a.inbox_tx
             .send(PeerCommand::Advertised {
                 prefix: prefix_for(prefix_byte),
-                device: ble_device(peer),
+                device_id: peer.clone(),
                 rssi: None,
             })
             .await
@@ -386,7 +377,7 @@ async fn adapter_off_on_one_node_does_not_evict_others() {
         from_inbox
             .send(PeerCommand::Advertised {
                 prefix: prefix_for(prefix_byte),
-                device: ble_device(peer),
+                device_id: peer.clone(),
                 rssi: None,
             })
             .await
