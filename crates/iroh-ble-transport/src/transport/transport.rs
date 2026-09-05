@@ -267,6 +267,10 @@ pub struct BleTransport {
     /// and the per-endpoint waker set. Exposed via
     /// `routing_snapshot()` for telemetry.
     routing: Arc<crate::transport::routing::Routing>,
+    /// Live iroh connections, indexed by the BLE pipe they route over.
+    /// The hook populates it; the hook (on dedup eviction) and the
+    /// driver (on pipe death) close through it.
+    connections: Arc<crate::transport::conns::ConnectionRegistry>,
     tx_bytes: Arc<AtomicU64>,
     rx_bytes: Arc<AtomicU64>,
     retransmits: Arc<AtomicU64>,
@@ -525,6 +529,7 @@ impl BleTransport {
             inbox_tx.clone(),
         ));
         let routing = Arc::new(crate::transport::routing::Routing::new());
+        let connections = Arc::new(crate::transport::conns::ConnectionRegistry::default());
         let driver = Driver::new(
             iface,
             inbox_tx.clone(),
@@ -614,6 +619,7 @@ impl BleTransport {
             },
             incoming_rx: tokio::sync::Mutex::new(Some(incoming_rx)),
             routing,
+            connections,
             tx_bytes,
             rx_bytes,
             retransmits,
@@ -644,6 +650,7 @@ impl BleTransport {
             self.local_id,
             Arc::clone(&self.routing),
             self.hook_tx.clone(),
+            Arc::clone(&self.connections),
         )
     }
 

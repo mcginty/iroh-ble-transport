@@ -89,6 +89,7 @@ crates/iroh-ble-transport/src/
     ├── registry.rs          # Pure state machine (PeerEntry/PeerPhase) + actor loop
     ├── peer.rs              # PeerEntry, PeerPhase, PeerCommand, PeerAction, ChannelHandle
     ├── routing.rs           # TransportRouting: Token ↔ peer-identity, KeyPrefix → DeviceId
+    ├── conns.rs             # Live iroh connections indexed by pipe; closed when their pipe dies
     ├── events.rs            # blew event pumps (run_central_events, run_peripheral_events)
     ├── pipe.rs              # Per-peer data pipe: ReliableChannel ↔ inbox/outbox channels
     ├── reliable.rs          # Selective-Repeat ARQ sliding-window protocol + fragment canary
