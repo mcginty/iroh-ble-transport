@@ -1,7 +1,7 @@
 //! Action executor. Translates `PeerAction` into `BleInterface` calls and follow-up `PeerCommand`s on success/failure.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicU64, AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::mpsc;
@@ -117,6 +117,55 @@ fn log_peer_metric(metric: &str) {
     }
 }
 
+type LaneJob = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// What abandoning a device does to a job on its lane.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cancellation {
+    /// Runs whatever else happens. Cleanup (disconnect, refresh) has to,
+    /// because the very thing that abandons a device is usually the decision
+    /// to tear it down.
+    Never,
+    /// Skipped while still queued; once started it runs to completion. Used
+    /// for connect, where unwinding mid-flight would leave the platform's
+    /// GATT client in a state we can't reason about — the result is rejected
+    /// by generation instead.
+    WhileQueued,
+    /// Unwound as soon as the device is abandoned. Used for work that is
+    /// already bounded and safe to drop (the VERSION read, the L2CAP open).
+    Immediate,
+}
+
+/// Serialized native-connection work for one device.
+///
+/// Connect, disconnect, refresh, the VERSION read and the L2CAP open all
+/// queue here and run one at a time in dispatch order. That ordering is what
+/// makes a teardown finish before the retry that reuses the same native
+/// connection begins, instead of the two racing as detached tasks.
+struct DeviceLane {
+    jobs: mpsc::UnboundedSender<LaneJob>,
+    worker: tokio::task::JoinHandle<()>,
+    /// Bumped when the registry walks away from whatever this device was
+    /// doing, retiring every job dispatched under the previous value.
+    epoch: tokio::sync::watch::Sender<u64>,
+    /// Jobs queued or running. A lane with none left can be dropped.
+    outstanding: Arc<AtomicUsize>,
+}
+
+impl Drop for DeviceLane {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
+}
+
+struct OutstandingGuard(Arc<AtomicUsize>);
+
+impl Drop for OutstandingGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct Driver<I: BleInterface> {
     iface: Arc<I>,
     inbox: mpsc::Sender<PeerCommand>,
@@ -134,6 +183,13 @@ pub struct Driver<I: BleInterface> {
     /// registry so tests that build a `Driver` directly need not supply
     /// one; the real transport installs its own via `with_connections`.
     connections: Arc<crate::transport::conns::ConnectionRegistry>,
+    /// Per-device serialization of native-connection work. Owned here so
+    /// the workers die with the driver instead of outliving the actor.
+    lanes: parking_lot::Mutex<HashMap<blew::DeviceId, DeviceLane>>,
+    /// Channel id of the connection `connect` last handed to the registry
+    /// for each device. A `CloseChannel` naming a different id is closing
+    /// something this device has already replaced, and is skipped.
+    live_channels: Arc<parking_lot::Mutex<HashMap<blew::DeviceId, u64>>>,
 }
 
 impl<I: BleInterface> Driver<I> {
@@ -158,6 +214,80 @@ impl<I: BleInterface> Driver<I> {
             store,
             routing,
             connections: Arc::new(crate::transport::conns::ConnectionRegistry::default()),
+            lanes: parking_lot::Mutex::new(HashMap::new()),
+            live_channels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Claim a slot on this device's lane, creating the lane on first use and
+    /// counting the caller's job before releasing the map — a lane whose count
+    /// is zero is swept here, so the increment has to happen under the same
+    /// lock or the sweep could drop a lane a job is about to be sent on.
+    /// Sweeping keeps a session that churns through DeviceIds (Android MAC
+    /// rotation) from accumulating lanes.
+    fn claim_lane(
+        &self,
+        device_id: &blew::DeviceId,
+    ) -> (
+        mpsc::UnboundedSender<LaneJob>,
+        tokio::sync::watch::Receiver<u64>,
+        OutstandingGuard,
+    ) {
+        let mut lanes = self.lanes.lock();
+        lanes.retain(|id, lane| id == device_id || lane.outstanding.load(Ordering::Relaxed) > 0);
+        let lane = lanes.entry(device_id.clone()).or_insert_with(|| {
+            let (jobs, mut rx) = mpsc::unbounded_channel::<LaneJob>();
+            let worker = tokio::spawn(async move {
+                while let Some(job) = rx.recv().await {
+                    job.await;
+                }
+            });
+            let (epoch, _) = tokio::sync::watch::channel(0u64);
+            DeviceLane {
+                jobs,
+                worker,
+                epoch,
+                outstanding: Arc::new(AtomicUsize::new(0)),
+            }
+        });
+        lane.outstanding.fetch_add(1, Ordering::Relaxed);
+        (
+            lane.jobs.clone(),
+            lane.epoch.subscribe(),
+            OutstandingGuard(Arc::clone(&lane.outstanding)),
+        )
+    }
+
+    /// Retire this device's current epoch. Work still queued under it is
+    /// skipped, and `Cancellation::Immediate` work already running unwinds.
+    fn abandon_device(&self, device_id: &blew::DeviceId) {
+        if let Some(lane) = self.lanes.lock().get(device_id) {
+            lane.epoch.send_modify(|e| *e += 1);
+        }
+    }
+
+    /// Queue `work` behind everything already pending for this device.
+    fn dispatch(&self, device_id: &blew::DeviceId, cancellation: Cancellation, work: LaneJob) {
+        let (jobs, mut epoch, guard) = self.claim_lane(device_id);
+        let my_epoch = *epoch.borrow();
+        let job: LaneJob = Box::pin(async move {
+            let _guard = guard;
+            if cancellation != Cancellation::Never && *epoch.borrow() != my_epoch {
+                return;
+            }
+            match cancellation {
+                Cancellation::Never | Cancellation::WhileQueued => work.await,
+                Cancellation::Immediate => {
+                    tokio::select! {
+                        biased;
+                        _ = epoch.wait_for(|e| *e != my_epoch) => {}
+                        () = work => {}
+                    }
+                }
+            }
+        });
+        if jobs.send(job).is_err() {
+            tracing::debug!(device = %device_id, "device lane closed; dropping job");
         }
     }
 
@@ -177,80 +307,136 @@ impl<I: BleInterface> Driver<I> {
             PeerAction::StartConnect {
                 device_id,
                 attempt: _,
+                attempt_gen,
             } => {
                 let iface = Arc::clone(&self.iface);
                 let inbox = self.inbox.clone();
+                let live_channels = Arc::clone(&self.live_channels);
+                let dev_for_job = device_id.clone();
                 let dev_for_msg = device_id.clone();
+                // A fresh attempt supersedes everything the previous one left
+                // running against this device, and queues behind any teardown
+                // that is still finishing.
+                self.abandon_device(&device_id);
                 // blew enforces `CentralConfig::connect_timeout` itself
                 // (15 s default, overridable by the app). On expiry it
                 // refresh()+close()s the Android GATT client and
                 // returns `BlewError::ConnectTimedOut`, which flows
                 // through the `Err` arm below into the registry's
                 // normal retry logic.
-                tokio::spawn(async move {
-                    match iface.connect(&device_id).await {
-                        Ok(channel) => {
-                            let _ = inbox
-                                .send(PeerCommand::ConnectSucceeded {
-                                    device_id: dev_for_msg,
-                                    channel,
-                                })
-                                .await;
+                self.dispatch(
+                    &device_id,
+                    Cancellation::WhileQueued,
+                    Box::pin(async move {
+                        match iface.connect(&dev_for_job).await {
+                            Ok(channel) => {
+                                live_channels.lock().insert(dev_for_job.clone(), channel.id);
+                                let _ = inbox
+                                    .send(PeerCommand::ConnectSucceeded {
+                                        device_id: dev_for_msg,
+                                        attempt_gen,
+                                        channel,
+                                    })
+                                    .await;
+                            }
+                            Err(e) => {
+                                let _ = inbox
+                                    .send(PeerCommand::ConnectFailed {
+                                        device_id: dev_for_msg,
+                                        attempt_gen,
+                                        error: format!("{e}"),
+                                    })
+                                    .await;
+                            }
                         }
-                        Err(e) => {
-                            let _ = inbox
-                                .send(PeerCommand::ConnectFailed {
-                                    device_id: dev_for_msg,
-                                    error: format!("{e}"),
-                                })
-                                .await;
-                        }
-                    }
-                });
+                    }),
+                );
             }
 
-            PeerAction::ReadVersion { device_id } => {
+            PeerAction::ReadVersion {
+                device_id,
+                attempt_gen,
+            } => {
                 let iface = Arc::clone(&self.iface);
                 let inbox = self.inbox.clone();
+                let dev_for_job = device_id.clone();
                 let dev_for_msg = device_id.clone();
-                tokio::spawn(async move {
-                    let want = crate::transport::transport::PROTOCOL_VERSION;
-                    match iface.read_version(&device_id).await {
-                        Ok(Some(got)) if got != want => {
-                            let _ = inbox
-                                .send(PeerCommand::ProtocolVersionMismatch {
-                                    device_id: dev_for_msg,
-                                    got,
-                                    want,
-                                })
-                                .await;
+                self.dispatch(
+                    &device_id,
+                    Cancellation::Immediate,
+                    Box::pin(async move {
+                        let want = crate::transport::transport::PROTOCOL_VERSION;
+                        match iface.read_version(&dev_for_job).await {
+                            Ok(Some(got)) if got != want => {
+                                let _ = inbox
+                                    .send(PeerCommand::ProtocolVersionMismatch {
+                                        device_id: dev_for_msg,
+                                        attempt_gen,
+                                        got,
+                                        want,
+                                    })
+                                    .await;
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::debug!(
+                                    device = %dev_for_msg,
+                                    ?e,
+                                    "read_version returned error; treating as skip"
+                                );
+                            }
                         }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::debug!(
-                                device = %dev_for_msg,
-                                ?e,
-                                "read_version returned error; treating as skip"
-                            );
-                        }
-                    }
-                });
+                    }),
+                );
             }
 
-            PeerAction::CloseChannel { device_id, .. } => {
+            PeerAction::CloseChannel {
+                device_id, channel, ..
+            } => {
                 let iface = Arc::clone(&self.iface);
-                tokio::spawn(async move {
-                    let _ = iface.disconnect(&device_id).await;
-                });
+                let live_channels = Arc::clone(&self.live_channels);
+                let dev_for_job = device_id.clone();
+                // The attempt that owned this channel is over: retire
+                // anything still queued for it before tearing down.
+                self.abandon_device(&device_id);
+                self.dispatch(
+                    &device_id,
+                    Cancellation::Never,
+                    Box::pin(async move {
+                        // `disconnect` is by device, not by channel, so a
+                        // close naming a channel this device has already
+                        // replaced would take the replacement down with it.
+                        let replaced = live_channels
+                            .lock()
+                            .get(&dev_for_job)
+                            .is_some_and(|live| *live != channel.id);
+                        if replaced {
+                            tracing::debug!(
+                                device = %dev_for_job,
+                                channel = channel.id,
+                                "skipping close of a channel this device has already replaced"
+                            );
+                            return;
+                        }
+                        let _ = iface.disconnect(&dev_for_job).await;
+                        let mut live = live_channels.lock();
+                        if live.get(&dev_for_job).is_some_and(|id| *id == channel.id) {
+                            live.remove(&dev_for_job);
+                        }
+                    }),
+                );
             }
 
-            // TODO: Own these detached maintenance tasks in Driver so transport
-            // shutdown can abort them instead of letting them outlive the actor.
             PeerAction::Refresh { device_id, .. } => {
                 let iface = Arc::clone(&self.iface);
-                tokio::spawn(async move {
-                    let _ = iface.refresh(&device_id).await;
-                });
+                let dev_for_job = device_id.clone();
+                self.dispatch(
+                    &device_id,
+                    Cancellation::Never,
+                    Box::pin(async move {
+                        let _ = iface.refresh(&dev_for_job).await;
+                    }),
+                );
             }
 
             PeerAction::AckSend { waker, .. } => {
@@ -409,8 +595,11 @@ impl<I: BleInterface> Driver<I> {
                     tracing::debug!("inbox closed before DataPipeReady forwarded");
                 }
             }
-            PeerAction::UpgradeToL2cap { device_id } => {
-                self.spawn_l2cap_open(device_id);
+            PeerAction::UpgradeToL2cap {
+                device_id,
+                upgrade_gen,
+            } => {
+                self.spawn_l2cap_open(device_id, upgrade_gen);
             }
             PeerAction::SwapPipeToL2cap {
                 device_id,
@@ -426,53 +615,59 @@ impl<I: BleInterface> Driver<I> {
         }
     }
 
-    fn spawn_l2cap_open(&self, device_id: blew::DeviceId) {
+    fn spawn_l2cap_open(&self, device_id: blew::DeviceId, upgrade_gen: u64) {
         let iface = Arc::clone(&self.iface);
         let inbox = self.inbox.clone();
+        let dev_for_job = device_id.clone();
         let dev_for_msg = device_id.clone();
-        // TODO: Track and cancel in-flight L2CAP opens when the registry
-        // abandons the upgrade, instead of detaching them until timeout/completion.
-        tokio::spawn(async move {
-            let result = tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
-                let psm = read_psm_with_retry(&READ_PSM_BACKOFFS_MS, &device_id, || {
-                    let iface = Arc::clone(&iface);
-                    let dev = device_id.clone();
-                    async move { iface.read_psm(&dev).await }
+        self.dispatch(
+            &device_id,
+            Cancellation::Immediate,
+            Box::pin(async move {
+                let result = tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
+                    let psm = read_psm_with_retry(&READ_PSM_BACKOFFS_MS, &dev_for_job, || {
+                        let iface = Arc::clone(&iface);
+                        let dev = dev_for_job.clone();
+                        async move { iface.read_psm(&dev).await }
+                    })
+                    .await?;
+                    iface
+                        .open_l2cap(&dev_for_job, psm)
+                        .await
+                        .map_err(|e| format!("{e}"))
                 })
-                .await?;
-                iface
-                    .open_l2cap(&device_id, psm)
-                    .await
-                    .map_err(|e| format!("{e}"))
-            })
-            .await;
-            match result {
-                Ok(Ok(channel)) => {
-                    let _ = inbox
-                        .send(PeerCommand::OpenL2capSucceeded {
-                            device_id: dev_for_msg,
-                            channel,
-                        })
-                        .await;
+                .await;
+                match result {
+                    Ok(Ok(channel)) => {
+                        let _ = inbox
+                            .send(PeerCommand::OpenL2capSucceeded {
+                                device_id: dev_for_msg,
+                                upgrade_gen,
+                                channel,
+                            })
+                            .await;
+                    }
+                    Ok(Err(error)) => {
+                        let _ = inbox
+                            .send(PeerCommand::OpenL2capFailed {
+                                device_id: dev_for_msg,
+                                upgrade_gen,
+                                error,
+                            })
+                            .await;
+                    }
+                    Err(_elapsed) => {
+                        let _ = inbox
+                            .send(PeerCommand::OpenL2capFailed {
+                                device_id: dev_for_msg,
+                                upgrade_gen,
+                                error: "l2cap select timeout".into(),
+                            })
+                            .await;
+                    }
                 }
-                Ok(Err(error)) => {
-                    let _ = inbox
-                        .send(PeerCommand::OpenL2capFailed {
-                            device_id: dev_for_msg,
-                            error,
-                        })
-                        .await;
-                }
-                Err(_elapsed) => {
-                    let _ = inbox
-                        .send(PeerCommand::OpenL2capFailed {
-                            device_id: dev_for_msg,
-                            error: "l2cap select timeout".into(),
-                        })
-                        .await;
-                }
-            }
-        });
+            }),
+        );
     }
 }
 
@@ -1360,6 +1555,7 @@ mod tests {
         driver
             .execute(PeerAction::UpgradeToL2cap {
                 device_id: device_id.clone(),
+                upgrade_gen: 1,
             })
             .await;
 
@@ -1428,6 +1624,7 @@ mod tests {
             .execute(PeerAction::StartConnect {
                 device_id: device_id.clone(),
                 attempt: 0,
+                attempt_gen: 1,
             })
             .await;
         let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -1436,5 +1633,193 @@ mod tests {
             .unwrap();
         assert!(matches!(cmd, PeerCommand::ConnectSucceeded { .. }));
         iface.assert_called(&CallKind::Connect(device_id));
+    }
+
+    fn test_driver(
+        iface: Arc<MockBleInterface>,
+    ) -> (Driver<MockBleInterface>, mpsc::Receiver<PeerCommand>) {
+        let (tx, rx) = mpsc::channel(16);
+        let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(4);
+        let driver = Driver::new(
+            iface,
+            tx,
+            incoming_tx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(crate::transport::store::InMemoryPeerStore::new()),
+            Arc::new(crate::transport::routing::Routing::new()),
+        );
+        (driver, rx)
+    }
+
+    async fn next_command(rx: &mut mpsc::Receiver<PeerCommand>) -> PeerCommand {
+        tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for a command")
+            .expect("inbox closed")
+    }
+
+    /// Both operations name the same native connection, so a teardown that is
+    /// still in flight when the replacement dial is dispatched must finish
+    /// first — otherwise the platform sees a connect and a disconnect for one
+    /// device at once, and whichever lands last wins.
+    #[tokio::test]
+    async fn teardown_completes_before_the_replacement_dial_touches_the_device() {
+        let iface = Arc::new(MockBleInterface::new());
+        let device_id = blew::DeviceId::from("serialize-dev");
+        let (driver, mut rx) = test_driver(Arc::clone(&iface));
+
+        driver
+            .execute(PeerAction::StartConnect {
+                device_id: device_id.clone(),
+                attempt: 0,
+                attempt_gen: 1,
+            })
+            .await;
+        assert!(matches!(
+            next_command(&mut rx).await,
+            PeerCommand::ConnectSucceeded { .. }
+        ));
+
+        iface.hold_disconnect();
+        driver
+            .execute(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                reason: crate::transport::peer::DisconnectReason::LinkLoss,
+            })
+            .await;
+        // The replacement dial is dispatched while the teardown is still open.
+        driver
+            .execute(PeerAction::StartConnect {
+                device_id: device_id.clone(),
+                attempt: 1,
+                attempt_gen: 2,
+            })
+            .await;
+
+        let disconnected = |calls: &[CallKind]| {
+            calls
+                .iter()
+                .filter(|c| matches!(c, CallKind::Disconnect(_)))
+                .count()
+        };
+        let connected = |calls: &[CallKind]| {
+            calls
+                .iter()
+                .filter(|c| matches!(c, CallKind::Connect(_)))
+                .count()
+        };
+        for _ in 0..50 {
+            if disconnected(&iface.calls()) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            disconnected(&iface.calls()),
+            1,
+            "teardown must have started"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            connected(&iface.calls()),
+            1,
+            "the replacement dial must wait for the teardown to finish"
+        );
+
+        iface.release_disconnect();
+        let cmd = next_command(&mut rx).await;
+        match cmd {
+            PeerCommand::ConnectSucceeded { attempt_gen, .. } => assert_eq!(attempt_gen, 2),
+            other => panic!("expected the replacement's ConnectSucceeded, got {other:?}"),
+        }
+        assert_eq!(connected(&iface.calls()), 2);
+    }
+
+    /// `disconnect` is addressed by device, not by channel, so a close naming
+    /// a channel the device has already replaced would take the replacement
+    /// down with it.
+    #[tokio::test]
+    async fn closing_a_replaced_channel_leaves_the_replacement_connected() {
+        let iface = Arc::new(MockBleInterface::new());
+        let device_id = blew::DeviceId::from("replaced-chan-dev");
+        iface.on_connect(
+            device_id.clone(),
+            Ok(ChannelHandle {
+                id: 1,
+                path: ConnectPath::Gatt,
+            }),
+        );
+        iface.on_connect(
+            device_id.clone(),
+            Ok(ChannelHandle {
+                id: 2,
+                path: ConnectPath::Gatt,
+            }),
+        );
+        let (driver, mut rx) = test_driver(Arc::clone(&iface));
+
+        for (attempt, attempt_gen) in [(0u32, 1u64), (1, 2)] {
+            driver
+                .execute(PeerAction::StartConnect {
+                    device_id: device_id.clone(),
+                    attempt,
+                    attempt_gen,
+                })
+                .await;
+            assert!(matches!(
+                next_command(&mut rx).await,
+                PeerCommand::ConnectSucceeded { .. }
+            ));
+        }
+
+        // A close for the first attempt's channel arrives late.
+        driver
+            .execute(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                reason: crate::transport::peer::DisconnectReason::LinkLoss,
+            })
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !iface
+                .calls()
+                .iter()
+                .any(|c| matches!(c, CallKind::Disconnect(_))),
+            "a stale close must not disconnect the device; got {:?}",
+            iface.calls()
+        );
+
+        // The live channel still closes normally.
+        driver
+            .execute(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                channel: ChannelHandle {
+                    id: 2,
+                    path: ConnectPath::Gatt,
+                },
+                reason: crate::transport::peer::DisconnectReason::LinkLoss,
+            })
+            .await;
+        for _ in 0..50 {
+            if iface
+                .calls()
+                .iter()
+                .any(|c| matches!(c, CallKind::Disconnect(_)))
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the live channel's close never reached the interface");
     }
 }

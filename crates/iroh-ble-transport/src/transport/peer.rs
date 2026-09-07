@@ -89,6 +89,22 @@ pub struct PeerEntry {
     /// and rejected rather than silently delivered on a channel the caller
     /// never intended. Never decrements; the starting value is 0.
     pub tx_gen: u64,
+    /// Monotonic tag for the connect attempt this entry is currently
+    /// pursuing. Bumped every time the registry starts a dial and every time
+    /// an attempt is abandoned, so it is unique for the lifetime of the
+    /// entry — unlike `PeerPhase::Connecting::attempt`, which is a retry
+    /// counter that resets to 0 on every fresh dial. Every asynchronous
+    /// completion belonging to a connect attempt (`ConnectSucceeded`,
+    /// `ConnectFailed`, `ProtocolVersionMismatch`) carries the tag it was
+    /// started under and is dropped unless it still matches, so a detached
+    /// task finishing after its attempt was replaced cannot speak for the
+    /// replacement.
+    pub attempt_gen: u64,
+    /// Same idea for L2CAP opens, which run against an already-connected
+    /// peer and so have a lifetime of their own: bumped whenever the
+    /// registry emits `UpgradeToL2cap`, and whenever an outstanding upgrade
+    /// is abandoned (new dial, teardown).
+    pub upgrade_gen: u64,
     pub pending_sends: VecDeque<PendingSend>,
     pub role: ConnectRole,
     pub pipe: Option<PipeHandles>,
@@ -129,6 +145,8 @@ impl PeerEntry {
             last_tx: None,
             consecutive_failures: 0,
             tx_gen: 0,
+            attempt_gen: 0,
+            upgrade_gen: 0,
             pending_sends: VecDeque::new(),
             role: ConnectRole::Central,
             pipe: None,
@@ -302,18 +320,22 @@ pub enum PeerCommand {
     Tick(Instant),
     ConnectSucceeded {
         device_id: DeviceId,
+        attempt_gen: u64,
         channel: ChannelHandle,
     },
     ConnectFailed {
         device_id: DeviceId,
+        attempt_gen: u64,
         error: String,
     },
     OpenL2capSucceeded {
         device_id: DeviceId,
+        upgrade_gen: u64,
         channel: L2capChannel,
     },
     OpenL2capFailed {
         device_id: DeviceId,
+        upgrade_gen: u64,
         error: String,
     },
     /// Central read the peer's VERSION characteristic and got back a byte
@@ -322,6 +344,7 @@ pub enum PeerCommand {
     /// incompatible data pipe start.
     ProtocolVersionMismatch {
         device_id: DeviceId,
+        attempt_gen: u64,
         got: u8,
         want: u8,
     },
@@ -381,12 +404,14 @@ pub enum PeerAction {
     StartConnect {
         device_id: DeviceId,
         attempt: u32,
+        attempt_gen: u64,
     },
     /// Read the peer's VERSION characteristic and, on mismatch, emit
     /// [`PeerCommand::ProtocolVersionMismatch`] so the registry can Dead
     /// the peer instead of running an incompatible data pipe.
     ReadVersion {
         device_id: DeviceId,
+        attempt_gen: u64,
     },
     CloseChannel {
         device_id: DeviceId,
@@ -416,6 +441,7 @@ pub enum PeerAction {
     /// for this already-connected GATT peer.
     UpgradeToL2cap {
         device_id: DeviceId,
+        upgrade_gen: u64,
     },
     /// L2CAP open succeeded; add the L2CAP worker to this peer's pipe
     /// supervisor alongside the existing GATT worker (both-paths-alive;
@@ -451,6 +477,8 @@ mod tests {
         let e = PeerEntry::new(DeviceId::from("test"));
         assert!(matches!(e.phase, PeerPhase::Unknown));
         assert_eq!(e.tx_gen, 0);
+        assert_eq!(e.attempt_gen, 0);
+        assert_eq!(e.upgrade_gen, 0);
     }
 
     #[test]
@@ -519,6 +547,7 @@ mod tests {
         };
         let _act1 = PeerAction::UpgradeToL2cap {
             device_id: DeviceId::from("x"),
+            upgrade_gen: 1,
         };
         assert_eq!(DisconnectReason::DedupLoser, DisconnectReason::DedupLoser);
     }

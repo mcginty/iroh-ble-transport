@@ -59,6 +59,10 @@ struct Inner {
 #[derive(Clone)]
 pub struct MockBleInterface {
     inner: Arc<Mutex<Inner>>,
+    /// `true` parks every `disconnect` call after it has been recorded, so a
+    /// test can hold a teardown open across the point where a replacement
+    /// dial would otherwise start.
+    disconnect_hold: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Default for MockBleInterface {
@@ -70,6 +74,7 @@ impl Default for MockBleInterface {
 impl MockBleInterface {
     pub fn new() -> Self {
         Self {
+            disconnect_hold: Arc::new(tokio::sync::watch::channel(false).0),
             inner: Arc::new(Mutex::new(Inner {
                 calls: Vec::new(),
                 connect_queue: VecDeque::new(),
@@ -140,6 +145,16 @@ impl MockBleInterface {
 
     pub fn set_connect_delay(&self, delay: Duration) {
         self.inner.lock().unwrap().connect_delay = Some(delay);
+    }
+
+    /// Park `disconnect` after it records its call, until
+    /// `release_disconnect`. Models a platform teardown that takes a while.
+    pub fn hold_disconnect(&self) {
+        self.disconnect_hold.send_replace(true);
+    }
+
+    pub fn release_disconnect(&self) {
+        self.disconnect_hold.send_replace(false);
     }
 
     pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
@@ -214,14 +229,19 @@ impl BleInterface for MockBleInterface {
     }
 
     async fn disconnect(&self, device_id: &DeviceId) -> BleResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.calls.push(CallKind::Disconnect(device_id.clone()));
-        inner
-            .disconnect_queue
-            .iter()
-            .position(|(id, _)| id == device_id)
-            .map(|pos| inner.disconnect_queue.remove(pos).unwrap().1)
-            .unwrap_or(Ok(()))
+        let result = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.calls.push(CallKind::Disconnect(device_id.clone()));
+            inner
+                .disconnect_queue
+                .iter()
+                .position(|(id, _)| id == device_id)
+                .map(|pos| inner.disconnect_queue.remove(pos).unwrap().1)
+                .unwrap_or(Ok(()))
+        };
+        let mut hold = self.disconnect_hold.subscribe();
+        let _ = hold.wait_for(|held| !*held).await;
+        result
     }
 
     async fn write_c2p(&self, device_id: &DeviceId, bytes: Bytes) -> BleResult<()> {

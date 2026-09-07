@@ -1888,6 +1888,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: old_device.clone(),
+            attempt_gen: reg.attempt_gen(&old_device),
             channel: ChannelHandle {
                 id: 9,
                 path: ConnectPath::Gatt,
