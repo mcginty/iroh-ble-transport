@@ -169,7 +169,9 @@ async fn inbound_role_replacement_joins_connect_and_rejects_its_completion() {
         PeerPhase::Connected { .. }
     ));
 
-    // Queue obsolete cleanup after the worker's ownership transfer.
+    // DeviceId-only disconnect cannot distinguish the obsolete central client
+    // from the replacement inbound lifecycle. Keep it open rather than risk
+    // tearing the replacement down; queue obsolete cleanup to enforce this.
     h.driver
         .execute(PeerAction::RetireLifecycle {
             device_id: h.device.clone(),

@@ -404,6 +404,10 @@ pub enum PeerAction {
         device_id: DeviceId,
         lifecycle_id: u64,
     },
+    /// Cancel queued connect work and queued/running VERSION or L2CAP work
+    /// for this lifecycle. Native ownership remains until a replacement is
+    /// activated in dispatch order, so its cleanup can still run. Retirement
+    /// does not itself disconnect, and a running connect is joined.
     RetireLifecycle {
         device_id: DeviceId,
         lifecycle_id: u64,

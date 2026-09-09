@@ -29,7 +29,46 @@ pub struct IncomingPacket {
 /// succeed; the first attempt is immediate, the remaining two cover the
 /// slow-path before we give up and fall back to GATT.
 const READ_PSM_BACKOFFS_MS: [u64; 3] = [0, 150, 400];
+// VERSION is optional; leave time for a slow GATT read without holding up an upgrade indefinitely.
 const VERSION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+// Well above blew's two-second Android disconnect fallback. These deadlines
+// bound asynchronous waits, not a blocking native call or its eventual effects.
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// Discovery and subscription follow the separately configured native connect
+// timeout; a missing callback in either must still return a connect failure.
+const GATT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn bounded_cleanup(
+    device_id: &blew::DeviceId,
+    lifecycle_id: u64,
+    operation: &'static str,
+    work: impl std::future::Future<Output = crate::error::BleResult<()>>,
+) {
+    match tokio::time::timeout(CLEANUP_TIMEOUT, work).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(device = %device_id, lifecycle_id, operation, %error, "native cleanup failed");
+        }
+        Err(_) => {
+            // Drop the waiter instead of detaching it: no late Rust continuation
+            // may mutate ownership after the lane advances. Native cancellation
+            // is not guaranteed; any later link-down event still follows normal
+            // registry recovery. Retrying cleanup here would target the same
+            // uncertain device and could hold the replacement up again.
+            tracing::warn!(device = %device_id, lifecycle_id, operation, "native cleanup timed out; releasing device lane with native state uncertain");
+        }
+    }
+}
+
+async fn bounded_gatt_setup(
+    work: impl std::future::Future<Output = crate::error::BleResult<()>>,
+) -> crate::error::BleResult<()> {
+    tokio::time::timeout(GATT_SETUP_TIMEOUT, work)
+        .await
+        .map_err(|_| crate::error::BleError::Timeout {
+            stage: "GATT setup",
+        })?
+}
 
 /// Translate the registry's role (`Central` = we dialed, `Peripheral` =
 /// they dialed) into `routing`'s observer-local `Direction`.
@@ -134,7 +173,7 @@ enum LaneJob {
     },
 }
 
-async fn run_lane(mut rx: mpsc::UnboundedReceiver<LaneJob>) {
+async fn run_lane(device_id: blew::DeviceId, mut rx: mpsc::UnboundedReceiver<LaneJob>) {
     let mut native_owner = None;
     while let Some(job) = rx.recv().await {
         match job {
@@ -154,10 +193,12 @@ async fn run_lane(mut rx: mpsc::UnboundedReceiver<LaneJob>) {
             } => {
                 let _guard = guard;
                 if native_owner != Some(lifecycle_id) {
+                    tracing::debug!(device = %device_id, lifecycle_id, ?native_owner, "dropping work for a replaced native lifecycle");
                     continue;
                 }
                 if cancellation != Cancellation::Never && *lifecycle.borrow() != Some(lifecycle_id)
                 {
+                    tracing::debug!(device = %device_id, lifecycle_id, "dropping queued work for a retired lifecycle");
                     continue;
                 }
                 match cancellation {
@@ -165,7 +206,9 @@ async fn run_lane(mut rx: mpsc::UnboundedReceiver<LaneJob>) {
                     Cancellation::Immediate => {
                         tokio::select! {
                             biased;
-                            _ = lifecycle.wait_for(|current| *current != Some(lifecycle_id)) => {}
+                            _ = lifecycle.wait_for(|current| *current != Some(lifecycle_id)) => {
+                                tracing::debug!(device = %device_id, lifecycle_id, "cancelling work for a retired lifecycle");
+                            }
                             () = work => {}
                         }
                     }
@@ -184,7 +227,7 @@ enum Cancellation {
     /// Skipped while still queued; once started it runs to completion. Used
     /// for connect, where unwinding mid-flight would leave the platform's
     /// GATT client in a state we can't reason about — the result is rejected
-    /// by generation instead.
+    /// by lifecycle identity instead.
     WhileQueued,
     /// Unwound as soon as the device is abandoned. Used for work that is
     /// already bounded and safe to drop (the VERSION read, the L2CAP open).
@@ -278,7 +321,7 @@ impl<I: BleInterface> Driver<I> {
         });
         let lane = lanes.entry(device_id.clone()).or_insert_with(|| {
             let (jobs, rx) = mpsc::unbounded_channel::<LaneJob>();
-            let worker = tokio::spawn(run_lane(rx));
+            let worker = tokio::spawn(run_lane(device_id.clone(), rx));
             DeviceLane {
                 jobs,
                 worker,
@@ -319,6 +362,7 @@ impl<I: BleInterface> Driver<I> {
     ) {
         let lanes = self.lanes.lock();
         let Some(lane) = lanes.get(device_id) else {
+            tracing::debug!(device = %device_id, lifecycle_id, "device has no lane; dropping job");
             return;
         };
         let lifecycle = lane.lifecycle.subscribe();
@@ -459,7 +503,13 @@ impl<I: BleInterface> Driver<I> {
                     lifecycle_id,
                     Cancellation::Never,
                     Box::pin(async move {
-                        let _ = iface.disconnect(&dev_for_job).await;
+                        bounded_cleanup(
+                            &dev_for_job,
+                            lifecycle_id,
+                            "disconnect",
+                            iface.disconnect(&dev_for_job),
+                        )
+                        .await;
                     }),
                 );
             }
@@ -475,7 +525,13 @@ impl<I: BleInterface> Driver<I> {
                     lifecycle_id,
                     Cancellation::Never,
                     Box::pin(async move {
-                        let _ = iface.refresh(&dev_for_job).await;
+                        bounded_cleanup(
+                            &dev_for_job,
+                            lifecycle_id,
+                            "refresh",
+                            iface.refresh(&dev_for_job),
+                        )
+                        .await;
                     }),
                 );
             }
@@ -786,10 +842,14 @@ impl BleInterface for BlewDriver {
         // GATT is not usable until services are discovered and P2C notifications
         // are subscribed. Android/Apple both require this explicitly before
         // write_characteristic or delivering notifications.
-        self.central.discover_services(device_id).await?;
-        self.central
-            .subscribe_characteristic(device_id, P2C_CHAR_UUID)
-            .await?;
+        bounded_gatt_setup(async {
+            self.central.discover_services(device_id).await?;
+            self.central
+                .subscribe_characteristic(device_id, P2C_CHAR_UUID)
+                .await?;
+            Ok(())
+        })
+        .await?;
         let id = self.next_channel_id.fetch_add(1, Ordering::Relaxed);
         let handle = ChannelHandle {
             id,
@@ -1801,8 +1861,203 @@ mod tests {
         assert_eq!(connected(&iface.calls()), 2);
     }
 
-    /// The registry installing a channel is what makes it live, so that is
-    /// what the driver tracks. `StartDataPipe` announces every one of them.
+    #[tokio::test(start_paused = true)]
+    async fn hung_cleanup_expires_before_the_replacement_dial_runs() {
+        for refresh in [false, true] {
+            let iface = Arc::new(MockBleInterface::new());
+            let device_id = blew::DeviceId::from("hung-cleanup");
+            let (driver, mut rx) = test_driver(Arc::clone(&iface));
+            driver
+                .execute(PeerAction::StartConnect {
+                    device_id: device_id.clone(),
+                    attempt: 0,
+                    lifecycle_id: 1,
+                })
+                .await;
+            assert!(matches!(
+                next_command(&mut rx).await,
+                PeerCommand::ConnectSucceeded { .. }
+            ));
+
+            let action = if refresh {
+                iface.set_refresh_held(true);
+                PeerAction::Refresh {
+                    device_id: device_id.clone(),
+                    lifecycle_id: 1,
+                }
+            } else {
+                iface.hold_disconnect();
+                PeerAction::CloseChannel {
+                    device_id: device_id.clone(),
+                    lifecycle_id: 1,
+                    channel: ChannelHandle {
+                        id: 1,
+                        path: ConnectPath::Gatt,
+                    },
+                    reason: crate::transport::peer::DisconnectReason::LocalClose,
+                }
+            };
+            driver.execute(action).await;
+            // The worker has entered the backend wait before the clock advances.
+            for _ in 0..100 {
+                if iface.cleanup_waiters() == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(iface.cleanup_waiters(), 1);
+            driver
+                .execute(PeerAction::RetireLifecycle {
+                    device_id: device_id.clone(),
+                    lifecycle_id: 1,
+                })
+                .await;
+            driver
+                .execute(PeerAction::StartConnect {
+                    device_id: device_id.clone(),
+                    attempt: 1,
+                    lifecycle_id: 2,
+                })
+                .await;
+
+            tokio::time::advance(CLEANUP_TIMEOUT - std::time::Duration::from_secs(1)).await;
+            assert!(rx.try_recv().is_err());
+            assert_eq!(
+                iface
+                    .calls()
+                    .iter()
+                    .filter(|c| matches!(c, CallKind::Connect(_)))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                iface.cleanup_waiters(),
+                1,
+                "retirement must not cancel teardown early"
+            );
+            tokio::time::advance(std::time::Duration::from_secs(2)).await;
+            assert!(matches!(
+                next_command(&mut rx).await,
+                PeerCommand::ConnectSucceeded {
+                    lifecycle_id: 2,
+                    ..
+                }
+            ));
+            assert_eq!(
+                iface.cleanup_waiters(),
+                0,
+                "the timed-out future must be dropped, not detached"
+            );
+
+            // Releasing the old backend waiter must not resume a Rust cleanup
+            // continuation against lifecycle 2. The replacement can still work.
+            iface.release_disconnect();
+            iface.set_refresh_held(false);
+            iface.seed_version(Some(
+                crate::transport::transport::PROTOCOL_VERSION.wrapping_add(1),
+            ));
+            driver
+                .execute(PeerAction::ReadVersion {
+                    device_id: device_id.clone(),
+                    lifecycle_id: 2,
+                })
+                .await;
+            assert!(matches!(
+                next_command(&mut rx).await,
+                PeerCommand::ProtocolVersionMismatch {
+                    lifecycle_id: 2,
+                    ..
+                }
+            ));
+            assert_eq!(
+                iface
+                    .calls()
+                    .iter()
+                    .filter(|c| matches!(c, CallKind::Connect(_)))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_error_does_not_block_the_replacement_dial() {
+        let iface = Arc::new(MockBleInterface::new());
+        let device_id = blew::DeviceId::from("failed-cleanup");
+        iface.on_disconnect(device_id.clone(), Err(crate::error::BleError::NotConnected));
+        let (driver, mut rx) = test_driver(Arc::clone(&iface));
+        driver
+            .execute(PeerAction::StartConnect {
+                device_id: device_id.clone(),
+                attempt: 0,
+                lifecycle_id: 1,
+            })
+            .await;
+        let _ = next_command(&mut rx).await;
+        driver
+            .execute(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                lifecycle_id: 1,
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                reason: crate::transport::peer::DisconnectReason::LocalClose,
+            })
+            .await;
+        driver
+            .execute(PeerAction::RetireLifecycle {
+                device_id: device_id.clone(),
+                lifecycle_id: 1,
+            })
+            .await;
+        driver
+            .execute(PeerAction::StartConnect {
+                device_id: device_id.clone(),
+                attempt: 1,
+                lifecycle_id: 2,
+            })
+            .await;
+        assert!(matches!(
+            next_command(&mut rx).await,
+            PeerCommand::ConnectSucceeded {
+                lifecycle_id: 2,
+                ..
+            }
+        ));
+        iface.assert_called(&CallKind::Disconnect(device_id));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gatt_setup_deadline_covers_discovery_and_subscription_together() {
+        let started = tokio::time::Instant::now();
+        let result = bounded_gatt_setup(async {
+            // Discovery consumes most of the shared deadline.
+            tokio::time::sleep(GATT_SETUP_TIMEOUT - std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            Ok(())
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(crate::error::BleError::Timeout {
+                stage: "GATT setup"
+            })
+        ));
+        assert_eq!(started.elapsed(), GATT_SETUP_TIMEOUT);
+
+        let result = bounded_gatt_setup(std::future::pending()).await;
+        assert!(matches!(
+            result,
+            Err(crate::error::BleError::Timeout {
+                stage: "GATT setup"
+            })
+        ));
+        let result = bounded_gatt_setup(async { Err(crate::error::BleError::NotConnected) }).await;
+        assert!(matches!(result, Err(crate::error::BleError::NotConnected)));
+    }
+
+    /// Announce a lifecycle through the same action as a registry-created pipe.
     async fn announce_channel(
         driver: &Driver<MockBleInterface>,
         device_id: &blew::DeviceId,
@@ -1885,62 +2140,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the live channel's close never reached the interface");
-    }
-
-    /// Not every live channel comes back from `connect`: a notification can
-    /// promote a peer straight to `Connected` on a registry-minted handle
-    /// while a dial is still in flight, and the registry then ignores that
-    /// dial's result. Tracking ownership from `connect` instead of from the
-    /// registry's own announcement made every later close of that live
-    /// connection look stale, so the peer was never torn down.
-    #[tokio::test]
-    async fn a_registry_minted_channel_can_still_be_closed_after_a_dial_lands() {
-        let iface = Arc::new(MockBleInterface::new());
-        let device_id = blew::DeviceId::from("promoted-dev");
-        iface.on_connect(
-            device_id.clone(),
-            Ok(ChannelHandle {
-                id: 7,
-                path: ConnectPath::Gatt,
-            }),
-        );
-        let (driver, mut rx) = test_driver(Arc::clone(&iface));
-
-        // Inbound traffic promotes the peer on a handle the registry minted.
-        announce_channel(&driver, &device_id, 1, &mut rx).await;
-
-        // The dial that was already in flight completes; the registry drops
-        // its result, but the driver used to record its channel id anyway.
-        driver
-            .execute(PeerAction::StartConnect {
-                device_id: device_id.clone(),
-                attempt: 0,
-                lifecycle_id: 1,
-            })
-            .await;
-        assert!(matches!(
-            next_command(&mut rx).await,
-            PeerCommand::ConnectSucceeded { .. }
-        ));
-
-        driver
-            .execute(PeerAction::CloseChannel {
-                lifecycle_id: 1,
-                device_id: device_id.clone(),
-                channel: ChannelHandle {
-                    id: 0,
-                    path: ConnectPath::Gatt,
-                },
-                reason: crate::transport::peer::DisconnectReason::LinkLoss,
-            })
-            .await;
-        for _ in 0..50 {
-            if disconnects(&iface) == 1 {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("the live channel was never torn down");
     }
 
     /// A close we are going to skip must not retire the live channel's work

@@ -63,6 +63,7 @@ pub struct MockBleInterface {
     /// test can hold a teardown open across the point where a replacement
     /// dial would otherwise start.
     disconnect_hold: Arc<tokio::sync::watch::Sender<bool>>,
+    refresh_hold: Arc<tokio::sync::watch::Sender<bool>>,
     connect_hold: Arc<tokio::sync::watch::Sender<bool>>,
     version_hold: Arc<tokio::sync::watch::Sender<bool>>,
 }
@@ -77,6 +78,7 @@ impl MockBleInterface {
     pub fn new() -> Self {
         Self {
             disconnect_hold: Arc::new(tokio::sync::watch::channel(false).0),
+            refresh_hold: Arc::new(tokio::sync::watch::channel(false).0),
             connect_hold: Arc::new(tokio::sync::watch::channel(false).0),
             version_hold: Arc::new(tokio::sync::watch::channel(false).0),
             inner: Arc::new(Mutex::new(Inner {
@@ -167,6 +169,14 @@ impl MockBleInterface {
 
     pub fn set_version_held(&self, held: bool) {
         self.version_hold.send_replace(held);
+    }
+
+    pub fn set_refresh_held(&self, held: bool) {
+        self.refresh_hold.send_replace(held);
+    }
+
+    pub fn cleanup_waiters(&self) -> usize {
+        self.disconnect_hold.receiver_count() + self.refresh_hold.receiver_count()
     }
 
     pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
@@ -383,6 +393,8 @@ impl BleInterface for MockBleInterface {
             .unwrap()
             .calls
             .push(CallKind::Refresh(device_id.clone()));
+        let mut hold = self.refresh_hold.subscribe();
+        let _ = hold.wait_for(|held| !*held).await;
         Ok(())
     }
 

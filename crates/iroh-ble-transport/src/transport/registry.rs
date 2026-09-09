@@ -1488,6 +1488,9 @@ impl Registry {
     }
 
     fn handle_shutdown(&mut self, actions: &mut Vec<PeerAction>) {
+        // The actor exits after dispatching these actions. Invalidate work but
+        // leave phases alone; the newly allocated IDs will never be activated
+        // or used for cleanup, unlike IDs in an ongoing lifecycle transition.
         for entry in self.peers.values_mut() {
             Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
             for send in entry.pending_sends.drain(..) {
@@ -1555,8 +1558,10 @@ impl Registry {
         if entry.lifecycle_id != lifecycle_id || entry.upgrade_gen != upgrade_gen {
             tracing::debug!(
                 device = %device_id,
-                stale_gen = upgrade_gen,
-                current_gen = entry.upgrade_gen,
+                received_lifecycle_id = lifecycle_id,
+                current_lifecycle_id = entry.lifecycle_id,
+                received_upgrade_gen = upgrade_gen,
+                current_upgrade_gen = entry.upgrade_gen,
                 "dropping OpenL2capSucceeded from a superseded upgrade"
             );
             return;
@@ -1642,8 +1647,10 @@ impl Registry {
         if entry.lifecycle_id != lifecycle_id || entry.upgrade_gen != upgrade_gen {
             tracing::debug!(
                 device = %device_id,
-                stale_gen = upgrade_gen,
-                current_gen = entry.upgrade_gen,
+                received_lifecycle_id = lifecycle_id,
+                current_lifecycle_id = entry.lifecycle_id,
+                received_upgrade_gen = upgrade_gen,
+                current_upgrade_gen = entry.upgrade_gen,
                 "dropping OpenL2capFailed from a superseded upgrade"
             );
             return;
@@ -1947,9 +1954,8 @@ impl Registry {
         }
     }
 
-    /// Start a connect attempt. Mints a fresh generation so completions from
-    /// whatever this entry was doing before can no longer be mistaken for
-    /// this attempt's, then emits the action carrying that generation.
+    /// Start a connect attempt under a fresh lifecycle identity, retiring the
+    /// previous lifecycle before dispatching the new native work.
     fn begin_connect(
         next_lifecycle: &mut u64,
         actions: &mut Vec<PeerAction>,
@@ -1970,9 +1976,8 @@ impl Registry {
         });
     }
 
-    /// Retire every generation this entry has outstanding. Anything the
-    /// driver is still running on its behalf now carries a stale tag and its
-    /// result will be dropped. Returns the fresh attempt generation.
+    /// Retire this entry's lifecycle, rejecting its outstanding completions.
+    /// Returns a fresh lifecycle identity and resets its upgrade sequence.
     fn abandon_outstanding(
         next_lifecycle: &mut u64,
         actions: &mut Vec<PeerAction>,
@@ -2046,7 +2051,7 @@ impl Registry {
         self.peers.get(device_id)
     }
 
-    /// Generation the peer's current connect attempt was started under.
+    /// Identity of the peer's current lifecycle.
     /// Tests synthesizing a driver completion use this to speak for the
     /// attempt in flight; passing anything else is how they simulate a
     /// completion from an attempt that has already been replaced.
