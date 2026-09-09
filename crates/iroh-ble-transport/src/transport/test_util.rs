@@ -63,6 +63,8 @@ pub struct MockBleInterface {
     /// test can hold a teardown open across the point where a replacement
     /// dial would otherwise start.
     disconnect_hold: Arc<tokio::sync::watch::Sender<bool>>,
+    connect_hold: Arc<tokio::sync::watch::Sender<bool>>,
+    version_hold: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Default for MockBleInterface {
@@ -75,6 +77,8 @@ impl MockBleInterface {
     pub fn new() -> Self {
         Self {
             disconnect_hold: Arc::new(tokio::sync::watch::channel(false).0),
+            connect_hold: Arc::new(tokio::sync::watch::channel(false).0),
+            version_hold: Arc::new(tokio::sync::watch::channel(false).0),
             inner: Arc::new(Mutex::new(Inner {
                 calls: Vec::new(),
                 connect_queue: VecDeque::new(),
@@ -157,6 +161,14 @@ impl MockBleInterface {
         self.disconnect_hold.send_replace(false);
     }
 
+    pub fn set_connect_held(&self, held: bool) {
+        self.connect_hold.send_replace(held);
+    }
+
+    pub fn set_version_held(&self, held: bool) {
+        self.version_hold.send_replace(held);
+    }
+
     pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
         self.inner.lock().unwrap().on_c2p_write = Some(Arc::from(hook));
     }
@@ -222,6 +234,8 @@ impl BleInterface for MockBleInterface {
                 });
             (delay, result)
         };
+        let mut hold = self.connect_hold.subscribe();
+        let _ = hold.wait_for(|held| !*held).await;
         if let Some(d) = delay {
             tokio::time::sleep(d).await;
         }
@@ -291,9 +305,14 @@ impl BleInterface for MockBleInterface {
     }
 
     async fn read_version(&self, device_id: &DeviceId) -> BleResult<Option<u8>> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.calls.push(CallKind::ReadVersion(device_id.clone()));
-        Ok(inner.version_responses.pop_front().flatten())
+        let response = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.calls.push(CallKind::ReadVersion(device_id.clone()));
+            inner.version_responses.pop_front().flatten()
+        };
+        let mut hold = self.version_hold.subscribe();
+        let _ = hold.wait_for(|held| !*held).await;
+        Ok(response)
     }
 
     async fn read_psm(&self, device_id: &DeviceId) -> BleResult<Option<u16>> {
