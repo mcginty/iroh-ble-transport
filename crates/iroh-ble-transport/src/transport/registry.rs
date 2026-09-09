@@ -35,6 +35,7 @@ pub(crate) const CONNECTED_IDLE_DEADLINE: std::time::Duration = std::time::Durat
 #[derive(Debug)]
 pub struct Registry {
     peers: HashMap<DeviceId, PeerEntry>,
+    next_lifecycle: u64,
     l2cap_policy: L2capPolicy,
     /// Prefixes whose identity has been verified by iroh's QUIC handshake.
     /// Populated by `VerifiedEndpoint`; consulted by `handle_advertised`
@@ -50,11 +51,21 @@ impl Registry {
         let my_prefix = crate::transport::routing::prefix_from_endpoint(&my_endpoint);
         Self {
             peers: HashMap::new(),
+            next_lifecycle: 1,
             l2cap_policy,
             verified_prefixes: HashMap::new(),
             my_endpoint,
             my_prefix,
         }
+    }
+
+    fn new_entry(next_lifecycle: &mut u64, device_id: DeviceId) -> PeerEntry {
+        let mut entry = PeerEntry::new(device_id);
+        entry.lifecycle_id = *next_lifecycle;
+        *next_lifecycle = next_lifecycle
+            .checked_add(1)
+            .expect("lifecycle ID exhausted");
+        entry
     }
 
     pub fn new_for_test() -> Self {
@@ -104,11 +115,19 @@ impl Registry {
                 datagram,
                 waker,
             ),
-            PeerCommand::ConnectSucceeded { device_id, channel } => {
-                self.handle_connect_succeeded(&mut actions, now, device_id, channel);
+            PeerCommand::ConnectSucceeded {
+                device_id,
+                lifecycle_id,
+                channel,
+            } => {
+                self.handle_connect_succeeded(&mut actions, now, device_id, lifecycle_id, channel);
             }
-            PeerCommand::ConnectFailed { device_id, error } => {
-                self.handle_connect_failed(&mut actions, now, device_id, &error);
+            PeerCommand::ConnectFailed {
+                device_id,
+                lifecycle_id,
+                error,
+            } => {
+                self.handle_connect_failed(&mut actions, now, device_id, lifecycle_id, &error);
             }
             PeerCommand::InboundGattFragment {
                 device_id,
@@ -146,10 +165,31 @@ impl Registry {
             ),
             PeerCommand::OpenL2capSucceeded {
                 device_id,
+                lifecycle_id,
+                upgrade_gen,
                 channel: l2cap_chan,
-            } => self.handle_open_l2cap_succeeded(&mut actions, now, device_id, l2cap_chan),
-            PeerCommand::OpenL2capFailed { device_id, error } => {
-                self.handle_open_l2cap_failed(&mut actions, now, device_id, &error);
+            } => self.handle_open_l2cap_succeeded(
+                &mut actions,
+                now,
+                device_id,
+                lifecycle_id,
+                upgrade_gen,
+                l2cap_chan,
+            ),
+            PeerCommand::OpenL2capFailed {
+                device_id,
+                lifecycle_id,
+                upgrade_gen,
+                error,
+            } => {
+                self.handle_open_l2cap_failed(
+                    &mut actions,
+                    now,
+                    device_id,
+                    lifecycle_id,
+                    upgrade_gen,
+                    &error,
+                );
             }
             PeerCommand::InboundL2capChannel { device_id, channel } => {
                 self.handle_inbound_l2cap_channel(&mut actions, now, device_id, channel);
@@ -163,9 +203,17 @@ impl Registry {
             }
             PeerCommand::ProtocolVersionMismatch {
                 device_id,
+                lifecycle_id,
                 got,
                 want,
-            } => self.handle_protocol_version_mismatch(&mut actions, now, device_id, got, want),
+            } => self.handle_protocol_version_mismatch(
+                &mut actions,
+                now,
+                device_id,
+                lifecycle_id,
+                got,
+                want,
+            ),
             PeerCommand::VerifiedEndpoint {
                 endpoint_id,
                 token: _,
@@ -231,6 +279,7 @@ impl Registry {
         for did in to_cancel {
             if let Some(entry) = self.peers.get_mut(&did) {
                 let drain_acks = Self::drain_to_draining(
+                    &mut self.next_lifecycle,
                     entry,
                     now,
                     crate::transport::peer::DisconnectReason::DedupLoser,
@@ -281,6 +330,7 @@ impl Registry {
                 }
                 if let Some(entry) = self.peers.get_mut(&did) {
                     let drain_acks = Self::drain_to_draining(
+                        &mut self.next_lifecycle,
                         entry,
                         now,
                         crate::transport::peer::DisconnectReason::DedupLoser,
@@ -330,7 +380,14 @@ impl Registry {
                     if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
                         *upgrading = true;
                     }
-                    actions.push(PeerAction::UpgradeToL2cap { device_id: did });
+                    entry.upgrade_gen += 1;
+                    let upgrade_gen = entry.upgrade_gen;
+                    let lifecycle_id = entry.lifecycle_id;
+                    actions.push(PeerAction::UpgradeToL2cap {
+                        device_id: did,
+                        lifecycle_id,
+                        upgrade_gen,
+                    });
                 }
             }
         }
@@ -348,7 +405,7 @@ impl Registry {
         let entry = self
             .peers
             .entry(client_id.clone())
-            .or_insert_with(|| PeerEntry::new(client_id.clone()));
+            .or_insert_with(|| Self::new_entry(&mut self.next_lifecycle, client_id.clone()));
         if let Some(p) = prefix {
             entry.prefix = Some(p);
         }
@@ -379,7 +436,15 @@ impl Registry {
         ) {
             return;
         }
-        Self::restart_peripheral_gatt_pipe(entry, actions, now, client_id, None, Some(char_uuid));
+        Self::restart_peripheral_gatt_pipe(
+            &mut self.next_lifecycle,
+            entry,
+            actions,
+            now,
+            client_id,
+            None,
+            Some(char_uuid),
+        );
     }
 
     fn handle_peripheral_client_unsubscribed(
@@ -404,6 +469,7 @@ impl Registry {
         }
         entry.rx_backlog.clear();
         let broken_pipe_acks = Self::drain_to_draining(
+            &mut self.next_lifecycle,
             entry,
             now,
             crate::transport::peer::DisconnectReason::RemoteClose,
@@ -459,7 +525,7 @@ impl Registry {
         let entry = self
             .peers
             .entry(device_id.clone())
-            .or_insert_with(|| PeerEntry::new(device_id.clone()));
+            .or_insert_with(|| Self::new_entry(&mut self.next_lifecycle, device_id.clone()));
         entry.last_adv = Some(now);
         entry.prefix = Some(prefix);
         entry.verified_live_suppressed_logged = false;
@@ -467,10 +533,10 @@ impl Registry {
         let mut resurrected_endpoint = None;
         match &entry.phase {
             PeerPhase::Unknown => {
-                Self::arm_for_dial(actions, entry, now, defer_prefix);
+                Self::arm_for_dial(&mut self.next_lifecycle, actions, entry, now, defer_prefix);
             }
             PeerPhase::Discovered { .. } if !entry.pending_sends.is_empty() => {
-                Self::arm_for_dial(actions, entry, now, defer_prefix);
+                Self::arm_for_dial(&mut self.next_lifecycle, actions, entry, now, defer_prefix);
             }
             // `Dead` means we had reason to believe this peer was gone. An
             // advertisement received now is direct evidence to the contrary,
@@ -487,23 +553,15 @@ impl Registry {
                     | crate::transport::peer::DeadReason::Drained,
                 ..
             } => {
-                Self::clear_connection_state(entry);
+                Self::clear_connection_state(&mut self.next_lifecycle, actions, entry);
                 resurrected_endpoint = entry.verified_endpoint;
-                Self::arm_for_dial(actions, entry, now, defer_prefix);
+                Self::arm_for_dial(&mut self.next_lifecycle, actions, entry, now, defer_prefix);
             }
             PeerPhase::Reconnecting {
                 attempt, next_at, ..
             } if *next_at <= now => {
                 let attempt = *attempt;
-                entry.phase = PeerPhase::Connecting {
-                    attempt,
-                    started: now,
-                    path: crate::transport::peer::ConnectPath::Gatt,
-                };
-                actions.push(PeerAction::StartConnect {
-                    device_id: device_id.clone(),
-                    attempt,
-                });
+                Self::begin_connect(&mut self.next_lifecycle, actions, entry, now, attempt);
             }
             _ => {}
         }
@@ -533,7 +591,7 @@ impl Registry {
         let entry = self
             .peers
             .entry(device_id.clone())
-            .or_insert_with(|| PeerEntry::new(device_id.clone()));
+            .or_insert_with(|| Self::new_entry(&mut self.next_lifecycle, device_id.clone()));
         enum SendDecision {
             Enqueue,
             Reject,
@@ -688,15 +746,7 @@ impl Registry {
                         datagram,
                         waker,
                     });
-                entry.phase = PeerPhase::Connecting {
-                    attempt: 0,
-                    started: now,
-                    path: crate::transport::peer::ConnectPath::Gatt,
-                };
-                actions.push(PeerAction::StartConnect {
-                    device_id: device_id.clone(),
-                    attempt: 0,
-                });
+                Self::begin_connect(&mut self.next_lifecycle, actions, entry, now, 0);
             }
         }
     }
@@ -706,6 +756,7 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        lifecycle_id: u64,
         channel: crate::transport::peer::ChannelHandle,
     ) {
         let known_prefix = self.peers.get(&device_id).and_then(|entry| entry.prefix);
@@ -725,6 +776,21 @@ impl Registry {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
+        // The connect task can outlive its registry lifecycle, so it may be
+        // reporting for an attempt we have already walked away from. The
+        // replacement is authoritative; adopting the old result here would
+        // hand the new attempt a channel it never opened. Do not close the
+        // channel either — for this DeviceId it is the same native
+        // connection the replacement is about to use.
+        if entry.lifecycle_id != lifecycle_id {
+            tracing::debug!(
+                device = %device_id,
+                stale_gen = lifecycle_id,
+                current_gen = entry.lifecycle_id,
+                "dropping ConnectSucceeded from a superseded attempt"
+            );
+            return;
+        }
         if !matches!(entry.phase, PeerPhase::Connecting { .. }) {
             return;
         }
@@ -736,6 +802,7 @@ impl Registry {
         // so the momentary pipe is harmless.
         actions.push(PeerAction::ReadVersion {
             device_id: device_id.clone(),
+            lifecycle_id,
         });
         entry.subscribed_chars.clear();
         entry.tx_gen += 1;
@@ -749,6 +816,7 @@ impl Registry {
         let role = entry.role;
         actions.push(PeerAction::StartDataPipe {
             device_id: device_id.clone(),
+            lifecycle_id: entry.lifecycle_id,
             tx_gen,
             role,
             target_endpoint: entry.target_endpoint,
@@ -768,7 +836,14 @@ impl Registry {
             if let PeerPhase::Connected { upgrading, .. } = &mut entry.phase {
                 *upgrading = true;
             }
-            actions.push(PeerAction::UpgradeToL2cap { device_id });
+            entry.upgrade_gen += 1;
+            let upgrade_gen = entry.upgrade_gen;
+            let lifecycle_id = entry.lifecycle_id;
+            actions.push(PeerAction::UpgradeToL2cap {
+                device_id,
+                lifecycle_id,
+                upgrade_gen,
+            });
         }
     }
 
@@ -777,11 +852,21 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        lifecycle_id: u64,
         error: &str,
     ) {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
+        if entry.lifecycle_id != lifecycle_id {
+            tracing::debug!(
+                device = %device_id,
+                stale_gen = lifecycle_id,
+                current_gen = entry.lifecycle_id,
+                "dropping ConnectFailed from a superseded attempt"
+            );
+            return;
+        }
         let Some(attempt) = (if let PeerPhase::Connecting { attempt, .. } = &entry.phase {
             Some(*attempt)
         } else {
@@ -789,6 +874,22 @@ impl Registry {
         }) else {
             return;
         };
+        // Reaching here means nothing has replaced this dial: an inbound role
+        // replacement or an early notification would have promoted the peer
+        // out of `Connecting`, and a retry that already started would carry a
+        // newer lifecycle (both checked above). So the only session that can
+        // be on this device is the one that just failed, and it may have left
+        // a native link up — `connect` fails the same way whether the link
+        // never came up or came up and then failed GATT setup, and nothing
+        // else will ever close it, because a peer in `Connecting` has no
+        // channel for `CloseChannel` to name. Tearing down a link that was
+        // never established is a wasted call the driver logs and moves on
+        // from; leaving a live one up strands the peer.
+        actions.push(PeerAction::CloseNativeConnection {
+            device_id: device_id.clone(),
+            lifecycle_id,
+        });
+        Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
         let next_attempt = attempt + 1;
         entry.consecutive_failures += 1;
         actions.push(PeerAction::EmitMetric(format!("connect_failed:{error}")));
@@ -822,7 +923,7 @@ impl Registry {
         use std::collections::hash_map::Entry;
         let (entry, freshly_inserted) = match self.peers.entry(device_id.clone()) {
             Entry::Vacant(v) => {
-                let mut e = PeerEntry::new(device_id.clone());
+                let mut e = Self::new_entry(&mut self.next_lifecycle, device_id.clone());
                 e.role = crate::transport::peer::ConnectRole::Peripheral;
                 e.phase = PeerPhase::Connected {
                     since: now,
@@ -843,6 +944,7 @@ impl Registry {
             entry.rx_backlog.push_back(bytes);
             actions.push(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
+                lifecycle_id: entry.lifecycle_id,
                 tx_gen: 1,
                 role: crate::transport::peer::ConnectRole::Peripheral,
                 target_endpoint: entry.target_endpoint,
@@ -873,6 +975,7 @@ impl Registry {
             let role = entry.role;
             actions.push(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
+                lifecycle_id: entry.lifecycle_id,
                 tx_gen,
                 role,
                 target_endpoint: entry.target_endpoint,
@@ -910,6 +1013,7 @@ impl Registry {
                 crate::transport::peer::FragmentSource::PeripheralReceivedC2p
             ) {
                 Self::restart_peripheral_gatt_pipe(
+                    &mut self.next_lifecycle,
                     entry,
                     actions,
                     now,
@@ -962,6 +1066,11 @@ impl Registry {
                 crate::transport::peer::ConnectRole::Peripheral
             }
         };
+        if !(matches!(entry.phase, PeerPhase::Connecting { .. })
+            && role == crate::transport::peer::ConnectRole::Central)
+        {
+            Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
+        }
         entry.pipe = None;
         entry.role = role;
         entry.tx_gen += 1;
@@ -977,6 +1086,7 @@ impl Registry {
         entry.rx_backlog.push_back(bytes);
         actions.push(PeerAction::StartDataPipe {
             device_id: device_id.clone(),
+            lifecycle_id: entry.lifecycle_id,
             tx_gen: entry.tx_gen,
             role,
             target_endpoint: entry.target_endpoint,
@@ -986,6 +1096,7 @@ impl Registry {
     }
 
     fn restart_peripheral_gatt_pipe(
+        next_lifecycle: &mut u64,
         entry: &mut PeerEntry,
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
@@ -999,6 +1110,7 @@ impl Registry {
         // receive teardown signals, and the old task exits. This is the
         // intended teardown mechanism — do not add explicit aborts here.
         entry.pipe = None;
+        Self::abandon_outstanding(next_lifecycle, actions, entry);
         entry.role = crate::transport::peer::ConnectRole::Peripheral;
         entry.subscribed_chars.clear();
         if let Some(char_uuid) = subscribed_char {
@@ -1019,6 +1131,7 @@ impl Registry {
         }
         actions.push(PeerAction::StartDataPipe {
             device_id,
+            lifecycle_id: entry.lifecycle_id,
             tx_gen: entry.tx_gen,
             role: crate::transport::peer::ConnectRole::Peripheral,
             target_endpoint: entry.target_endpoint,
@@ -1037,6 +1150,7 @@ impl Registry {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
+        let lifecycle_id = entry.lifecycle_id;
         let reason = crate::transport::peer::DisconnectReason::from(cause);
         if entry.resume_after_drain && matches!(entry.phase, PeerPhase::Draining { .. }) {
             // The disconnect callback is the signal our own CloseChannel
@@ -1044,7 +1158,7 @@ impl Registry {
             // of idling out DRAINING_TIMEOUT is the difference between a ~2 s
             // and a 5 s reconnect floor. Re-draining would be worse than a
             // no-op: it resets `since` and extends the window.
-            Self::resume_drained_entry(actions, entry, now);
+            Self::resume_drained_entry(&mut self.next_lifecycle, actions, entry, now);
             return;
         }
         // A DeviceDisconnected for a peer we were in the middle of
@@ -1058,6 +1172,7 @@ impl Registry {
         // into the connect-failure retry path so Android GATT 133
         // (and similar) can back off + retry correctly.
         if let PeerPhase::Connecting { attempt, .. } = entry.phase {
+            Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
             let next_attempt = attempt + 1;
             entry.consecutive_failures += 1;
             entry.pending_sends.clear();
@@ -1080,7 +1195,10 @@ impl Registry {
                 };
             }
             if matches!(reason, crate::transport::peer::DisconnectReason::Gatt133) {
-                actions.push(PeerAction::Refresh { device_id });
+                actions.push(PeerAction::Refresh {
+                    device_id,
+                    lifecycle_id,
+                });
             }
             return;
         }
@@ -1090,10 +1208,12 @@ impl Registry {
             }
             _ => None,
         };
-        let broken_pipe_acks = Self::drain_to_draining(entry, now, reason.clone());
+        let broken_pipe_acks =
+            Self::drain_to_draining(&mut self.next_lifecycle, entry, now, reason.clone());
         actions.extend(broken_pipe_acks);
         if let Some(ch) = channel {
             actions.push(PeerAction::CloseChannel {
+                lifecycle_id,
                 device_id: device_id.clone(),
                 channel: ch,
                 reason: reason.clone(),
@@ -1101,6 +1221,7 @@ impl Registry {
         }
         if matches!(reason, crate::transport::peer::DisconnectReason::Gatt133) {
             actions.push(PeerAction::Refresh {
+                lifecycle_id,
                 device_id: device_id.clone(),
             });
         }
@@ -1114,6 +1235,7 @@ impl Registry {
     ) {
         if !powered {
             for entry in self.peers.values_mut() {
+                Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
                 entry.phase = PeerPhase::Restoring { since: now };
                 entry.pending_sends.clear();
             }
@@ -1194,32 +1316,27 @@ impl Registry {
                 .expect("device_id was just read from self.peers");
             match action {
                 TickAction::StartConnect { attempt } => {
-                    entry.phase = PeerPhase::Connecting {
+                    Self::begin_connect(
+                        &mut self.next_lifecycle,
+                        actions,
+                        entry,
+                        tick_now,
                         attempt,
-                        started: tick_now,
-                        path: crate::transport::peer::ConnectPath::Gatt,
-                    };
-                    actions.push(PeerAction::StartConnect {
-                        device_id: device_id.clone(),
-                        attempt,
-                    });
+                    );
                 }
                 TickAction::PendingDialExpired => {
-                    entry.phase = PeerPhase::Connecting {
-                        attempt: 0,
-                        started: tick_now,
-                        path: crate::transport::peer::ConnectPath::Gatt,
-                    };
-                    actions.push(PeerAction::StartConnect {
-                        device_id: device_id.clone(),
-                        attempt: 0,
-                    });
+                    Self::begin_connect(&mut self.next_lifecycle, actions, entry, tick_now, 0);
                 }
                 TickAction::DrainingToDead => {
                     if entry.resume_after_drain {
                         // Backstop for the peripheral role, where no
                         // disconnect callback arrives to resolve the drain.
-                        Self::resume_drained_entry(actions, entry, tick_now);
+                        Self::resume_drained_entry(
+                            &mut self.next_lifecycle,
+                            actions,
+                            entry,
+                            tick_now,
+                        );
                     } else {
                         // After the drain window, stop trying to rescue
                         // this DeviceId. Reconnection is driven by fresh
@@ -1248,10 +1365,17 @@ impl Registry {
                         None
                     };
                     let reason = crate::transport::peer::DisconnectReason::LinkDead;
-                    let drain_acks = Self::drain_to_draining(entry, tick_now, reason.clone());
+                    let lifecycle_id = entry.lifecycle_id;
+                    let drain_acks = Self::drain_to_draining(
+                        &mut self.next_lifecycle,
+                        entry,
+                        tick_now,
+                        reason.clone(),
+                    );
                     actions.extend(drain_acks);
                     if let Some(ch) = channel {
                         actions.push(PeerAction::CloseChannel {
+                            lifecycle_id,
                             device_id: device_id.clone(),
                             channel: ch,
                             reason,
@@ -1308,8 +1432,10 @@ impl Registry {
             }
             _ => None,
         };
+        let lifecycle_id = entry.lifecycle_id;
         let reason = crate::transport::peer::DisconnectReason::LocalClose;
         entry.pipe = None;
+        Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
         for send in entry.pending_sends.drain(..) {
             actions.push(PeerAction::AckSend {
                 tx_gen: send.tx_gen,
@@ -1325,6 +1451,7 @@ impl Registry {
         };
         if let Some(ch) = channel {
             actions.push(PeerAction::CloseChannel {
+                lifecycle_id,
                 device_id: device_id.clone(),
                 channel: ch,
                 reason,
@@ -1350,6 +1477,7 @@ impl Registry {
         }) else {
             return;
         };
+        let lifecycle_id = entry.lifecycle_id;
         let reason = match cause {
             crate::transport::peer::StallCause::LinkDead => {
                 crate::transport::peer::DisconnectReason::LinkDead
@@ -1358,7 +1486,8 @@ impl Registry {
                 crate::transport::peer::DisconnectReason::LocalClose
             }
         };
-        let broken_pipe_acks = Self::drain_to_draining(entry, now, reason.clone());
+        let broken_pipe_acks =
+            Self::drain_to_draining(&mut self.next_lifecycle, entry, now, reason.clone());
         // Hanging up is a local decision, not evidence about the radio: drain
         // the pipe, but let the entry come back once the close has landed
         // instead of tombstoning it for DEAD_GC_TTL. Set after the drain,
@@ -1366,6 +1495,7 @@ impl Registry {
         entry.resume_after_drain = matches!(cause, crate::transport::peer::StallCause::LocalClose);
         actions.extend(broken_pipe_acks);
         actions.push(PeerAction::CloseChannel {
+            lifecycle_id,
             device_id: device_id.clone(),
             channel,
             reason,
@@ -1373,7 +1503,11 @@ impl Registry {
     }
 
     fn handle_shutdown(&mut self, actions: &mut Vec<PeerAction>) {
+        // The actor exits after dispatching these actions. Invalidate work but
+        // leave phases alone; the newly allocated IDs will never be activated
+        // or used for cleanup, unlike IDs in an ongoing lifecycle transition.
         for entry in self.peers.values_mut() {
+            Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
             for send in entry.pending_sends.drain(..) {
                 actions.push(PeerAction::AckSend {
                     tx_gen: send.tx_gen,
@@ -1429,11 +1563,24 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
         l2cap_chan: blew::L2capChannel,
     ) {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
+        if entry.lifecycle_id != lifecycle_id || entry.upgrade_gen != upgrade_gen {
+            tracing::debug!(
+                device = %device_id,
+                received_lifecycle_id = lifecycle_id,
+                current_lifecycle_id = entry.lifecycle_id,
+                received_upgrade_gen = upgrade_gen,
+                current_upgrade_gen = entry.upgrade_gen,
+                "dropping OpenL2capSucceeded from a superseded upgrade"
+            );
+            return;
+        }
         match &entry.phase {
             PeerPhase::Handshaking { .. } => {
                 let gatt_channel = match &entry.phase {
@@ -1457,6 +1604,7 @@ impl Registry {
                 let role = entry.role;
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    lifecycle_id: entry.lifecycle_id,
                     tx_gen,
                     role,
                     target_endpoint: entry.target_endpoint,
@@ -1504,11 +1652,24 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
         error: &str,
     ) {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
+        if entry.lifecycle_id != lifecycle_id || entry.upgrade_gen != upgrade_gen {
+            tracing::debug!(
+                device = %device_id,
+                received_lifecycle_id = lifecycle_id,
+                current_lifecycle_id = entry.lifecycle_id,
+                received_upgrade_gen = upgrade_gen,
+                current_upgrade_gen = entry.upgrade_gen,
+                "dropping OpenL2capFailed from a superseded upgrade"
+            );
+            return;
+        }
         match &entry.phase {
             PeerPhase::Handshaking { .. } => {
                 let channel = match &entry.phase {
@@ -1537,6 +1698,7 @@ impl Registry {
                 let role = entry.role;
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    lifecycle_id: entry.lifecycle_id,
                     tx_gen,
                     role,
                     target_endpoint: entry.target_endpoint,
@@ -1596,7 +1758,7 @@ impl Registry {
         use std::collections::hash_map::Entry;
         match self.peers.entry(device_id.clone()) {
             Entry::Vacant(v) => {
-                let mut e = PeerEntry::new(device_id.clone());
+                let mut e = Self::new_entry(&mut self.next_lifecycle, device_id.clone());
                 e.role = crate::transport::peer::ConnectRole::Peripheral;
                 e.tx_gen = 1;
                 e.l2cap_channel = Some(channel);
@@ -1612,6 +1774,7 @@ impl Registry {
                 let inserted = v.insert(e);
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    lifecycle_id: inserted.lifecycle_id,
                     tx_gen: 1,
                     role: crate::transport::peer::ConnectRole::Peripheral,
                     target_endpoint: inserted.target_endpoint,
@@ -1676,6 +1839,7 @@ impl Registry {
                         }
                     }
                 } else {
+                    Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
                     entry.l2cap_channel = Some(channel);
                     entry.tx_gen += 1;
                     let tx_gen = entry.tx_gen;
@@ -1691,6 +1855,7 @@ impl Registry {
                     let role = entry.role;
                     actions.push(PeerAction::StartDataPipe {
                         device_id: device_id.clone(),
+                        lifecycle_id: entry.lifecycle_id,
                         tx_gen,
                         role,
                         target_endpoint: entry.target_endpoint,
@@ -1707,12 +1872,27 @@ impl Registry {
         actions: &mut Vec<PeerAction>,
         now: std::time::Instant,
         device_id: DeviceId,
+        lifecycle_id: u64,
         got: u8,
         want: u8,
     ) {
         let Some(entry) = self.peers.get_mut(&device_id) else {
             return;
         };
+        // The VERSION read belongs to the connect attempt that started it.
+        // A reply landing after that attempt was replaced says nothing about
+        // the peer we are talking to now, and tombstoning on it would kill a
+        // healthy replacement connection.
+        if entry.lifecycle_id != lifecycle_id {
+            tracing::debug!(
+                device = %device_id,
+                stale_gen = lifecycle_id,
+                current_gen = entry.lifecycle_id,
+                "dropping ProtocolVersionMismatch from a superseded attempt"
+            );
+            return;
+        }
+        let lifecycle_id = entry.lifecycle_id;
         let channel = match &entry.phase {
             PeerPhase::Handshaking { channel, .. } | PeerPhase::Connected { channel, .. } => {
                 Some(channel.clone())
@@ -1720,6 +1900,7 @@ impl Registry {
             _ => None,
         };
         let broken_pipe_acks = Self::drain_to_draining(
+            &mut self.next_lifecycle,
             entry,
             now,
             crate::transport::peer::DisconnectReason::ProtocolMismatch,
@@ -1732,6 +1913,7 @@ impl Registry {
         };
         if let Some(ch) = channel {
             actions.push(PeerAction::CloseChannel {
+                lifecycle_id,
                 device_id: device_id.clone(),
                 channel: ch,
                 reason: crate::transport::peer::DisconnectReason::ProtocolMismatch,
@@ -1747,7 +1929,12 @@ impl Registry {
 
     /// Wipe the leftovers of a connection that is definitively gone, so the
     /// entry can be reused for a fresh one.
-    fn clear_connection_state(entry: &mut PeerEntry) {
+    fn clear_connection_state(
+        next_lifecycle: &mut u64,
+        actions: &mut Vec<PeerAction>,
+        entry: &mut PeerEntry,
+    ) {
+        Self::abandon_outstanding(next_lifecycle, actions, entry);
         entry.consecutive_failures = 0;
         entry.pipe = None;
         entry.l2cap_channel = None;
@@ -1763,6 +1950,7 @@ impl Registry {
     /// `defer_prefix` is set, let the peer dial us first under the fairness
     /// rule.
     fn arm_for_dial(
+        next_lifecycle: &mut u64,
         actions: &mut Vec<PeerAction>,
         entry: &mut PeerEntry,
         now: std::time::Instant,
@@ -1777,30 +1965,65 @@ impl Registry {
                 prefix,
             };
         } else {
-            entry.phase = PeerPhase::Connecting {
-                attempt: 0,
-                started: now,
-                path: crate::transport::peer::ConnectPath::Gatt,
-            };
-            actions.push(PeerAction::StartConnect {
-                device_id: entry.device_id.clone(),
-                attempt: 0,
-            });
+            Self::begin_connect(next_lifecycle, actions, entry, now, 0);
         }
+    }
+
+    /// Start a connect attempt under a fresh lifecycle identity, retiring the
+    /// previous lifecycle before dispatching the new native work.
+    fn begin_connect(
+        next_lifecycle: &mut u64,
+        actions: &mut Vec<PeerAction>,
+        entry: &mut PeerEntry,
+        now: std::time::Instant,
+        attempt: u32,
+    ) {
+        let lifecycle_id = Self::abandon_outstanding(next_lifecycle, actions, entry);
+        entry.phase = PeerPhase::Connecting {
+            attempt,
+            started: now,
+            path: crate::transport::peer::ConnectPath::Gatt,
+        };
+        actions.push(PeerAction::StartConnect {
+            device_id: entry.device_id.clone(),
+            attempt,
+            lifecycle_id,
+        });
+    }
+
+    /// Retire this entry's lifecycle, rejecting its outstanding completions.
+    /// Returns a fresh lifecycle identity and resets its upgrade sequence.
+    fn abandon_outstanding(
+        next_lifecycle: &mut u64,
+        actions: &mut Vec<PeerAction>,
+        entry: &mut PeerEntry,
+    ) -> u64 {
+        actions.push(PeerAction::RetireLifecycle {
+            device_id: entry.device_id.clone(),
+            lifecycle_id: entry.lifecycle_id,
+        });
+        entry.lifecycle_id = *next_lifecycle;
+        *next_lifecycle = next_lifecycle
+            .checked_add(1)
+            .expect("lifecycle ID exhausted");
+        entry.upgrade_gen = 0;
+        entry.lifecycle_id
     }
 
     /// Finish a drain we asked for ourselves. The peer was never presumed
     /// gone, so it goes back to being dialable instead of `Dead`.
     fn resume_drained_entry(
+        next_lifecycle: &mut u64,
         actions: &mut Vec<PeerAction>,
         entry: &mut PeerEntry,
         now: std::time::Instant,
     ) {
-        Self::clear_connection_state(entry);
-        Self::arm_for_dial(actions, entry, now, None);
+        Self::clear_connection_state(next_lifecycle, actions, entry);
+        Self::arm_for_dial(next_lifecycle, actions, entry, now, None);
     }
 
     fn drain_to_draining(
+        next_lifecycle: &mut u64,
         entry: &mut PeerEntry,
         now: std::time::Instant,
         reason: crate::transport::peer::DisconnectReason,
@@ -1808,6 +2031,10 @@ impl Registry {
         let mut out = Vec::new();
         let was_connected = matches!(entry.phase, PeerPhase::Connected { .. });
         entry.pipe = None;
+        // Whatever the driver is still running for this peer belongs to a
+        // connection we have given up on; retire its tag so a late
+        // completion cannot be applied to the entry's next life.
+        Self::abandon_outstanding(next_lifecycle, &mut out, entry);
         // Every path into `Draining` lands here, so clearing the resume intent
         // by default keeps it scoped to the one teardown that asked for it —
         // `handle_stalled` re-arms it immediately afterwards.
@@ -1837,6 +2064,23 @@ impl Registry {
 
     pub fn peer(&self, device_id: &DeviceId) -> Option<&PeerEntry> {
         self.peers.get(device_id)
+    }
+
+    /// Identity of the peer's current lifecycle.
+    /// Tests synthesizing a driver completion use this to speak for the
+    /// attempt in flight; passing anything else is how they simulate a
+    /// completion from an attempt that has already been replaced.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn lifecycle_id(&self, device_id: &DeviceId) -> u64 {
+        self.peers.get(device_id).map_or(0, |e| e.lifecycle_id)
+    }
+
+    /// Generation the peer's outstanding L2CAP upgrade was started under.
+    #[cfg(any(test, feature = "testing"))]
+    #[must_use]
+    pub fn upgrade_gen(&self, device_id: &DeviceId) -> u64 {
+        self.peers.get(device_id).map_or(0, |e| e.upgrade_gen)
     }
 
     pub(crate) fn publish_snapshot(&self, target: &ArcSwap<SnapshotMaps>) {
@@ -2128,6 +2372,173 @@ mod tests {
         ]
     }
 
+    /// Everything about a `PeerEntry` a completion could plausibly move. A
+    /// stale completion must leave all of it alone, so the staleness property
+    /// can compare this across the call rather than naming one field.
+    #[derive(Debug, PartialEq)]
+    struct EntryFingerprint {
+        phase: PhaseKind,
+        tx_gen: u64,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
+        consecutive_failures: u32,
+        role: crate::transport::peer::ConnectRole,
+        l2cap_upgrade_failed: bool,
+        resume_after_drain: bool,
+        pending_sends: usize,
+        rx_backlog: usize,
+        has_pipe: bool,
+        has_l2cap_channel: bool,
+        target_endpoint: Option<iroh_base::EndpointId>,
+        verified_endpoint: Option<iroh_base::EndpointId>,
+        prefix: Option<crate::transport::peer::KeyPrefix>,
+    }
+
+    fn fingerprint(reg: &Registry, device_id: &DeviceId) -> Option<EntryFingerprint> {
+        reg.peer(device_id).map(|e| EntryFingerprint {
+            phase: PhaseKind::from(&e.phase),
+            tx_gen: e.tx_gen,
+            lifecycle_id: e.lifecycle_id,
+            upgrade_gen: e.upgrade_gen,
+            consecutive_failures: e.consecutive_failures,
+            role: e.role,
+            l2cap_upgrade_failed: e.l2cap_upgrade_failed,
+            resume_after_drain: e.resume_after_drain,
+            pending_sends: e.pending_sends.len(),
+            rx_backlog: e.rx_backlog.len(),
+            has_pipe: e.pipe.is_some(),
+            has_l2cap_channel: e.l2cap_channel.is_some(),
+            target_endpoint: e.target_endpoint,
+            verified_endpoint: e.verified_endpoint,
+            prefix: e.prefix,
+        })
+    }
+
+    /// The five completions the driver reports back under the lifecycle they
+    /// were started with.
+    #[derive(Debug, Clone, Copy)]
+    enum Completion {
+        ConnectSucceeded,
+        ConnectFailed,
+        VersionMismatch,
+        L2capSucceeded,
+        L2capFailed,
+    }
+
+    fn completion_command(
+        completion: Completion,
+        device_id: &DeviceId,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
+    ) -> PeerCommand {
+        match completion {
+            Completion::ConnectSucceeded => PeerCommand::ConnectSucceeded {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                channel: crate::transport::peer::ChannelHandle {
+                    id: 7,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                },
+            },
+            Completion::ConnectFailed => PeerCommand::ConnectFailed {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                error: "stale".into(),
+            },
+            Completion::VersionMismatch => PeerCommand::ProtocolVersionMismatch {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                got: 0xff,
+                want: crate::transport::transport::PROTOCOL_VERSION,
+            },
+            Completion::L2capSucceeded => PeerCommand::OpenL2capSucceeded {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                upgrade_gen,
+                channel: blew::L2capChannel::pair(1024).0,
+            },
+            Completion::L2capFailed => PeerCommand::OpenL2capFailed {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                upgrade_gen,
+                error: "stale".into(),
+            },
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum StalenessCommand {
+        Advertise {
+            endpoint_seed: u8,
+        },
+        Send {
+            endpoint_seed: u8,
+        },
+        Complete {
+            completion: Completion,
+        },
+        CentralDisconnected,
+        Stalled {
+            local: bool,
+        },
+        InboundFragment {
+            peripheral: bool,
+        },
+        PeripheralSubscribed,
+        VerifiedEndpoint {
+            endpoint_seed: u8,
+        },
+        AdapterOff,
+        AdapterOn,
+        Tick,
+        Forget,
+        DataPipeReady,
+        /// Retires every lifecycle without touching any phase — the one path
+        /// that can leave a retired entry mid-upgrade.
+        Shutdown,
+        /// Deliver one of the completions under a lifecycle this entry has
+        /// already left behind — the thing a detached driver task does when it
+        /// finishes after the registry moved on.
+        ReplayStale {
+            completion: Completion,
+            pick: u8,
+        },
+    }
+
+    fn completion_strategy() -> impl Strategy<Value = Completion> {
+        prop_oneof![
+            Just(Completion::ConnectSucceeded),
+            Just(Completion::ConnectFailed),
+            Just(Completion::VersionMismatch),
+            Just(Completion::L2capSucceeded),
+            Just(Completion::L2capFailed),
+        ]
+    }
+
+    fn staleness_command_strategy() -> impl Strategy<Value = StalenessCommand> {
+        prop_oneof![
+            // A narrow seed range so `Advertise` and `VerifiedEndpoint` name the
+            // same prefix often enough to reach the L2CAP upgrade paths. Seed 0
+            // is the registry's own endpoint, so peers start at 1.
+            (1u8..4).prop_map(|endpoint_seed| StalenessCommand::Advertise { endpoint_seed }),
+            (1u8..4).prop_map(|endpoint_seed| StalenessCommand::Send { endpoint_seed }),
+            completion_strategy().prop_map(|completion| StalenessCommand::Complete { completion }),
+            Just(StalenessCommand::CentralDisconnected),
+            any::<bool>().prop_map(|local| StalenessCommand::Stalled { local }),
+            any::<bool>().prop_map(|peripheral| StalenessCommand::InboundFragment { peripheral }),
+            Just(StalenessCommand::PeripheralSubscribed),
+            (1u8..4).prop_map(|endpoint_seed| StalenessCommand::VerifiedEndpoint { endpoint_seed }),
+            Just(StalenessCommand::AdapterOff),
+            Just(StalenessCommand::AdapterOn),
+            Just(StalenessCommand::Tick),
+            Just(StalenessCommand::Forget),
+            Just(StalenessCommand::DataPipeReady),
+            Just(StalenessCommand::Shutdown),
+            (completion_strategy(), any::<u8>())
+                .prop_map(|(completion, pick)| StalenessCommand::ReplayStale { completion, pick }),
+        ]
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2173,6 +2584,7 @@ mod tests {
                     }
                     TargetLifecycleCommand::ConnectSucceeded => reg.handle(PeerCommand::ConnectSucceeded {
                         device_id: device_id.clone(),
+                        lifecycle_id: reg.lifecycle_id(&device_id),
                         channel: crate::transport::peer::ChannelHandle {
                             id: 1,
                             path: crate::transport::peer::ConnectPath::Gatt,
@@ -2180,6 +2592,7 @@ mod tests {
                     }),
                     TargetLifecycleCommand::ConnectFailed => reg.handle(PeerCommand::ConnectFailed {
                         device_id: device_id.clone(),
+                        lifecycle_id: reg.lifecycle_id(&device_id),
                         error: "timeout".into(),
                     }),
                     TargetLifecycleCommand::CentralDisconnectedTimeout => reg.handle(
@@ -2327,7 +2740,8 @@ mod tests {
                     MultiPeerCommand::ConnectSucceeded { device_idx } => {
                         let device_id = device_ids[usize::from(device_idx)].clone();
                         reg.handle(PeerCommand::ConnectSucceeded {
-                            device_id,
+                            device_id: device_id.clone(),
+                            lifecycle_id: reg.lifecycle_id(&device_id),
                             channel: crate::transport::peer::ChannelHandle {
                                 id: u64::from(device_idx) + 1,
                                 path: crate::transport::peer::ConnectPath::Gatt,
@@ -2337,7 +2751,8 @@ mod tests {
                     MultiPeerCommand::ConnectFailed { device_idx } => {
                         let device_id = device_ids[usize::from(device_idx)].clone();
                         reg.handle(PeerCommand::ConnectFailed {
-                            device_id,
+                            device_id: device_id.clone(),
+                            lifecycle_id: reg.lifecycle_id(&device_id),
                             error: "timeout".into(),
                         })
                     }
@@ -2432,6 +2847,163 @@ mod tests {
                 }
             }
         }
+
+        /// Two properties that together are what makes a detached driver task
+        /// safe to ignore.
+        ///
+        /// **Lifecycle identities are never reused.** They come from a
+        /// registry-global counter, so an id only ever moves forward — across
+        /// retries, across teardown, and across the peer GC that drops the
+        /// `PeerEntry` entirely and builds a new one for the same `DeviceId`.
+        /// A per-entry counter would restart at zero there and could collide
+        /// with an identity a task from the peer's previous life still holds.
+        ///
+        /// **A completion under a retired identity changes nothing.** Not the
+        /// phase, not the retry budget, not the pipe, and no actions — so it
+        /// cannot violate any other invariant either, which is why this is
+        /// asserted here rather than woven through the other properties.
+        #[test]
+        fn a_retired_lifecycles_completion_cannot_touch_the_peer(
+            commands in prop::collection::vec(staleness_command_strategy(), 1..120)
+        ) {
+            let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+            let device_id = blew::DeviceId::from("prop-stale-peer");
+            let mut history: Vec<u64> = Vec::new();
+
+            for command in commands {
+                let live = reg.lifecycle_id(&device_id);
+                let upgrade_gen = reg.upgrade_gen(&device_id);
+
+                if let StalenessCommand::ReplayStale { completion, pick } = command {
+                    let retired: Vec<u64> =
+                        history.iter().copied().filter(|id| *id != live).collect();
+                    if retired.is_empty() {
+                        continue;
+                    }
+                    let stale_id = retired[usize::from(pick) % retired.len()];
+                    let before = fingerprint(&reg, &device_id);
+                    // Pass the live upgrade_gen so identity alone is what
+                    // rejects the L2CAP variants.
+                    let actions = reg.handle(completion_command(
+                        completion,
+                        &device_id,
+                        stale_id,
+                        upgrade_gen,
+                    ));
+                    prop_assert!(
+                        actions.is_empty(),
+                        "{completion:?} under retired lifecycle {stale_id} (live {live}) \
+                         produced {actions:?}"
+                    );
+                    prop_assert_eq!(
+                        before,
+                        fingerprint(&reg, &device_id),
+                        "{:?} under retired lifecycle {} (live {}) mutated the entry",
+                        completion,
+                        stale_id,
+                        live
+                    );
+                    continue;
+                }
+
+                let _ = match command {
+                    StalenessCommand::Advertise { endpoint_seed } => {
+                        let endpoint = endpoint_from_seed(endpoint_seed);
+                        reg.handle(PeerCommand::Advertised {
+                            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+                            device_id: device_id.clone(),
+                            rssi: None,
+                        })
+                    }
+                    StalenessCommand::Send { endpoint_seed } => {
+                        reg.handle(PeerCommand::SendDatagram {
+                            device_id: device_id.clone(),
+                            target_endpoint: Some(endpoint_from_seed(endpoint_seed)),
+                            tx_gen: reg.peer(&device_id).map_or(0, |e| e.tx_gen),
+                            datagram: bytes::Bytes::from_static(b"hello"),
+                            waker: noop_waker(),
+                        })
+                    }
+                    StalenessCommand::Complete { completion } => reg.handle(completion_command(
+                        completion,
+                        &device_id,
+                        live,
+                        upgrade_gen,
+                    )),
+                    StalenessCommand::CentralDisconnected => {
+                        reg.handle(PeerCommand::CentralDisconnected {
+                            device_id: device_id.clone(),
+                            cause: blew::DisconnectCause::LinkLoss,
+                        })
+                    }
+                    StalenessCommand::Stalled { local } => reg.handle(PeerCommand::Stalled {
+                        device_id: device_id.clone(),
+                        cause: if local {
+                            crate::transport::peer::StallCause::LocalClose
+                        } else {
+                            crate::transport::peer::StallCause::LinkDead
+                        },
+                    }),
+                    StalenessCommand::InboundFragment { peripheral } => {
+                        reg.handle(PeerCommand::InboundGattFragment {
+                            device_id: device_id.clone(),
+                            source: if peripheral {
+                                crate::transport::peer::FragmentSource::PeripheralReceivedC2p
+                            } else {
+                                crate::transport::peer::FragmentSource::CentralReceivedP2c
+                            },
+                            bytes: bytes::Bytes::from_static(b"frag"),
+                        })
+                    }
+                    StalenessCommand::PeripheralSubscribed => {
+                        reg.handle(PeerCommand::PeripheralClientSubscribed {
+                            client_id: device_id.clone(),
+                            char_uuid: uuid::Uuid::nil(),
+                            prefix: reg.peer(&device_id).and_then(|e| e.prefix),
+                        })
+                    }
+                    StalenessCommand::VerifiedEndpoint { endpoint_seed } => {
+                        reg.handle(PeerCommand::VerifiedEndpoint {
+                            endpoint_id: endpoint_from_seed(endpoint_seed),
+                            token: None,
+                        })
+                    }
+                    StalenessCommand::AdapterOff => {
+                        reg.handle(PeerCommand::AdapterStateChanged { powered: false })
+                    }
+                    StalenessCommand::AdapterOn => {
+                        reg.handle(PeerCommand::AdapterStateChanged { powered: true })
+                    }
+                    StalenessCommand::Tick => reg.handle(PeerCommand::Tick(
+                        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                    )),
+                    StalenessCommand::Forget => reg.handle(PeerCommand::Forget {
+                        device_id: device_id.clone(),
+                    }),
+                    StalenessCommand::DataPipeReady => {
+                        if reg.peer(&device_id).is_some() {
+                            mark_data_pipe_ready(&mut reg, &device_id);
+                        }
+                        Vec::new()
+                    }
+                    StalenessCommand::Shutdown => reg.handle(PeerCommand::Shutdown),
+                    StalenessCommand::ReplayStale { .. } => unreachable!("handled above"),
+                };
+
+                let current = reg.lifecycle_id(&device_id);
+                if current != 0 {
+                    if let Some(&last) = history.last() {
+                        prop_assert!(
+                            current >= last,
+                            "lifecycle {current} reuses or precedes {last}"
+                        );
+                    }
+                    if history.last() != Some(&current) {
+                        history.push(current);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2511,6 +3083,7 @@ mod tests {
         };
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: ch,
         });
         let has_start = actions.iter().any(|a| matches!(
@@ -2561,6 +3134,7 @@ mod tests {
         };
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: ch,
         });
         assert!(
@@ -2573,7 +3147,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                PeerAction::UpgradeToL2cap { device_id: d } if *d == device_id
+                PeerAction::UpgradeToL2cap { device_id: d, .. } if *d == device_id
             )),
             "expected UpgradeToL2cap; got {actions:?}"
         );
@@ -2626,12 +3200,13 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: ch,
         });
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                PeerAction::UpgradeToL2cap { device_id: d } if *d == device_id
+                PeerAction::UpgradeToL2cap { device_id: d, .. } if *d == device_id
             )),
             "lone connected central must get UpgradeToL2cap even when it is the lower endpoint; got {actions:?}"
         );
@@ -2661,6 +3236,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::ConnectFailed {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             error: "boom".into(),
         });
         assert!(
@@ -2691,6 +3267,7 @@ mod tests {
         });
         let _actions = reg.handle(PeerCommand::ConnectFailed {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             error: "final boom".into(),
         });
         assert!(matches!(
@@ -2966,6 +3543,7 @@ mod tests {
         // Slow path arrives after the fast one.
         let actions = reg.handle(PeerCommand::ConnectFailed {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             error: "gatt 133".into(),
         });
         assert!(actions.is_empty(), "ConnectFailed must be a no-op");
@@ -3037,8 +3615,11 @@ mod tests {
         }
         let actions = reg.handle(PeerCommand::AdapterStateChanged { powered: false });
         assert!(
-            actions.is_empty(),
-            "powered=false emits no driver actions; blew tears the stack down on its own, and rebuild/restart fire on powered=true"
+            actions.len() == ids.len()
+                && actions
+                    .iter()
+                    .all(|a| matches!(a, PeerAction::RetireLifecycle { .. })),
+            "adapter-off retires each lifecycle without issuing native teardown"
         );
         for device_id in &ids {
             assert!(matches!(
@@ -3066,7 +3647,10 @@ mod tests {
         });
         assert!(matches!(
             actions.as_slice(),
-            [PeerAction::StartConnect { .. }]
+            [
+                PeerAction::RetireLifecycle { .. },
+                PeerAction::StartConnect { .. }
+            ]
         ));
         assert!(matches!(
             reg.peer(&device_id).unwrap().phase,
@@ -3095,7 +3679,10 @@ mod tests {
         });
         assert!(matches!(
             actions.as_slice(),
-            [PeerAction::StartConnect { .. }]
+            [
+                PeerAction::RetireLifecycle { .. },
+                PeerAction::StartConnect { .. }
+            ]
         ));
         assert_eq!(
             reg.peer(&device_id).unwrap().target_endpoint,
@@ -3104,6 +3691,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: crate::transport::peer::ChannelHandle {
                 id: 1,
                 path: crate::transport::peer::ConnectPath::Gatt,
@@ -3135,7 +3723,10 @@ mod tests {
         });
         assert!(matches!(
             actions.as_slice(),
-            [PeerAction::StartConnect { .. }]
+            [
+                PeerAction::RetireLifecycle { .. },
+                PeerAction::StartConnect { .. }
+            ]
         ));
         assert_eq!(
             reg.peer(&device_id).unwrap().target_endpoint,
@@ -3144,6 +3735,7 @@ mod tests {
 
         let _ = reg.handle(PeerCommand::ConnectFailed {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             error: "timeout".into(),
         });
         assert!(matches!(
@@ -3160,11 +3752,12 @@ mod tests {
         ));
         assert!(matches!(
             actions.as_slice(),
-            [PeerAction::StartConnect { device_id: d, attempt: 1 }] if d == &device_id
+            [PeerAction::RetireLifecycle { .. }, PeerAction::StartConnect { device_id: d, attempt: 1, .. }] if d == &device_id
         ));
 
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: crate::transport::peer::ChannelHandle {
                 id: 2,
                 path: crate::transport::peer::ConnectPath::Gatt,
@@ -3217,6 +3810,7 @@ mod tests {
         ));
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: crate::transport::peer::ChannelHandle {
                 id: 3,
                 path: crate::transport::peer::ConnectPath::Gatt,
@@ -3271,6 +3865,7 @@ mod tests {
         ));
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: crate::transport::peer::ChannelHandle {
                 id: 4,
                 path: crate::transport::peer::ConnectPath::Gatt,
@@ -3753,7 +4348,10 @@ mod tests {
 
         let actions = advertise(&mut reg, &device_id, [0u8; 12]);
 
-        assert!(actions.is_empty(), "no queued sends, so no dial");
+        assert!(
+            matches!(actions.as_slice(), [PeerAction::RetireLifecycle { .. }]),
+            "no queued sends, so only retire"
+        );
         assert!(
             matches!(
                 reg.peer(&device_id).unwrap().phase,
@@ -4622,7 +5220,10 @@ mod tests {
             client_id: client.clone(),
             char_uuid: second,
         });
-        assert!(actions.is_empty(), "no pending sends to ack in this setup");
+        assert!(
+            matches!(actions.as_slice(), [PeerAction::RetireLifecycle { .. }]),
+            "last unsubscribe retires the lifecycle"
+        );
         let entry = reg.peer(&client).unwrap();
         assert!(entry.subscribed_chars.is_empty());
         assert!(
@@ -5213,6 +5814,7 @@ mod tests {
         };
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: ch,
         });
 
@@ -5254,7 +5856,9 @@ mod tests {
 
         let (l2cap_chan, _other) = blew::L2capChannel::pair(1024);
         let actions = reg.handle(PeerCommand::OpenL2capSucceeded {
+            lifecycle_id: reg.lifecycle_id(&device_id),
             device_id: device_id.clone(),
+            upgrade_gen: reg.upgrade_gen(&device_id),
             channel: l2cap_chan,
         });
 
@@ -5307,7 +5911,9 @@ mod tests {
         });
 
         let actions = reg.handle(PeerCommand::OpenL2capFailed {
+            lifecycle_id: reg.lifecycle_id(&device_id),
             device_id: device_id.clone(),
+            upgrade_gen: reg.upgrade_gen(&device_id),
             error: "no PSM".into(),
         });
 
@@ -5601,7 +6207,9 @@ mod tests {
         });
         let (chan, _other) = blew::L2capChannel::pair(1024);
         let actions = reg.handle(PeerCommand::OpenL2capSucceeded {
+            lifecycle_id: reg.lifecycle_id(&device_id),
             device_id: device_id.clone(),
+            upgrade_gen: reg.upgrade_gen(&device_id),
             channel: chan,
         });
         assert!(actions.iter().any(|a| matches!(
@@ -5635,7 +6243,9 @@ mod tests {
             e
         });
         let actions = reg.handle(PeerCommand::OpenL2capFailed {
+            lifecycle_id: reg.lifecycle_id(&device_id),
             device_id: device_id.clone(),
+            upgrade_gen: reg.upgrade_gen(&device_id),
             error: "no l2cap".into(),
         });
         assert!(actions.iter().any(|a| matches!(
@@ -5751,6 +6361,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             channel: ChannelHandle {
                 id: 1,
                 path: ConnectPath::Gatt,
@@ -5759,7 +6370,7 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                PeerAction::ReadVersion { device_id: d } if *d == device_id
+                PeerAction::ReadVersion { device_id: d, .. } if *d == device_id
             )),
             "expected ReadVersion; got {actions:?}"
         );
@@ -5786,6 +6397,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::ProtocolVersionMismatch {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             got: 7,
             want: 1,
         });
@@ -5807,6 +6419,7 @@ mod tests {
         let mut reg = Registry::new_for_test();
         let actions = reg.handle(PeerCommand::ProtocolVersionMismatch {
             device_id: blew::DeviceId::from("dev-unknown"),
+            lifecycle_id: reg.lifecycle_id(&blew::DeviceId::from("dev-unknown")),
             got: 9,
             want: 1,
         });
@@ -5931,6 +6544,7 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::ConnectFailed {
             device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
             error: "final boom".into(),
         });
         assert!(matches!(
@@ -6779,7 +7393,7 @@ mod tests {
 
         assert!(
             actions.iter().any(
-                |a| matches!(a, PeerAction::UpgradeToL2cap { device_id } if device_id == &dev)
+                |a| matches!(a, PeerAction::UpgradeToL2cap { device_id, .. } if device_id == &dev)
             ),
             "winner must get UpgradeToL2cap; got {actions:?}"
         );
@@ -6830,7 +7444,7 @@ mod tests {
 
         assert!(
             actions.iter().any(
-                |a| matches!(a, PeerAction::UpgradeToL2cap { device_id } if device_id == &dev)
+                |a| matches!(a, PeerAction::UpgradeToL2cap { device_id, .. } if device_id == &dev)
             ),
             "lone connected central must get UpgradeToL2cap even when it is the lower endpoint; got {actions:?}"
         );
@@ -6966,7 +7580,9 @@ mod tests {
 
         let (l2cap_chan, _other) = blew::L2capChannel::pair(1024);
         let actions = reg.handle(PeerCommand::OpenL2capSucceeded {
+            lifecycle_id: reg.lifecycle_id(&device_id),
             device_id: device_id.clone(),
+            upgrade_gen: reg.upgrade_gen(&device_id),
             channel: l2cap_chan,
         });
 
@@ -7017,7 +7633,9 @@ mod tests {
 
         let (l2cap_chan, _other) = blew::L2capChannel::pair(1024);
         let actions = reg.handle(PeerCommand::OpenL2capSucceeded {
+            lifecycle_id: reg.lifecycle_id(&device_id),
             device_id: device_id.clone(),
+            upgrade_gen: reg.upgrade_gen(&device_id),
             channel: l2cap_chan,
         });
 
@@ -7061,7 +7679,9 @@ mod tests {
         });
 
         let actions = reg.handle(PeerCommand::OpenL2capFailed {
+            lifecycle_id: reg.lifecycle_id(&device_id),
             device_id: device_id.clone(),
+            upgrade_gen: reg.upgrade_gen(&device_id),
             error: "upgrade timed out".into(),
         });
 
@@ -7155,7 +7775,9 @@ mod tests {
         }
 
         let actions = reg.handle(PeerCommand::OpenL2capFailed {
+            lifecycle_id: reg.lifecycle_id(&dev),
             device_id: dev.clone(),
+            upgrade_gen: reg.upgrade_gen(&dev),
             error: "psm read failed".into(),
         });
 
@@ -7209,5 +7831,257 @@ mod tests {
             !e.l2cap_upgrade_failed,
             "drain_to_draining must reset the flag so reconnect can retry L2CAP"
         );
+    }
+    /// A connect task the driver detached for attempt A can complete after
+    /// the registry has already given up on A and started B against the same
+    /// device. Neither of A's outcomes may be applied to B: adopting the
+    /// success hands B a channel it never opened, and adopting the failure
+    /// spends one of B's retries (and, at the end of the budget, tombstones a
+    /// peer that is dialing fine).
+    #[test]
+    fn a_replaced_connect_attempt_cannot_speak_for_its_replacement() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-stale-attempt");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x71u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device_id: device_id.clone(),
+            rssi: None,
+        });
+        let actions = reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                PeerAction::RetireLifecycle { .. },
+                PeerAction::StartConnect { .. }
+            ]
+        ));
+        let gen_a = reg.lifecycle_id(&device_id);
+
+        // The central disconnects mid-dial. A is abandoned, but its task is
+        // detached and still running.
+        reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::LinkLoss,
+        });
+        let actions = reg.handle(PeerCommand::Tick(
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        assert!(matches!(
+            actions.as_slice(),
+            [PeerAction::RetireLifecycle { .. }, PeerAction::StartConnect { device_id: d, attempt: 1, .. }] if d == &device_id
+        ));
+        let gen_b = reg.lifecycle_id(&device_id);
+        assert_ne!(gen_a, gen_b, "the retry must mint a fresh generation");
+
+        // A finishes, successfully.
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            lifecycle_id: gen_a,
+            channel: crate::transport::peer::ChannelHandle {
+                id: 1,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert!(
+            actions.is_empty(),
+            "a superseded attempt's success must be dropped; got {actions:?}"
+        );
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Connecting { attempt: 1, .. }
+        ));
+
+        // And the failure variant, which used to burn one of B's retries.
+        let failures_before = reg.peer(&device_id).unwrap().consecutive_failures;
+        let actions = reg.handle(PeerCommand::ConnectFailed {
+            device_id: device_id.clone(),
+            lifecycle_id: gen_a,
+            error: "timeout".into(),
+        });
+        assert!(
+            actions.is_empty(),
+            "a superseded attempt's failure must be dropped; got {actions:?}"
+        );
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(matches!(
+            entry.phase,
+            PeerPhase::Connecting { attempt: 1, .. }
+        ));
+        assert_eq!(entry.consecutive_failures, failures_before);
+
+        // B is still the one that gets to decide.
+        let actions = reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            lifecycle_id: gen_b,
+            channel: crate::transport::peer::ChannelHandle {
+                id: 2,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, PeerAction::StartDataPipe { .. })),
+            "the live attempt must still be able to connect; got {actions:?}"
+        );
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Connected { .. }
+        ));
+    }
+
+    /// The VERSION read is started by a connect attempt and answered
+    /// asynchronously. A mismatch reported after that attempt was replaced
+    /// describes a connection that no longer exists, so it must not tombstone
+    /// the peer that is connected now.
+    #[test]
+    fn a_replaced_attempts_version_mismatch_does_not_tombstone_the_replacement() {
+        let mut reg = Registry::new_for_test();
+        let device_id = blew::DeviceId::from("dev-stale-version");
+        let endpoint = iroh_base::SecretKey::from_bytes(&[0x72u8; 32]).public();
+        reg.handle(PeerCommand::Advertised {
+            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+            device_id: device_id.clone(),
+            rssi: None,
+        });
+        reg.handle(PeerCommand::SendDatagram {
+            device_id: device_id.clone(),
+            target_endpoint: Some(endpoint),
+            tx_gen: 0,
+            datagram: bytes::Bytes::from_static(b"hello"),
+            waker: noop_waker(),
+        });
+        let gen_a = reg.lifecycle_id(&device_id);
+        reg.handle(PeerCommand::ConnectFailed {
+            device_id: device_id.clone(),
+            lifecycle_id: gen_a,
+            error: "timeout".into(),
+        });
+        reg.handle(PeerCommand::Tick(
+            std::time::Instant::now() + std::time::Duration::from_secs(3600),
+        ));
+        reg.handle(PeerCommand::ConnectSucceeded {
+            device_id: device_id.clone(),
+            lifecycle_id: reg.lifecycle_id(&device_id),
+            channel: crate::transport::peer::ChannelHandle {
+                id: 2,
+                path: crate::transport::peer::ConnectPath::Gatt,
+            },
+        });
+
+        let actions = reg.handle(PeerCommand::ProtocolVersionMismatch {
+            device_id: device_id.clone(),
+            lifecycle_id: gen_a,
+            got: 7,
+            want: crate::transport::transport::PROTOCOL_VERSION,
+        });
+        assert!(
+            actions.is_empty(),
+            "a superseded attempt's VERSION read must be dropped; got {actions:?}"
+        );
+        assert!(matches!(
+            reg.peer(&device_id).unwrap().phase,
+            PeerPhase::Connected { .. }
+        ));
+    }
+
+    /// L2CAP opens are detached too, and the peer keeps its identity across a
+    /// reconnect, so an open started before a teardown can land on the entry's
+    /// next life and hand it a channel belonging to a dead ACL link.
+    #[test]
+    fn an_l2cap_result_from_before_a_reconnect_is_rejected() {
+        use crate::transport::peer::{ChannelHandle, ConnectPath, ConnectRole};
+
+        let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+        let device_id = blew::DeviceId::from("dev-stale-upgrade");
+        reg.peers.insert(device_id.clone(), {
+            let mut e = PeerEntry::new(device_id.clone());
+            e.role = ConnectRole::Central;
+            e.tx_gen = 1;
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: 1,
+                upgrading: true,
+            };
+            e
+        });
+        let stale_gen = reg.upgrade_gen(&device_id);
+
+        // The connection is torn down and rebuilt while that open is in
+        // flight, and the new one starts an upgrade of its own.
+        reg.handle(PeerCommand::CentralDisconnected {
+            device_id: device_id.clone(),
+            cause: blew::DisconnectCause::LinkLoss,
+        });
+        reg.handle(PeerCommand::Advertised {
+            prefix: [9u8; crate::transport::peer::KEY_PREFIX_LEN],
+            device_id: device_id.clone(),
+            rssi: None,
+        });
+        {
+            let e = reg.peers.get_mut(&device_id).unwrap();
+            e.phase = PeerPhase::Connected {
+                since: std::time::Instant::now(),
+                channel: ChannelHandle {
+                    id: 2,
+                    path: ConnectPath::Gatt,
+                },
+                tx_gen: e.tx_gen,
+                upgrading: true,
+            };
+            e.upgrade_gen += 1;
+        }
+        let live_gen = reg.upgrade_gen(&device_id);
+        assert_ne!(stale_gen, live_gen);
+
+        let (l2cap_chan, _other) = blew::L2capChannel::pair(1024);
+        let actions = reg.handle(PeerCommand::OpenL2capSucceeded {
+            lifecycle_id: reg.lifecycle_id(&device_id),
+            device_id: device_id.clone(),
+            upgrade_gen: stale_gen,
+            channel: l2cap_chan,
+        });
+        assert!(
+            actions.is_empty(),
+            "a superseded upgrade's channel must be dropped; got {actions:?}"
+        );
+        match &reg.peer(&device_id).unwrap().phase {
+            PeerPhase::Connected {
+                channel, upgrading, ..
+            } => {
+                assert_eq!(channel.path, ConnectPath::Gatt);
+                assert!(*upgrading, "the live upgrade must still be outstanding");
+            }
+            other => panic!("expected Connected, got {other:?}"),
+        }
+
+        // Nor may the stale failure retire the live upgrade.
+        let actions = reg.handle(PeerCommand::OpenL2capFailed {
+            lifecycle_id: reg.lifecycle_id(&device_id),
+            device_id: device_id.clone(),
+            upgrade_gen: stale_gen,
+            error: "l2cap select timeout".into(),
+        });
+        assert!(actions.is_empty(), "got {actions:?}");
+        let entry = reg.peer(&device_id).unwrap();
+        assert!(!entry.l2cap_upgrade_failed);
+        assert!(matches!(
+            entry.phase,
+            PeerPhase::Connected {
+                upgrading: true,
+                ..
+            }
+        ));
     }
 }

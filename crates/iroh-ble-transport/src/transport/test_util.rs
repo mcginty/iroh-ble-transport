@@ -59,6 +59,13 @@ struct Inner {
 #[derive(Clone)]
 pub struct MockBleInterface {
     inner: Arc<Mutex<Inner>>,
+    /// `true` parks every `disconnect` call after it has been recorded, so a
+    /// test can hold a teardown open across the point where a replacement
+    /// dial would otherwise start.
+    disconnect_hold: Arc<tokio::sync::watch::Sender<bool>>,
+    refresh_hold: Arc<tokio::sync::watch::Sender<bool>>,
+    connect_hold: Arc<tokio::sync::watch::Sender<bool>>,
+    version_hold: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Default for MockBleInterface {
@@ -70,6 +77,10 @@ impl Default for MockBleInterface {
 impl MockBleInterface {
     pub fn new() -> Self {
         Self {
+            disconnect_hold: Arc::new(tokio::sync::watch::channel(false).0),
+            refresh_hold: Arc::new(tokio::sync::watch::channel(false).0),
+            connect_hold: Arc::new(tokio::sync::watch::channel(false).0),
+            version_hold: Arc::new(tokio::sync::watch::channel(false).0),
             inner: Arc::new(Mutex::new(Inner {
                 calls: Vec::new(),
                 connect_queue: VecDeque::new(),
@@ -142,6 +153,32 @@ impl MockBleInterface {
         self.inner.lock().unwrap().connect_delay = Some(delay);
     }
 
+    /// Park `disconnect` after it records its call, until
+    /// `release_disconnect`. Models a platform teardown that takes a while.
+    pub fn hold_disconnect(&self) {
+        self.disconnect_hold.send_replace(true);
+    }
+
+    pub fn release_disconnect(&self) {
+        self.disconnect_hold.send_replace(false);
+    }
+
+    pub fn set_connect_held(&self, held: bool) {
+        self.connect_hold.send_replace(held);
+    }
+
+    pub fn set_version_held(&self, held: bool) {
+        self.version_hold.send_replace(held);
+    }
+
+    pub fn set_refresh_held(&self, held: bool) {
+        self.refresh_hold.send_replace(held);
+    }
+
+    pub fn cleanup_waiters(&self) -> usize {
+        self.disconnect_hold.receiver_count() + self.refresh_hold.receiver_count()
+    }
+
     pub fn set_on_c2p_write(&self, hook: Box<dyn Fn(DeviceId, Bytes) + Send + Sync>) {
         self.inner.lock().unwrap().on_c2p_write = Some(Arc::from(hook));
     }
@@ -207,6 +244,8 @@ impl BleInterface for MockBleInterface {
                 });
             (delay, result)
         };
+        let mut hold = self.connect_hold.subscribe();
+        let _ = hold.wait_for(|held| !*held).await;
         if let Some(d) = delay {
             tokio::time::sleep(d).await;
         }
@@ -214,14 +253,19 @@ impl BleInterface for MockBleInterface {
     }
 
     async fn disconnect(&self, device_id: &DeviceId) -> BleResult<()> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.calls.push(CallKind::Disconnect(device_id.clone()));
-        inner
-            .disconnect_queue
-            .iter()
-            .position(|(id, _)| id == device_id)
-            .map(|pos| inner.disconnect_queue.remove(pos).unwrap().1)
-            .unwrap_or(Ok(()))
+        let result = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.calls.push(CallKind::Disconnect(device_id.clone()));
+            inner
+                .disconnect_queue
+                .iter()
+                .position(|(id, _)| id == device_id)
+                .map(|pos| inner.disconnect_queue.remove(pos).unwrap().1)
+                .unwrap_or(Ok(()))
+        };
+        let mut hold = self.disconnect_hold.subscribe();
+        let _ = hold.wait_for(|held| !*held).await;
+        result
     }
 
     async fn write_c2p(&self, device_id: &DeviceId, bytes: Bytes) -> BleResult<()> {
@@ -271,9 +315,14 @@ impl BleInterface for MockBleInterface {
     }
 
     async fn read_version(&self, device_id: &DeviceId) -> BleResult<Option<u8>> {
-        let mut inner = self.inner.lock().unwrap();
-        inner.calls.push(CallKind::ReadVersion(device_id.clone()));
-        Ok(inner.version_responses.pop_front().flatten())
+        let response = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.calls.push(CallKind::ReadVersion(device_id.clone()));
+            inner.version_responses.pop_front().flatten()
+        };
+        let mut hold = self.version_hold.subscribe();
+        let _ = hold.wait_for(|held| !*held).await;
+        Ok(response)
     }
 
     async fn read_psm(&self, device_id: &DeviceId) -> BleResult<Option<u16>> {
@@ -344,6 +393,8 @@ impl BleInterface for MockBleInterface {
             .unwrap()
             .calls
             .push(CallKind::Refresh(device_id.clone()));
+        let mut hold = self.refresh_hold.subscribe();
+        let _ = hold.wait_for(|held| !*held).await;
         Ok(())
     }
 

@@ -89,6 +89,11 @@ pub struct PeerEntry {
     /// and rejected rather than silently delivered on a channel the caller
     /// never intended. Never decrements; the starting value is 0.
     pub tx_gen: u64,
+    /// Registry-allocated lifecycle identity, never reused even after peer GC.
+    /// Native work, retirement, and asynchronous completions share this identity.
+    pub lifecycle_id: u64,
+    /// Operation sequence within a lifecycle; reset when the lifecycle is retired.
+    pub upgrade_gen: u64,
     pub pending_sends: VecDeque<PendingSend>,
     pub role: ConnectRole,
     pub pipe: Option<PipeHandles>,
@@ -129,6 +134,8 @@ impl PeerEntry {
             last_tx: None,
             consecutive_failures: 0,
             tx_gen: 0,
+            lifecycle_id: 0,
+            upgrade_gen: 0,
             pending_sends: VecDeque::new(),
             role: ConnectRole::Central,
             pipe: None,
@@ -302,18 +309,24 @@ pub enum PeerCommand {
     Tick(Instant),
     ConnectSucceeded {
         device_id: DeviceId,
+        lifecycle_id: u64,
         channel: ChannelHandle,
     },
     ConnectFailed {
         device_id: DeviceId,
+        lifecycle_id: u64,
         error: String,
     },
     OpenL2capSucceeded {
         device_id: DeviceId,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
         channel: L2capChannel,
     },
     OpenL2capFailed {
         device_id: DeviceId,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
         error: String,
     },
     /// Central read the peer's VERSION characteristic and got back a byte
@@ -322,6 +335,7 @@ pub enum PeerCommand {
     /// incompatible data pipe start.
     ProtocolVersionMismatch {
         device_id: DeviceId,
+        lifecycle_id: u64,
         got: u8,
         want: u8,
     },
@@ -381,20 +395,42 @@ pub enum PeerAction {
     StartConnect {
         device_id: DeviceId,
         attempt: u32,
+        lifecycle_id: u64,
     },
     /// Read the peer's VERSION characteristic and, on mismatch, emit
     /// [`PeerCommand::ProtocolVersionMismatch`] so the registry can Dead
     /// the peer instead of running an incompatible data pipe.
     ReadVersion {
         device_id: DeviceId,
+        lifecycle_id: u64,
+    },
+    /// Cancel queued connect work and queued/running VERSION or L2CAP work
+    /// for this lifecycle. Native ownership remains until a replacement is
+    /// activated in dispatch order, so its cleanup can still run. Retirement
+    /// does not itself disconnect, and a running connect is joined.
+    RetireLifecycle {
+        device_id: DeviceId,
+        lifecycle_id: u64,
     },
     CloseChannel {
         device_id: DeviceId,
+        lifecycle_id: u64,
         channel: ChannelHandle,
         reason: DisconnectReason,
     },
+    /// Tear down a native link a failed dial may have left up: `connect`
+    /// reports one error whether the link never came up or came up and then
+    /// failed GATT setup, and a peer in `Connecting` holds no channel, so
+    /// `CloseChannel` cannot express this. Emitted only while nothing has
+    /// replaced the dial — the registry's own guards decide that — and gated
+    /// on native ownership by the driver like any other cleanup.
+    CloseNativeConnection {
+        device_id: DeviceId,
+        lifecycle_id: u64,
+    },
     Refresh {
         device_id: DeviceId,
+        lifecycle_id: u64,
     },
     AckSend {
         tx_gen: u64,
@@ -406,6 +442,7 @@ pub enum PeerAction {
     RestartL2capListener,
     StartDataPipe {
         device_id: DeviceId,
+        lifecycle_id: u64,
         tx_gen: u64,
         role: ConnectRole,
         target_endpoint: Option<iroh_base::EndpointId>,
@@ -416,6 +453,8 @@ pub enum PeerAction {
     /// for this already-connected GATT peer.
     UpgradeToL2cap {
         device_id: DeviceId,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
     },
     /// L2CAP open succeeded; add the L2CAP worker to this peer's pipe
     /// supervisor alongside the existing GATT worker (both-paths-alive;
@@ -451,6 +490,8 @@ mod tests {
         let e = PeerEntry::new(DeviceId::from("test"));
         assert!(matches!(e.phase, PeerPhase::Unknown));
         assert_eq!(e.tx_gen, 0);
+        assert_eq!(e.lifecycle_id, 0);
+        assert_eq!(e.upgrade_gen, 0);
     }
 
     #[test]
@@ -491,6 +532,7 @@ mod tests {
         };
         let _act = PeerAction::StartDataPipe {
             device_id: DeviceId::from("x"),
+            lifecycle_id: 1,
             tx_gen: 1,
             role: ConnectRole::Central,
             target_endpoint: None,
@@ -518,7 +560,9 @@ mod tests {
             device_id: DeviceId::from("x"),
         };
         let _act1 = PeerAction::UpgradeToL2cap {
+            lifecycle_id: 1,
             device_id: DeviceId::from("x"),
+            upgrade_gen: 1,
         };
         assert_eq!(DisconnectReason::DedupLoser, DisconnectReason::DedupLoser);
     }

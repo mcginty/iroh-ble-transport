@@ -85,7 +85,7 @@ crates/iroh-ble-transport/src/
     ├── mod.rs               # Module tree + re-exports
     ├── transport.rs         # BleTransport: iroh CustomTransport entry point
     ├── interface.rs         # BleInterface trait — blew abstraction the driver consumes
-    ├── driver.rs            # Action executor: PeerAction → BleInterface calls → PeerCommand follow-ups
+    ├── driver.rs            # Action executor: PeerAction → BleInterface calls → PeerCommand follow-ups; per-device lanes
     ├── registry.rs          # Pure state machine (PeerEntry/PeerPhase) + actor loop
     ├── peer.rs              # PeerEntry, PeerPhase, PeerCommand, PeerAction, ChannelHandle
     ├── routing.rs           # TransportRouting: Token ↔ peer-identity, KeyPrefix → DeviceId
@@ -214,6 +214,78 @@ Key constants (registry.rs):
 | `DEAD_GC_TTL` | 60 s | How long a `Dead` entry sticks around for dedup |
 
 The transport itself is **passive**: it never dials on its own. Both resume edges above land in `Discovered`, which only dials when a datagram is already queued for that peer — reconnect policy stays in the application (see chat-app `reconnect_tick`).
+
+### Lifecycle identity
+
+Every asynchronous thing the driver does for a peer — connect, VERSION read,
+L2CAP open, disconnect, refresh — completes long after the registry has moved
+on, and reports back by `DeviceId`, which a peer keeps across teardown and
+redial. `PeerEntry::lifecycle_id` is the identity that tells those apart:
+
+- Allocated from a **registry-global counter** (`Registry::next_lifecycle`), so
+  it is never reused — not by a retry, and not by a `PeerEntry` recreated after
+  `DEAD_GC_TTL` evicted the old one. A retry counter cannot do this job:
+  `PeerPhase::Connecting::attempt` resets to 0 on every fresh dial.
+- Carried out on `StartConnect`, `ReadVersion`, `UpgradeToL2cap`,
+  `StartDataPipe`, `CloseChannel`, `CloseNativeConnection` and `Refresh`, and
+  back on `ConnectSucceeded`, `ConnectFailed`, `ProtocolVersionMismatch`,
+  `OpenL2capSucceeded` and `OpenL2capFailed`. The registry drops any completion
+  whose identity no longer matches the entry's.
+- Retired by `Registry::abandon_outstanding`, which emits
+  `PeerAction::RetireLifecycle` and mints a fresh identity. Every path that
+  walks away from a connection goes through it: a new dial, a drain, `Forget`,
+  adapter-off, a peripheral pipe restart, an inbound role replacement.
+- **Preserved** in one case: an early `CentralReceivedP2c` notification while
+  the peer is still `Connecting` is our own dial succeeding, so the entry keeps
+  its identity and only the phase advances. The dial's own completion is then
+  dropped on the phase, not the identity.
+
+`PeerEntry::upgrade_gen` numbers L2CAP opens *within* one lifecycle and resets
+to 0 when the lifecycle is retired, so `(lifecycle_id, upgrade_gen)` is unique.
+
+A stale completion is dropped, never acted on — in particular a stale
+`ConnectSucceeded` does **not** close its channel, because for that `DeviceId`
+it is the same native connection the replacement is about to use.
+
+### Per-device lanes (`driver.rs`)
+
+Native-connection work is serialized per device: connect, disconnect, refresh,
+the VERSION read and the L2CAP open queue on a `DeviceLane` and run one at a
+time, in dispatch order, on a worker the `Driver` owns (so they die with it
+rather than outliving the actor). Data-pipe I/O does not go through the lane.
+
+The lane worker tracks a `native_owner` — the lifecycle that currently owns the
+device's native connection — advanced by an `Activate` job that `StartConnect`
+and `StartDataPipe` enqueue. Because ownership moves *in queue order*, two
+guarantees fall out of the same rule: a teardown finishes before the retry that
+reuses the connection begins, and a cleanup naming a lifecycle the device has
+already replaced is skipped instead of taking the replacement down with it.
+
+`RetireLifecycle` clears the lane's *cancellable* lifecycle immediately, which
+is separate from native ownership. That split is what each `Cancellation` mode
+means:
+
+| Mode | Used by | Behaviour on retirement |
+|------|---------|-------------------------|
+| `Never` | disconnect, refresh, close-native | Runs anyway, but only while its lifecycle still owns the device — cleanup has to survive the retirement that ordered it |
+| `WhileQueued` | connect | Skipped if not yet started; a running connect is *joined*, since dropping it mid-flight leaves the platform's GATT client in a state we can't reason about. Its result is rejected by identity instead |
+| `Immediate` | VERSION read, L2CAP open | Unwound as soon as the lifecycle is retired |
+
+Every lane job is bounded, because one that never returns blocks the device for
+good — no later job can run and `native_owner` can never advance:
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `CLEANUP_TIMEOUT` | 10 s | Bounds `disconnect` / `refresh`. On expiry the waiter is **dropped**, not detached, so no late continuation can touch ownership after the lane advances; native state is then uncertain and logged at `warn` |
+| `GATT_SETUP_TIMEOUT` | 30 s | Bounds `discover_services` + `subscribe_characteristic` together inside `BlewDriver::connect`; separate from blew's own configurable connect timeout |
+| `VERSION_READ_TIMEOUT` | 5 s | VERSION is optional; don't let a slow read hold up an upgrade queued behind it |
+
+`connect` reports one error whether the link never came up or came up and then
+failed GATT setup, and a peer in `Connecting` holds no channel for
+`CloseChannel` to name — so `handle_connect_failed` emits
+`CloseNativeConnection` to tear down whatever the dial may have left up. Its
+guards are what make that safe: it is reached only when nothing has replaced
+the dial.
 
 ### Routing table (`TransportRouting`)
 

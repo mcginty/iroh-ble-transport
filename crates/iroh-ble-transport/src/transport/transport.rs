@@ -1877,7 +1877,7 @@ mod tests {
         let start_actions = reg.handle(send_cmd);
         assert!(matches!(
             start_actions.as_slice(),
-            [PeerAction::StartConnect { device_id, .. }] if device_id == &old_device
+            [PeerAction::RetireLifecycle { .. }, PeerAction::StartConnect { device_id, .. }] if device_id == &old_device
         ));
         assert_eq!(
             reg.peer(&old_device).unwrap().target_endpoint,
@@ -1888,6 +1888,7 @@ mod tests {
 
         let actions = reg.handle(PeerCommand::ConnectSucceeded {
             device_id: old_device.clone(),
+            lifecycle_id: reg.lifecycle_id(&old_device),
             channel: ChannelHandle {
                 id: 9,
                 path: ConnectPath::Gatt,
@@ -1898,6 +1899,7 @@ mod tests {
             .find_map(|action| match action {
                 PeerAction::StartDataPipe {
                     device_id,
+                    lifecycle_id,
                     tx_gen,
                     role,
                     target_endpoint,
@@ -1910,6 +1912,7 @@ mod tests {
                     target_endpoint,
                     path,
                     l2cap_channel,
+                    lifecycle_id,
                 )),
                 _ => None,
             })
@@ -1936,6 +1939,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: start_pipe.0.clone(),
+                lifecycle_id: start_pipe.6,
                 tx_gen: start_pipe.1,
                 role: start_pipe.2,
                 target_endpoint: start_pipe.3,
