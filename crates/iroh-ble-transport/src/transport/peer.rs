@@ -418,6 +418,16 @@ pub enum PeerAction {
         channel: ChannelHandle,
         reason: DisconnectReason,
     },
+    /// Tear down a native link a failed dial may have left up: `connect`
+    /// reports one error whether the link never came up or came up and then
+    /// failed GATT setup, and a peer in `Connecting` holds no channel, so
+    /// `CloseChannel` cannot express this. Emitted only while nothing has
+    /// replaced the dial — the registry's own guards decide that — and gated
+    /// on native ownership by the driver like any other cleanup.
+    CloseNativeConnection {
+        device_id: DeviceId,
+        lifecycle_id: u64,
+    },
     Refresh {
         device_id: DeviceId,
         lifecycle_id: u64,

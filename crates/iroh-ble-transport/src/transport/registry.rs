@@ -874,6 +874,21 @@ impl Registry {
         }) else {
             return;
         };
+        // Reaching here means nothing has replaced this dial: an inbound role
+        // replacement or an early notification would have promoted the peer
+        // out of `Connecting`, and a retry that already started would carry a
+        // newer lifecycle (both checked above). So the only session that can
+        // be on this device is the one that just failed, and it may have left
+        // a native link up — `connect` fails the same way whether the link
+        // never came up or came up and then failed GATT setup, and nothing
+        // else will ever close it, because a peer in `Connecting` has no
+        // channel for `CloseChannel` to name. Tearing down a link that was
+        // never established is a wasted call the driver logs and moves on
+        // from; leaving a live one up strands the peer.
+        actions.push(PeerAction::CloseNativeConnection {
+            device_id: device_id.clone(),
+            lifecycle_id,
+        });
         Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
         let next_attempt = attempt + 1;
         entry.consecutive_failures += 1;

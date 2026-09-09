@@ -31,9 +31,11 @@ pub struct IncomingPacket {
 const READ_PSM_BACKOFFS_MS: [u64; 3] = [0, 150, 400];
 // VERSION is optional; leave time for a slow GATT read without holding up an upgrade indefinitely.
 const VERSION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-// Well above blew's two-second Android disconnect fallback. These deadlines
-// bound asynchronous waits, not a blocking native call or its eventual effects.
-const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// Five times blew's two-second Android disconnect fallback, and small enough
+// that a teardown the platform never answers does not dominate the reconnect
+// the registry is already waiting to run behind it. Bounds an asynchronous
+// wait, not a blocking native call or its eventual effects.
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 // Discovery and subscription follow the separately configured native connect
 // timeout; a missing callback in either must still return a connect failure.
 const GATT_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -507,6 +509,28 @@ impl<I: BleInterface> Driver<I> {
                             &dev_for_job,
                             lifecycle_id,
                             "disconnect",
+                            iface.disconnect(&dev_for_job),
+                        )
+                        .await;
+                    }),
+                );
+            }
+
+            PeerAction::CloseNativeConnection {
+                device_id,
+                lifecycle_id,
+            } => {
+                let iface = Arc::clone(&self.iface);
+                let dev_for_job = device_id.clone();
+                self.dispatch(
+                    &device_id,
+                    lifecycle_id,
+                    Cancellation::Never,
+                    Box::pin(async move {
+                        bounded_cleanup(
+                            &dev_for_job,
+                            lifecycle_id,
+                            "close native connection",
                             iface.disconnect(&dev_for_job),
                         )
                         .await;

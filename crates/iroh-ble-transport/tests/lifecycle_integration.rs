@@ -6,6 +6,7 @@ use std::task::Waker;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use iroh_ble_transport::error::BleError;
 use iroh_ble_transport::transport::{
     driver::{Driver, IncomingPacket},
     peer::{ConnectRole, FragmentSource, PeerAction, PeerCommand, PeerPhase, StallCause},
@@ -329,4 +330,154 @@ async fn peer_gc_cannot_reuse_a_delayed_connects_lifecycle() {
             ..
         }
     ));
+}
+
+impl Harness {
+    /// Queue a dial that fails the way a completed link with broken GATT setup
+    /// does — `connect` reports one error either way.
+    fn fail_the_dial(&self) {
+        self.iface.on_connect(
+            self.device.clone(),
+            Err(BleError::Timeout {
+                stage: "GATT setup",
+            }),
+        );
+    }
+
+    /// Run something on the device lane for `lifecycle_id` and wait for it, so
+    /// any cleanup queued ahead of it has had its chance to run.
+    async fn lane_barrier(&mut self, lifecycle_id: u64) {
+        self.driver
+            .execute(PeerAction::Refresh {
+                device_id: self.device.clone(),
+                lifecycle_id,
+            })
+            .await;
+        self.wait_call(CallKind::Refresh(self.device.clone())).await;
+    }
+
+    fn disconnected(&self) -> bool {
+        self.iface
+            .calls()
+            .contains(&CallKind::Disconnect(self.device.clone()))
+    }
+}
+
+/// `connect` fails the same way whether the link never came up or came up and
+/// then failed GATT setup, and a peer in `Connecting` holds no channel for
+/// `CloseChannel` to name — so without an explicit teardown a half-open link
+/// would sit there until the peer or the platform gave up on it.
+#[tokio::test]
+async fn a_failed_dial_tears_down_the_link_it_may_have_left_up() {
+    let mut h = Harness::new();
+    h.fail_the_dial();
+    h.dial().await;
+
+    let failure = h.next().await;
+    assert!(matches!(failure, PeerCommand::ConnectFailed { .. }));
+    h.command(failure).await;
+    h.wait_call(CallKind::Disconnect(h.device.clone())).await;
+}
+
+/// The peer dialed us back while our own dial was still pending. Tearing the
+/// link down now would take the inbound session with it: `disconnect` names a
+/// device, not a lifecycle. The inbound session both retires the dial's
+/// lifecycle and promotes the peer out of `Connecting`, so either guard alone
+/// would stop the teardown.
+#[tokio::test]
+async fn a_failed_dial_replaced_by_an_inbound_session_leaves_the_link_alone() {
+    let mut h = Harness::new();
+    h.iface.set_connect_held(true);
+    h.fail_the_dial();
+    let dial = h.dial().await;
+    h.wait_call(CallKind::Connect(h.device.clone())).await;
+
+    h.fragment(FragmentSource::PeripheralReceivedC2p).await;
+    let replacement = h.lifecycle();
+    assert_ne!(replacement, dial, "the inbound session retires the dial");
+
+    h.iface.set_connect_held(false);
+    let failure = h.next().await;
+    assert!(
+        matches!(failure, PeerCommand::ConnectFailed { lifecycle_id, .. } if lifecycle_id == dial)
+    );
+    h.command(failure).await;
+
+    h.lane_barrier(replacement).await;
+    assert!(!h.disconnected(), "the inbound session must survive");
+}
+
+/// The subtler one: an early notification promotes the peer out of
+/// `Connecting` while *keeping* the dial's lifecycle, so identity alone says
+/// the completion is current. Only the phase says the dial no longer owns the
+/// peer, and tearing down here would kill the pipe the notification started.
+#[tokio::test]
+async fn a_failed_dial_promoted_by_an_early_notification_leaves_the_link_alone() {
+    let mut h = Harness::new();
+    h.iface.set_connect_held(true);
+    h.fail_the_dial();
+    let dial = h.dial().await;
+    h.wait_call(CallKind::Connect(h.device.clone())).await;
+
+    h.fragment(FragmentSource::CentralReceivedP2c).await;
+    assert_eq!(
+        h.lifecycle(),
+        dial,
+        "an early notification keeps the dial's lifecycle"
+    );
+    assert!(matches!(
+        h.registry.peer(&h.device).unwrap().phase,
+        PeerPhase::Connected { .. }
+    ));
+
+    h.iface.set_connect_held(false);
+    let failure = h.next().await;
+    assert!(
+        matches!(failure, PeerCommand::ConnectFailed { lifecycle_id, .. } if lifecycle_id == dial)
+    );
+    h.command(failure).await;
+
+    h.lane_barrier(dial).await;
+    assert!(!h.disconnected(), "the promoted session must survive");
+}
+
+/// The case lifecycle identity alone has to carry: the retry is itself in
+/// `Connecting`, so the phase says nothing, and the abandoned dial's failure
+/// arrives afterwards. Tearing down here would drop the link the replacement
+/// dial is opening on the very same device.
+#[tokio::test]
+async fn a_superseded_dials_failure_does_not_tear_down_the_retry() {
+    let mut h = Harness::new();
+    h.iface.set_connect_held(true);
+    h.fail_the_dial();
+    let dial = h.dial().await;
+    h.wait_call(CallKind::Connect(h.device.clone())).await;
+
+    // The link drops mid-dial and the retry tick starts a fresh attempt while
+    // the abandoned connect is still parked in the backend.
+    h.command(PeerCommand::CentralDisconnected {
+        device_id: h.device.clone(),
+        cause: blew::DisconnectCause::LinkLoss,
+    })
+    .await;
+    h.command(PeerCommand::Tick(
+        Instant::now() + Duration::from_secs(3600),
+    ))
+    .await;
+    let retry = h.lifecycle();
+    assert_ne!(retry, dial);
+    assert!(matches!(
+        h.registry.peer(&h.device).unwrap().phase,
+        PeerPhase::Connecting { .. }
+    ));
+
+    h.iface.set_connect_held(false);
+    let failure = h.next().await;
+    assert!(
+        matches!(failure, PeerCommand::ConnectFailed { lifecycle_id, .. } if lifecycle_id == dial)
+    );
+    h.command(failure).await;
+
+    h.lane_barrier(retry).await;
+    assert!(!h.disconnected(), "the replacement dial must survive");
 }
