@@ -5,3 +5,7 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 62ca6dc8c0f7ee6053557f605f56fcf03d988abad2a19c553caa8c56f59d68ea # shrinks to commands = [SendReserved { endpoint_seed: 0 }, CentralDisconnectedTimeout, Tick]
+cc 05b5e48f679c9ab815a640464636e42dd9ae74f24d479c219dfc9ce3306bf5fb # shrinks to commands = [InboundFragment { peripheral: false }, AdapterOff, AdapterOn, Tick, ReplayStale { completion: ConnectSucceeded, pick: 0 }]
+cc 3aaee97f0c43b538546ce900a7b8317bf70def8b1de79755ae7de715152520cf # shrinks to commands = [InboundFragment { peripheral: false }, AdapterOff, AdapterOn, Tick, ReplayStale { completion: ConnectFailed, pick: 0 }]
+cc 4ff96305ef6e4501ae70562bf2cdb1249bf750a8f362bda762ceb7b9908328d4 # shrinks to commands = [Advertise { endpoint_seed: 1 }, InboundFragment { peripheral: false }, VerifiedEndpoint { endpoint_seed: 1 }, ReplayStale { completion: L2capSucceeded, pick: 0 }]
+cc bb8951565d1b1de2641c86914390213380c063a1a3025cb6448b17406c6b2060 # shrinks to commands = [Advertise { endpoint_seed: 1 }, InboundFragment { peripheral: false }, VerifiedEndpoint { endpoint_seed: 1 }, ReplayStale { completion: L2capFailed, pick: 0 }]

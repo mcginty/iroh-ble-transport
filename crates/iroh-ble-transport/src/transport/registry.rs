@@ -2372,6 +2372,173 @@ mod tests {
         ]
     }
 
+    /// Everything about a `PeerEntry` a completion could plausibly move. A
+    /// stale completion must leave all of it alone, so the staleness property
+    /// can compare this across the call rather than naming one field.
+    #[derive(Debug, PartialEq)]
+    struct EntryFingerprint {
+        phase: PhaseKind,
+        tx_gen: u64,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
+        consecutive_failures: u32,
+        role: crate::transport::peer::ConnectRole,
+        l2cap_upgrade_failed: bool,
+        resume_after_drain: bool,
+        pending_sends: usize,
+        rx_backlog: usize,
+        has_pipe: bool,
+        has_l2cap_channel: bool,
+        target_endpoint: Option<iroh_base::EndpointId>,
+        verified_endpoint: Option<iroh_base::EndpointId>,
+        prefix: Option<crate::transport::peer::KeyPrefix>,
+    }
+
+    fn fingerprint(reg: &Registry, device_id: &DeviceId) -> Option<EntryFingerprint> {
+        reg.peer(device_id).map(|e| EntryFingerprint {
+            phase: PhaseKind::from(&e.phase),
+            tx_gen: e.tx_gen,
+            lifecycle_id: e.lifecycle_id,
+            upgrade_gen: e.upgrade_gen,
+            consecutive_failures: e.consecutive_failures,
+            role: e.role,
+            l2cap_upgrade_failed: e.l2cap_upgrade_failed,
+            resume_after_drain: e.resume_after_drain,
+            pending_sends: e.pending_sends.len(),
+            rx_backlog: e.rx_backlog.len(),
+            has_pipe: e.pipe.is_some(),
+            has_l2cap_channel: e.l2cap_channel.is_some(),
+            target_endpoint: e.target_endpoint,
+            verified_endpoint: e.verified_endpoint,
+            prefix: e.prefix,
+        })
+    }
+
+    /// The five completions the driver reports back under the lifecycle they
+    /// were started with.
+    #[derive(Debug, Clone, Copy)]
+    enum Completion {
+        ConnectSucceeded,
+        ConnectFailed,
+        VersionMismatch,
+        L2capSucceeded,
+        L2capFailed,
+    }
+
+    fn completion_command(
+        completion: Completion,
+        device_id: &DeviceId,
+        lifecycle_id: u64,
+        upgrade_gen: u64,
+    ) -> PeerCommand {
+        match completion {
+            Completion::ConnectSucceeded => PeerCommand::ConnectSucceeded {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                channel: crate::transport::peer::ChannelHandle {
+                    id: 7,
+                    path: crate::transport::peer::ConnectPath::Gatt,
+                },
+            },
+            Completion::ConnectFailed => PeerCommand::ConnectFailed {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                error: "stale".into(),
+            },
+            Completion::VersionMismatch => PeerCommand::ProtocolVersionMismatch {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                got: 0xff,
+                want: crate::transport::transport::PROTOCOL_VERSION,
+            },
+            Completion::L2capSucceeded => PeerCommand::OpenL2capSucceeded {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                upgrade_gen,
+                channel: blew::L2capChannel::pair(1024).0,
+            },
+            Completion::L2capFailed => PeerCommand::OpenL2capFailed {
+                device_id: device_id.clone(),
+                lifecycle_id,
+                upgrade_gen,
+                error: "stale".into(),
+            },
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    enum StalenessCommand {
+        Advertise {
+            endpoint_seed: u8,
+        },
+        Send {
+            endpoint_seed: u8,
+        },
+        Complete {
+            completion: Completion,
+        },
+        CentralDisconnected,
+        Stalled {
+            local: bool,
+        },
+        InboundFragment {
+            peripheral: bool,
+        },
+        PeripheralSubscribed,
+        VerifiedEndpoint {
+            endpoint_seed: u8,
+        },
+        AdapterOff,
+        AdapterOn,
+        Tick,
+        Forget,
+        DataPipeReady,
+        /// Retires every lifecycle without touching any phase — the one path
+        /// that can leave a retired entry mid-upgrade.
+        Shutdown,
+        /// Deliver one of the completions under a lifecycle this entry has
+        /// already left behind — the thing a detached driver task does when it
+        /// finishes after the registry moved on.
+        ReplayStale {
+            completion: Completion,
+            pick: u8,
+        },
+    }
+
+    fn completion_strategy() -> impl Strategy<Value = Completion> {
+        prop_oneof![
+            Just(Completion::ConnectSucceeded),
+            Just(Completion::ConnectFailed),
+            Just(Completion::VersionMismatch),
+            Just(Completion::L2capSucceeded),
+            Just(Completion::L2capFailed),
+        ]
+    }
+
+    fn staleness_command_strategy() -> impl Strategy<Value = StalenessCommand> {
+        prop_oneof![
+            // A narrow seed range so `Advertise` and `VerifiedEndpoint` name the
+            // same prefix often enough to reach the L2CAP upgrade paths. Seed 0
+            // is the registry's own endpoint, so peers start at 1.
+            (1u8..4).prop_map(|endpoint_seed| StalenessCommand::Advertise { endpoint_seed }),
+            (1u8..4).prop_map(|endpoint_seed| StalenessCommand::Send { endpoint_seed }),
+            completion_strategy().prop_map(|completion| StalenessCommand::Complete { completion }),
+            Just(StalenessCommand::CentralDisconnected),
+            any::<bool>().prop_map(|local| StalenessCommand::Stalled { local }),
+            any::<bool>().prop_map(|peripheral| StalenessCommand::InboundFragment { peripheral }),
+            Just(StalenessCommand::PeripheralSubscribed),
+            (1u8..4).prop_map(|endpoint_seed| StalenessCommand::VerifiedEndpoint { endpoint_seed }),
+            Just(StalenessCommand::AdapterOff),
+            Just(StalenessCommand::AdapterOn),
+            Just(StalenessCommand::Tick),
+            Just(StalenessCommand::Forget),
+            Just(StalenessCommand::DataPipeReady),
+            Just(StalenessCommand::Shutdown),
+            (completion_strategy(), any::<u8>())
+                .prop_map(|(completion, pick)| StalenessCommand::ReplayStale { completion, pick }),
+        ]
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
@@ -2677,6 +2844,163 @@ mod tests {
                         connected_count <= 1,
                         "verified prefix {prefix:?} must not retain multiple connected peers"
                     );
+                }
+            }
+        }
+
+        /// Two properties that together are what makes a detached driver task
+        /// safe to ignore.
+        ///
+        /// **Lifecycle identities are never reused.** They come from a
+        /// registry-global counter, so an id only ever moves forward — across
+        /// retries, across teardown, and across the peer GC that drops the
+        /// `PeerEntry` entirely and builds a new one for the same `DeviceId`.
+        /// A per-entry counter would restart at zero there and could collide
+        /// with an identity a task from the peer's previous life still holds.
+        ///
+        /// **A completion under a retired identity changes nothing.** Not the
+        /// phase, not the retry budget, not the pipe, and no actions — so it
+        /// cannot violate any other invariant either, which is why this is
+        /// asserted here rather than woven through the other properties.
+        #[test]
+        fn a_retired_lifecycles_completion_cannot_touch_the_peer(
+            commands in prop::collection::vec(staleness_command_strategy(), 1..120)
+        ) {
+            let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
+            let device_id = blew::DeviceId::from("prop-stale-peer");
+            let mut history: Vec<u64> = Vec::new();
+
+            for command in commands {
+                let live = reg.lifecycle_id(&device_id);
+                let upgrade_gen = reg.upgrade_gen(&device_id);
+
+                if let StalenessCommand::ReplayStale { completion, pick } = command {
+                    let retired: Vec<u64> =
+                        history.iter().copied().filter(|id| *id != live).collect();
+                    if retired.is_empty() {
+                        continue;
+                    }
+                    let stale_id = retired[usize::from(pick) % retired.len()];
+                    let before = fingerprint(&reg, &device_id);
+                    // Pass the live upgrade_gen so identity alone is what
+                    // rejects the L2CAP variants.
+                    let actions = reg.handle(completion_command(
+                        completion,
+                        &device_id,
+                        stale_id,
+                        upgrade_gen,
+                    ));
+                    prop_assert!(
+                        actions.is_empty(),
+                        "{completion:?} under retired lifecycle {stale_id} (live {live}) \
+                         produced {actions:?}"
+                    );
+                    prop_assert_eq!(
+                        before,
+                        fingerprint(&reg, &device_id),
+                        "{:?} under retired lifecycle {} (live {}) mutated the entry",
+                        completion,
+                        stale_id,
+                        live
+                    );
+                    continue;
+                }
+
+                let _ = match command {
+                    StalenessCommand::Advertise { endpoint_seed } => {
+                        let endpoint = endpoint_from_seed(endpoint_seed);
+                        reg.handle(PeerCommand::Advertised {
+                            prefix: crate::transport::routing::prefix_from_endpoint(&endpoint),
+                            device_id: device_id.clone(),
+                            rssi: None,
+                        })
+                    }
+                    StalenessCommand::Send { endpoint_seed } => {
+                        reg.handle(PeerCommand::SendDatagram {
+                            device_id: device_id.clone(),
+                            target_endpoint: Some(endpoint_from_seed(endpoint_seed)),
+                            tx_gen: reg.peer(&device_id).map_or(0, |e| e.tx_gen),
+                            datagram: bytes::Bytes::from_static(b"hello"),
+                            waker: noop_waker(),
+                        })
+                    }
+                    StalenessCommand::Complete { completion } => reg.handle(completion_command(
+                        completion,
+                        &device_id,
+                        live,
+                        upgrade_gen,
+                    )),
+                    StalenessCommand::CentralDisconnected => {
+                        reg.handle(PeerCommand::CentralDisconnected {
+                            device_id: device_id.clone(),
+                            cause: blew::DisconnectCause::LinkLoss,
+                        })
+                    }
+                    StalenessCommand::Stalled { local } => reg.handle(PeerCommand::Stalled {
+                        device_id: device_id.clone(),
+                        cause: if local {
+                            crate::transport::peer::StallCause::LocalClose
+                        } else {
+                            crate::transport::peer::StallCause::LinkDead
+                        },
+                    }),
+                    StalenessCommand::InboundFragment { peripheral } => {
+                        reg.handle(PeerCommand::InboundGattFragment {
+                            device_id: device_id.clone(),
+                            source: if peripheral {
+                                crate::transport::peer::FragmentSource::PeripheralReceivedC2p
+                            } else {
+                                crate::transport::peer::FragmentSource::CentralReceivedP2c
+                            },
+                            bytes: bytes::Bytes::from_static(b"frag"),
+                        })
+                    }
+                    StalenessCommand::PeripheralSubscribed => {
+                        reg.handle(PeerCommand::PeripheralClientSubscribed {
+                            client_id: device_id.clone(),
+                            char_uuid: uuid::Uuid::nil(),
+                            prefix: reg.peer(&device_id).and_then(|e| e.prefix),
+                        })
+                    }
+                    StalenessCommand::VerifiedEndpoint { endpoint_seed } => {
+                        reg.handle(PeerCommand::VerifiedEndpoint {
+                            endpoint_id: endpoint_from_seed(endpoint_seed),
+                            token: None,
+                        })
+                    }
+                    StalenessCommand::AdapterOff => {
+                        reg.handle(PeerCommand::AdapterStateChanged { powered: false })
+                    }
+                    StalenessCommand::AdapterOn => {
+                        reg.handle(PeerCommand::AdapterStateChanged { powered: true })
+                    }
+                    StalenessCommand::Tick => reg.handle(PeerCommand::Tick(
+                        std::time::Instant::now() + std::time::Duration::from_secs(3600),
+                    )),
+                    StalenessCommand::Forget => reg.handle(PeerCommand::Forget {
+                        device_id: device_id.clone(),
+                    }),
+                    StalenessCommand::DataPipeReady => {
+                        if reg.peer(&device_id).is_some() {
+                            mark_data_pipe_ready(&mut reg, &device_id);
+                        }
+                        Vec::new()
+                    }
+                    StalenessCommand::Shutdown => reg.handle(PeerCommand::Shutdown),
+                    StalenessCommand::ReplayStale { .. } => unreachable!("handled above"),
+                };
+
+                let current = reg.lifecycle_id(&device_id);
+                if current != 0 {
+                    if let Some(&last) = history.last() {
+                        prop_assert!(
+                            current >= last,
+                            "lifecycle {current} reuses or precedes {last}"
+                        );
+                    }
+                    if history.last() != Some(&current) {
+                        history.push(current);
+                    }
                 }
             }
         }
