@@ -29,6 +29,7 @@ pub struct IncomingPacket {
 /// succeed; the first attempt is immediate, the remaining two cover the
 /// slow-path before we give up and fall back to GATT.
 const READ_PSM_BACKOFFS_MS: [u64; 3] = [0, 150, 400];
+const VERSION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Translate the registry's role (`Central` = we dialed, `Peripheral` =
 /// they dialed) into `routing`'s observer-local `Direction`.
@@ -117,14 +118,68 @@ fn log_peer_metric(metric: &str) {
     }
 }
 
-type LaneJob = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+type LaneWork = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+enum LaneJob {
+    Activate {
+        lifecycle_id: u64,
+        guard: OutstandingGuard,
+    },
+    Work {
+        lifecycle_id: u64,
+        cancellation: Cancellation,
+        lifecycle: tokio::sync::watch::Receiver<Option<u64>>,
+        work: LaneWork,
+        guard: OutstandingGuard,
+    },
+}
+
+async fn run_lane(mut rx: mpsc::UnboundedReceiver<LaneJob>) {
+    let mut native_owner = None;
+    while let Some(job) = rx.recv().await {
+        match job {
+            LaneJob::Activate {
+                lifecycle_id,
+                guard,
+            } => {
+                let _guard = guard;
+                native_owner = Some(lifecycle_id);
+            }
+            LaneJob::Work {
+                lifecycle_id,
+                cancellation,
+                mut lifecycle,
+                work,
+                guard,
+            } => {
+                let _guard = guard;
+                if native_owner != Some(lifecycle_id) {
+                    continue;
+                }
+                if cancellation != Cancellation::Never && *lifecycle.borrow() != Some(lifecycle_id)
+                {
+                    continue;
+                }
+                match cancellation {
+                    Cancellation::Never | Cancellation::WhileQueued => work.await,
+                    Cancellation::Immediate => {
+                        tokio::select! {
+                            biased;
+                            _ = lifecycle.wait_for(|current| *current != Some(lifecycle_id)) => {}
+                            () = work => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// What abandoning a device does to a job on its lane.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cancellation {
-    /// Runs whatever else happens. Cleanup (disconnect, refresh) has to,
-    /// because the very thing that abandons a device is usually the decision
-    /// to tear it down.
+    /// Cleanup survives retirement, but only runs while its lifecycle still
+    /// owns the native connection in dispatch order.
     Never,
     /// Skipped while still queued; once started it runs to completion. Used
     /// for connect, where unwinding mid-flight would leave the platform's
@@ -145,9 +200,9 @@ enum Cancellation {
 struct DeviceLane {
     jobs: mpsc::UnboundedSender<LaneJob>,
     worker: tokio::task::JoinHandle<()>,
-    /// Bumped when the registry walks away from whatever this device was
-    /// doing, retiring every job dispatched under the previous value.
-    epoch: tokio::sync::watch::Sender<u64>,
+    /// Registry lifecycle currently allowed to run cancellable work.
+    /// Retirement clears this immediately; native ownership changes in the worker.
+    lifecycle: tokio::sync::watch::Sender<Option<u64>>,
     /// Jobs queued or running. A lane with none left can be dropped.
     outstanding: Arc<AtomicUsize>,
 }
@@ -186,10 +241,6 @@ pub struct Driver<I: BleInterface> {
     /// Per-device serialization of native-connection work. Owned here so
     /// the workers die with the driver instead of outliving the actor.
     lanes: parking_lot::Mutex<HashMap<blew::DeviceId, DeviceLane>>,
-    /// Channel id of the connection `connect` last handed to the registry
-    /// for each device. A `CloseChannel` naming a different id is closing
-    /// something this device has already replaced, and is skipped.
-    live_channels: Arc<parking_lot::Mutex<HashMap<blew::DeviceId, u64>>>,
 }
 
 impl<I: BleInterface> Driver<I> {
@@ -215,78 +266,72 @@ impl<I: BleInterface> Driver<I> {
             routing,
             connections: Arc::new(crate::transport::conns::ConnectionRegistry::default()),
             lanes: parking_lot::Mutex::new(HashMap::new()),
-            live_channels: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
-    /// Claim a slot on this device's lane, creating the lane on first use and
-    /// counting the caller's job before releasing the map — a lane whose count
-    /// is zero is swept here, so the increment has to happen under the same
-    /// lock or the sweep could drop a lane a job is about to be sent on.
-    /// Sweeping keeps a session that churns through DeviceIds (Android MAC
-    /// rotation) from accumulating lanes.
-    fn claim_lane(
-        &self,
-        device_id: &blew::DeviceId,
-    ) -> (
-        mpsc::UnboundedSender<LaneJob>,
-        tokio::sync::watch::Receiver<u64>,
-        OutstandingGuard,
-    ) {
+    fn activate(&self, device_id: &blew::DeviceId, lifecycle_id: u64) {
         let mut lanes = self.lanes.lock();
-        lanes.retain(|id, lane| id == device_id || lane.outstanding.load(Ordering::Relaxed) > 0);
+        lanes.retain(|id, lane| {
+            id == device_id
+                || lane.lifecycle.borrow().is_some()
+                || lane.outstanding.load(Ordering::Relaxed) > 0
+        });
         let lane = lanes.entry(device_id.clone()).or_insert_with(|| {
-            let (jobs, mut rx) = mpsc::unbounded_channel::<LaneJob>();
-            let worker = tokio::spawn(async move {
-                while let Some(job) = rx.recv().await {
-                    job.await;
-                }
-            });
-            let (epoch, _) = tokio::sync::watch::channel(0u64);
+            let (jobs, rx) = mpsc::unbounded_channel::<LaneJob>();
+            let worker = tokio::spawn(run_lane(rx));
             DeviceLane {
                 jobs,
                 worker,
-                epoch,
+                lifecycle: tokio::sync::watch::channel(None).0,
                 outstanding: Arc::new(AtomicUsize::new(0)),
             }
         });
-        lane.outstanding.fetch_add(1, Ordering::Relaxed);
-        (
-            lane.jobs.clone(),
-            lane.epoch.subscribe(),
-            OutstandingGuard(Arc::clone(&lane.outstanding)),
-        )
+        lane.lifecycle.send_replace(Some(lifecycle_id));
+        let outstanding = Arc::clone(&lane.outstanding);
+        outstanding.fetch_add(1, Ordering::Relaxed);
+        let guard = OutstandingGuard(outstanding);
+        // Ownership changes in native dispatch order, after any earlier teardown.
+        let _ = lane.jobs.send(LaneJob::Activate {
+            lifecycle_id,
+            guard,
+        });
     }
 
-    /// Retire this device's current epoch. Work still queued under it is
-    /// skipped, and `Cancellation::Immediate` work already running unwinds.
-    fn abandon_device(&self, device_id: &blew::DeviceId) {
+    fn retire(&self, device_id: &blew::DeviceId, lifecycle_id: u64) {
         if let Some(lane) = self.lanes.lock().get(device_id) {
-            lane.epoch.send_modify(|e| *e += 1);
+            lane.lifecycle.send_if_modified(|current| {
+                if *current == Some(lifecycle_id) {
+                    *current = None;
+                    true
+                } else {
+                    false
+                }
+            });
         }
     }
 
-    /// Queue `work` behind everything already pending for this device.
-    fn dispatch(&self, device_id: &blew::DeviceId, cancellation: Cancellation, work: LaneJob) {
-        let (jobs, mut epoch, guard) = self.claim_lane(device_id);
-        let my_epoch = *epoch.borrow();
-        let job: LaneJob = Box::pin(async move {
-            let _guard = guard;
-            if cancellation != Cancellation::Never && *epoch.borrow() != my_epoch {
-                return;
-            }
-            match cancellation {
-                Cancellation::Never | Cancellation::WhileQueued => work.await,
-                Cancellation::Immediate => {
-                    tokio::select! {
-                        biased;
-                        _ = epoch.wait_for(|e| *e != my_epoch) => {}
-                        () = work => {}
-                    }
-                }
-            }
-        });
-        if jobs.send(job).is_err() {
+    fn dispatch(
+        &self,
+        device_id: &blew::DeviceId,
+        lifecycle_id: u64,
+        cancellation: Cancellation,
+        work: LaneWork,
+    ) {
+        let lanes = self.lanes.lock();
+        let Some(lane) = lanes.get(device_id) else {
+            return;
+        };
+        let lifecycle = lane.lifecycle.subscribe();
+        lane.outstanding.fetch_add(1, Ordering::Relaxed);
+        let guard = OutstandingGuard(Arc::clone(&lane.outstanding));
+        let job = LaneJob::Work {
+            lifecycle_id,
+            cancellation,
+            lifecycle,
+            work,
+            guard,
+        };
+        if lane.jobs.send(job).is_err() {
             tracing::debug!(device = %device_id, "device lane closed; dropping job");
         }
     }
@@ -307,16 +352,13 @@ impl<I: BleInterface> Driver<I> {
             PeerAction::StartConnect {
                 device_id,
                 attempt: _,
-                attempt_gen,
+                lifecycle_id,
             } => {
                 let iface = Arc::clone(&self.iface);
                 let inbox = self.inbox.clone();
                 let dev_for_job = device_id.clone();
                 let dev_for_msg = device_id.clone();
-                // A fresh attempt supersedes everything the previous one left
-                // running against this device, and queues behind any teardown
-                // that is still finishing.
-                self.abandon_device(&device_id);
+                self.activate(&device_id, lifecycle_id);
                 // blew enforces `CentralConfig::connect_timeout` itself
                 // (15 s default, overridable by the app). On expiry it
                 // refresh()+close()s the Android GATT client and
@@ -325,6 +367,7 @@ impl<I: BleInterface> Driver<I> {
                 // normal retry logic.
                 self.dispatch(
                     &device_id,
+                    lifecycle_id,
                     Cancellation::WhileQueued,
                     Box::pin(async move {
                         match iface.connect(&dev_for_job).await {
@@ -332,7 +375,7 @@ impl<I: BleInterface> Driver<I> {
                                 let _ = inbox
                                     .send(PeerCommand::ConnectSucceeded {
                                         device_id: dev_for_msg,
-                                        attempt_gen,
+                                        lifecycle_id,
                                         channel,
                                     })
                                     .await;
@@ -341,7 +384,7 @@ impl<I: BleInterface> Driver<I> {
                                 let _ = inbox
                                     .send(PeerCommand::ConnectFailed {
                                         device_id: dev_for_msg,
-                                        attempt_gen,
+                                        lifecycle_id,
                                         error: format!("{e}"),
                                     })
                                     .await;
@@ -353,7 +396,7 @@ impl<I: BleInterface> Driver<I> {
 
             PeerAction::ReadVersion {
                 device_id,
-                attempt_gen,
+                lifecycle_id,
             } => {
                 let iface = Arc::clone(&self.iface);
                 let inbox = self.inbox.clone();
@@ -361,15 +404,24 @@ impl<I: BleInterface> Driver<I> {
                 let dev_for_msg = device_id.clone();
                 self.dispatch(
                     &device_id,
+                    lifecycle_id,
                     Cancellation::Immediate,
                     Box::pin(async move {
                         let want = crate::transport::transport::PROTOCOL_VERSION;
-                        match iface.read_version(&dev_for_job).await {
+                        let result = tokio::time::timeout(
+                            VERSION_READ_TIMEOUT,
+                            iface.read_version(&dev_for_job),
+                        ).await;
+                        let Ok(result) = result else {
+                            tracing::debug!(device = %dev_for_job, "VERSION read timed out; treating as skip");
+                            return;
+                        };
+                        match result {
                             Ok(Some(got)) if got != want => {
                                 let _ = inbox
                                     .send(PeerCommand::ProtocolVersionMismatch {
                                         device_id: dev_for_msg,
-                                        attempt_gen,
+                                        lifecycle_id,
                                         got,
                                         want,
                                     })
@@ -388,54 +440,39 @@ impl<I: BleInterface> Driver<I> {
                 );
             }
 
-            PeerAction::CloseChannel {
-                device_id, channel, ..
+            PeerAction::RetireLifecycle {
+                device_id,
+                lifecycle_id,
             } => {
-                // `disconnect` is by device, not by channel, so a close
-                // naming a channel this device has already replaced would
-                // take the replacement down with it. Decide that here rather
-                // than inside the job: a close we are going to skip must not
-                // retire the live channel's queued work on its way past.
-                // No record means the registry never announced a channel for
-                // this device (only reachable from `Handshaking`), so fall
-                // open and tear down.
-                let replaced = self
-                    .live_channels
-                    .lock()
-                    .get(&device_id)
-                    .is_some_and(|live| *live != channel.id);
-                if replaced {
-                    tracing::debug!(
-                        device = %device_id,
-                        channel = channel.id,
-                        "skipping close of a channel this device has already replaced"
-                    );
-                    return;
-                }
+                self.retire(&device_id, lifecycle_id);
+            }
+
+            PeerAction::CloseChannel {
+                device_id,
+                lifecycle_id,
+                ..
+            } => {
                 let iface = Arc::clone(&self.iface);
-                let live_channels = Arc::clone(&self.live_channels);
                 let dev_for_job = device_id.clone();
-                // The attempt that owned this channel is over: retire
-                // anything still queued for it before tearing down.
-                self.abandon_device(&device_id);
                 self.dispatch(
                     &device_id,
+                    lifecycle_id,
                     Cancellation::Never,
                     Box::pin(async move {
                         let _ = iface.disconnect(&dev_for_job).await;
-                        let mut live = live_channels.lock();
-                        if live.get(&dev_for_job).is_some_and(|id| *id == channel.id) {
-                            live.remove(&dev_for_job);
-                        }
                     }),
                 );
             }
 
-            PeerAction::Refresh { device_id, .. } => {
+            PeerAction::Refresh {
+                device_id,
+                lifecycle_id,
+            } => {
                 let iface = Arc::clone(&self.iface);
                 let dev_for_job = device_id.clone();
                 self.dispatch(
                     &device_id,
+                    lifecycle_id,
                     Cancellation::Never,
                     Box::pin(async move {
                         let _ = iface.refresh(&dev_for_job).await;
@@ -492,7 +529,7 @@ impl<I: BleInterface> Driver<I> {
 
             PeerAction::StartDataPipe {
                 device_id,
-                channel_id,
+                lifecycle_id,
                 tx_gen,
                 role,
                 target_endpoint,
@@ -500,13 +537,7 @@ impl<I: BleInterface> Driver<I> {
                 l2cap_channel,
             } => {
                 tracing::debug!(device = %device_id, ?role, ?path, "StartDataPipe");
-                // The registry installing a channel is the only thing that
-                // makes one live, and it mints its own for inbound peers, so
-                // this — not the return of `connect` — is what ownership is
-                // tracked from.
-                self.live_channels
-                    .lock()
-                    .insert(device_id.clone(), channel_id);
+                self.activate(&device_id, lifecycle_id);
                 let (outbound_tx, outbound_rx) =
                     mpsc::channel::<crate::transport::peer::PendingSend>(32);
                 let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(64);
@@ -519,8 +550,6 @@ impl<I: BleInterface> Driver<I> {
                 let truncation_counter = Arc::clone(&self.truncation_counter);
                 let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
-                let dev_for_cleanup = device_id.clone();
-                let live_channels = Arc::clone(&self.live_channels);
                 let pipe_last_rx_at = last_rx_at.clone();
                 // Register the pipe with routing and enter the
                 // pending pool. If the resolver previously minted a
@@ -596,17 +625,6 @@ impl<I: BleInterface> Driver<I> {
                         );
                     }
                     routing.evict_pipe(stable_id);
-                    // Stop vouching for a channel whose pipe is gone, unless
-                    // something newer has already claimed the device. A later
-                    // close then falls open, which is right: with no pipe
-                    // there is no replacement to protect.
-                    let mut live = live_channels.lock();
-                    if live
-                        .get(&dev_for_cleanup)
-                        .is_some_and(|id| *id == channel_id)
-                    {
-                        live.remove(&dev_for_cleanup);
-                    }
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
@@ -622,9 +640,10 @@ impl<I: BleInterface> Driver<I> {
             }
             PeerAction::UpgradeToL2cap {
                 device_id,
+                lifecycle_id,
                 upgrade_gen,
             } => {
-                self.spawn_l2cap_open(device_id, upgrade_gen);
+                self.spawn_l2cap_open(device_id, lifecycle_id, upgrade_gen);
             }
             PeerAction::SwapPipeToL2cap {
                 device_id,
@@ -640,13 +659,14 @@ impl<I: BleInterface> Driver<I> {
         }
     }
 
-    fn spawn_l2cap_open(&self, device_id: blew::DeviceId, upgrade_gen: u64) {
+    fn spawn_l2cap_open(&self, device_id: blew::DeviceId, lifecycle_id: u64, upgrade_gen: u64) {
         let iface = Arc::clone(&self.iface);
         let inbox = self.inbox.clone();
         let dev_for_job = device_id.clone();
         let dev_for_msg = device_id.clone();
         self.dispatch(
             &device_id,
+            lifecycle_id,
             Cancellation::Immediate,
             Box::pin(async move {
                 let result = tokio::time::timeout(super::registry::L2CAP_SELECT_TIMEOUT, async {
@@ -667,6 +687,7 @@ impl<I: BleInterface> Driver<I> {
                         let _ = inbox
                             .send(PeerCommand::OpenL2capSucceeded {
                                 device_id: dev_for_msg,
+                                lifecycle_id,
                                 upgrade_gen,
                                 channel,
                             })
@@ -676,6 +697,7 @@ impl<I: BleInterface> Driver<I> {
                         let _ = inbox
                             .send(PeerCommand::OpenL2capFailed {
                                 device_id: dev_for_msg,
+                                lifecycle_id,
                                 upgrade_gen,
                                 error,
                             })
@@ -685,6 +707,7 @@ impl<I: BleInterface> Driver<I> {
                         let _ = inbox
                             .send(PeerCommand::OpenL2capFailed {
                                 device_id: dev_for_msg,
+                                lifecycle_id,
                                 upgrade_gen,
                                 error: "l2cap select timeout".into(),
                             })
@@ -1071,7 +1094,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("start-pipe"),
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 7,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1116,7 +1139,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("start-pipe-peri"),
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 9,
                 role: ConnectRole::Peripheral,
                 target_endpoint: None,
@@ -1173,7 +1196,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("dying-pipe"),
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1259,7 +1282,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 3,
                 role: ConnectRole::Central,
                 target_endpoint: Some(endpoint),
@@ -1316,7 +1339,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: old_device,
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 3,
                 role: ConnectRole::Central,
                 target_endpoint: Some(endpoint),
@@ -1366,7 +1389,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("pending-peer"),
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1448,7 +1471,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("shadow-peer"),
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1521,7 +1544,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("central-peer"),
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1532,7 +1555,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("peripheral-peer"),
-                channel_id: 1,
+                lifecycle_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Peripheral,
                 target_endpoint: None,
@@ -1586,8 +1609,10 @@ mod tests {
             Arc::new(crate::transport::routing::Routing::new()),
         );
 
+        driver.activate(&device_id, 1);
         driver
             .execute(PeerAction::UpgradeToL2cap {
+                lifecycle_id: 1,
                 device_id: device_id.clone(),
                 upgrade_gen: 1,
             })
@@ -1658,7 +1683,7 @@ mod tests {
             .execute(PeerAction::StartConnect {
                 device_id: device_id.clone(),
                 attempt: 0,
-                attempt_gen: 1,
+                lifecycle_id: 1,
             })
             .await;
         let cmd = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
@@ -1708,7 +1733,7 @@ mod tests {
             .execute(PeerAction::StartConnect {
                 device_id: device_id.clone(),
                 attempt: 0,
-                attempt_gen: 1,
+                lifecycle_id: 1,
             })
             .await;
         assert!(matches!(
@@ -1719,6 +1744,7 @@ mod tests {
         iface.hold_disconnect();
         driver
             .execute(PeerAction::CloseChannel {
+                lifecycle_id: 1,
                 device_id: device_id.clone(),
                 channel: ChannelHandle {
                     id: 1,
@@ -1732,7 +1758,7 @@ mod tests {
             .execute(PeerAction::StartConnect {
                 device_id: device_id.clone(),
                 attempt: 1,
-                attempt_gen: 2,
+                lifecycle_id: 2,
             })
             .await;
 
@@ -1769,7 +1795,7 @@ mod tests {
         iface.release_disconnect();
         let cmd = next_command(&mut rx).await;
         match cmd {
-            PeerCommand::ConnectSucceeded { attempt_gen, .. } => assert_eq!(attempt_gen, 2),
+            PeerCommand::ConnectSucceeded { lifecycle_id, .. } => assert_eq!(lifecycle_id, 2),
             other => panic!("expected the replacement's ConnectSucceeded, got {other:?}"),
         }
         assert_eq!(connected(&iface.calls()), 2);
@@ -1780,14 +1806,14 @@ mod tests {
     async fn announce_channel(
         driver: &Driver<MockBleInterface>,
         device_id: &blew::DeviceId,
-        channel_id: u64,
+        lifecycle_id: u64,
         rx: &mut mpsc::Receiver<PeerCommand>,
     ) {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
-                channel_id,
-                tx_gen: channel_id,
+                lifecycle_id,
+                tx_gen: lifecycle_id,
                 role: crate::transport::peer::ConnectRole::Central,
                 target_endpoint: None,
                 path: ConnectPath::Gatt,
@@ -1823,6 +1849,7 @@ mod tests {
         // A close for the first channel arrives late.
         driver
             .execute(PeerAction::CloseChannel {
+                lifecycle_id: 1,
                 device_id: device_id.clone(),
                 channel: ChannelHandle {
                     id: 1,
@@ -1842,6 +1869,7 @@ mod tests {
         // The live channel still closes normally.
         driver
             .execute(PeerAction::CloseChannel {
+                lifecycle_id: 2,
                 device_id: device_id.clone(),
                 channel: ChannelHandle {
                     id: 2,
@@ -1879,7 +1907,7 @@ mod tests {
         let (driver, mut rx) = test_driver(Arc::clone(&iface));
 
         // Inbound traffic promotes the peer on a handle the registry minted.
-        announce_channel(&driver, &device_id, 0, &mut rx).await;
+        announce_channel(&driver, &device_id, 1, &mut rx).await;
 
         // The dial that was already in flight completes; the registry drops
         // its result, but the driver used to record its channel id anyway.
@@ -1887,7 +1915,7 @@ mod tests {
             .execute(PeerAction::StartConnect {
                 device_id: device_id.clone(),
                 attempt: 0,
-                attempt_gen: 1,
+                lifecycle_id: 1,
             })
             .await;
         assert!(matches!(
@@ -1897,6 +1925,7 @@ mod tests {
 
         driver
             .execute(PeerAction::CloseChannel {
+                lifecycle_id: 1,
                 device_id: device_id.clone(),
                 channel: ChannelHandle {
                     id: 0,
@@ -1935,17 +1964,19 @@ mod tests {
             .execute(PeerAction::StartConnect {
                 device_id: device_id.clone(),
                 attempt: 0,
-                attempt_gen: 1,
+                lifecycle_id: 2,
             })
             .await;
         driver
             .execute(PeerAction::UpgradeToL2cap {
+                lifecycle_id: 2,
                 device_id: device_id.clone(),
                 upgrade_gen: 1,
             })
             .await;
         driver
             .execute(PeerAction::CloseChannel {
+                lifecycle_id: 1,
                 device_id: device_id.clone(),
                 channel: ChannelHandle {
                     id: 1,
