@@ -431,6 +431,12 @@ pub enum PeerAction {
     RestartL2capListener,
     StartDataPipe {
         device_id: DeviceId,
+        /// Id of the `ChannelHandle` the registry just installed for this
+        /// peer. Every transition into `Connected` emits this action, so it
+        /// is the driver's only faithful record of which channel is live —
+        /// including the ones the registry mints itself for inbound peers,
+        /// which never went through `BleInterface::connect`.
+        channel_id: u64,
         tx_gen: u64,
         role: ConnectRole,
         target_endpoint: Option<iroh_base::EndpointId>,
@@ -519,6 +525,7 @@ mod tests {
         };
         let _act = PeerAction::StartDataPipe {
             device_id: DeviceId::from("x"),
+            channel_id: 1,
             tx_gen: 1,
             role: ConnectRole::Central,
             target_endpoint: None,

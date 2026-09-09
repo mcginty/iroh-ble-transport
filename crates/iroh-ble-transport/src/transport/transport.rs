@@ -1899,6 +1899,7 @@ mod tests {
             .find_map(|action| match action {
                 PeerAction::StartDataPipe {
                     device_id,
+                    channel_id,
                     tx_gen,
                     role,
                     target_endpoint,
@@ -1911,6 +1912,7 @@ mod tests {
                     target_endpoint,
                     path,
                     l2cap_channel,
+                    channel_id,
                 )),
                 _ => None,
             })
@@ -1937,6 +1939,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: start_pipe.0.clone(),
+                channel_id: start_pipe.6,
                 tx_gen: start_pipe.1,
                 role: start_pipe.2,
                 target_endpoint: start_pipe.3,

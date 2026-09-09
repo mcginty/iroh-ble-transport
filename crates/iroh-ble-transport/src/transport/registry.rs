@@ -773,6 +773,7 @@ impl Registry {
         entry.subscribed_chars.clear();
         entry.tx_gen += 1;
         let tx_gen = entry.tx_gen;
+        let channel_id = channel.id;
         entry.phase = PeerPhase::Connected {
             since: now,
             channel,
@@ -782,6 +783,7 @@ impl Registry {
         let role = entry.role;
         actions.push(PeerAction::StartDataPipe {
             device_id: device_id.clone(),
+            channel_id,
             tx_gen,
             role,
             target_endpoint: entry.target_endpoint,
@@ -891,6 +893,7 @@ impl Registry {
             entry.rx_backlog.push_back(bytes);
             actions.push(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
+                channel_id: 0,
                 tx_gen: 1,
                 role: crate::transport::peer::ConnectRole::Peripheral,
                 target_endpoint: entry.target_endpoint,
@@ -911,6 +914,7 @@ impl Registry {
             };
             entry.tx_gen += 1;
             let tx_gen = entry.tx_gen;
+            let channel_id = channel.id;
             entry.phase = PeerPhase::Connected {
                 since: now,
                 channel,
@@ -921,6 +925,7 @@ impl Registry {
             let role = entry.role;
             actions.push(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
+                channel_id,
                 tx_gen,
                 role,
                 target_endpoint: entry.target_endpoint,
@@ -1025,6 +1030,7 @@ impl Registry {
         entry.rx_backlog.push_back(bytes);
         actions.push(PeerAction::StartDataPipe {
             device_id: device_id.clone(),
+            channel_id: 0,
             tx_gen: entry.tx_gen,
             role,
             target_endpoint: entry.target_endpoint,
@@ -1068,6 +1074,7 @@ impl Registry {
         }
         actions.push(PeerAction::StartDataPipe {
             device_id,
+            channel_id: entry.tx_gen,
             tx_gen: entry.tx_gen,
             role: crate::transport::peer::ConnectRole::Peripheral,
             target_endpoint: entry.target_endpoint,
@@ -1489,6 +1496,7 @@ impl Registry {
                     id: gatt_channel.id,
                     path: crate::transport::peer::ConnectPath::L2cap,
                 };
+                let channel_id = l2cap_handle.id;
                 entry.l2cap_channel = Some(l2cap_chan);
                 entry.subscribed_chars.clear();
                 entry.tx_gen += 1;
@@ -1502,6 +1510,7 @@ impl Registry {
                 let role = entry.role;
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    channel_id,
                     tx_gen,
                     role,
                     target_endpoint: entry.target_endpoint,
@@ -1583,6 +1592,7 @@ impl Registry {
                 entry.subscribed_chars.clear();
                 entry.tx_gen += 1;
                 let tx_gen = entry.tx_gen;
+                let channel_id = channel.id;
                 entry.phase = PeerPhase::Connected {
                     since: now,
                     channel,
@@ -1592,6 +1602,7 @@ impl Registry {
                 let role = entry.role;
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    channel_id,
                     tx_gen,
                     role,
                     target_endpoint: entry.target_endpoint,
@@ -1667,6 +1678,7 @@ impl Registry {
                 let inserted = v.insert(e);
                 actions.push(PeerAction::StartDataPipe {
                     device_id: device_id.clone(),
+                    channel_id: 0,
                     tx_gen: 1,
                     role: crate::transport::peer::ConnectRole::Peripheral,
                     target_endpoint: inserted.target_endpoint,
@@ -1746,6 +1758,7 @@ impl Registry {
                     let role = entry.role;
                     actions.push(PeerAction::StartDataPipe {
                         device_id: device_id.clone(),
+                        channel_id: 0,
                         tx_gen,
                         role,
                         target_endpoint: entry.target_endpoint,

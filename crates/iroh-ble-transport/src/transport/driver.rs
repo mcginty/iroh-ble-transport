@@ -311,7 +311,6 @@ impl<I: BleInterface> Driver<I> {
             } => {
                 let iface = Arc::clone(&self.iface);
                 let inbox = self.inbox.clone();
-                let live_channels = Arc::clone(&self.live_channels);
                 let dev_for_job = device_id.clone();
                 let dev_for_msg = device_id.clone();
                 // A fresh attempt supersedes everything the previous one left
@@ -330,7 +329,6 @@ impl<I: BleInterface> Driver<I> {
                     Box::pin(async move {
                         match iface.connect(&dev_for_job).await {
                             Ok(channel) => {
-                                live_channels.lock().insert(dev_for_job.clone(), channel.id);
                                 let _ = inbox
                                     .send(PeerCommand::ConnectSucceeded {
                                         device_id: dev_for_msg,
@@ -393,6 +391,27 @@ impl<I: BleInterface> Driver<I> {
             PeerAction::CloseChannel {
                 device_id, channel, ..
             } => {
+                // `disconnect` is by device, not by channel, so a close
+                // naming a channel this device has already replaced would
+                // take the replacement down with it. Decide that here rather
+                // than inside the job: a close we are going to skip must not
+                // retire the live channel's queued work on its way past.
+                // No record means the registry never announced a channel for
+                // this device (only reachable from `Handshaking`), so fall
+                // open and tear down.
+                let replaced = self
+                    .live_channels
+                    .lock()
+                    .get(&device_id)
+                    .is_some_and(|live| *live != channel.id);
+                if replaced {
+                    tracing::debug!(
+                        device = %device_id,
+                        channel = channel.id,
+                        "skipping close of a channel this device has already replaced"
+                    );
+                    return;
+                }
                 let iface = Arc::clone(&self.iface);
                 let live_channels = Arc::clone(&self.live_channels);
                 let dev_for_job = device_id.clone();
@@ -403,21 +422,6 @@ impl<I: BleInterface> Driver<I> {
                     &device_id,
                     Cancellation::Never,
                     Box::pin(async move {
-                        // `disconnect` is by device, not by channel, so a
-                        // close naming a channel this device has already
-                        // replaced would take the replacement down with it.
-                        let replaced = live_channels
-                            .lock()
-                            .get(&dev_for_job)
-                            .is_some_and(|live| *live != channel.id);
-                        if replaced {
-                            tracing::debug!(
-                                device = %dev_for_job,
-                                channel = channel.id,
-                                "skipping close of a channel this device has already replaced"
-                            );
-                            return;
-                        }
                         let _ = iface.disconnect(&dev_for_job).await;
                         let mut live = live_channels.lock();
                         if live.get(&dev_for_job).is_some_and(|id| *id == channel.id) {
@@ -488,6 +492,7 @@ impl<I: BleInterface> Driver<I> {
 
             PeerAction::StartDataPipe {
                 device_id,
+                channel_id,
                 tx_gen,
                 role,
                 target_endpoint,
@@ -495,6 +500,13 @@ impl<I: BleInterface> Driver<I> {
                 l2cap_channel,
             } => {
                 tracing::debug!(device = %device_id, ?role, ?path, "StartDataPipe");
+                // The registry installing a channel is the only thing that
+                // makes one live, and it mints its own for inbound peers, so
+                // this — not the return of `connect` — is what ownership is
+                // tracked from.
+                self.live_channels
+                    .lock()
+                    .insert(device_id.clone(), channel_id);
                 let (outbound_tx, outbound_rx) =
                     mpsc::channel::<crate::transport::peer::PendingSend>(32);
                 let (inbound_tx, inbound_rx) = mpsc::channel::<Bytes>(64);
@@ -507,6 +519,8 @@ impl<I: BleInterface> Driver<I> {
                 let truncation_counter = Arc::clone(&self.truncation_counter);
                 let empty_frames_counter = Arc::clone(&self.empty_frames_counter);
                 let dev_for_ready = device_id.clone();
+                let dev_for_cleanup = device_id.clone();
+                let live_channels = Arc::clone(&self.live_channels);
                 let pipe_last_rx_at = last_rx_at.clone();
                 // Register the pipe with routing and enter the
                 // pending pool. If the resolver previously minted a
@@ -582,6 +596,17 @@ impl<I: BleInterface> Driver<I> {
                         );
                     }
                     routing.evict_pipe(stable_id);
+                    // Stop vouching for a channel whose pipe is gone, unless
+                    // something newer has already claimed the device. A later
+                    // close then falls open, which is right: with no pipe
+                    // there is no replacement to protect.
+                    let mut live = live_channels.lock();
+                    if live
+                        .get(&dev_for_cleanup)
+                        .is_some_and(|id| *id == channel_id)
+                    {
+                        live.remove(&dev_for_cleanup);
+                    }
                 });
                 let ready = PeerCommand::DataPipeReady {
                     device_id: dev_for_ready,
@@ -1046,6 +1071,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("start-pipe"),
+                channel_id: 1,
                 tx_gen: 7,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1090,6 +1116,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("start-pipe-peri"),
+                channel_id: 1,
                 tx_gen: 9,
                 role: ConnectRole::Peripheral,
                 target_endpoint: None,
@@ -1146,6 +1173,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("dying-pipe"),
+                channel_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1231,6 +1259,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: device_id.clone(),
+                channel_id: 1,
                 tx_gen: 3,
                 role: ConnectRole::Central,
                 target_endpoint: Some(endpoint),
@@ -1287,6 +1316,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: old_device,
+                channel_id: 1,
                 tx_gen: 3,
                 role: ConnectRole::Central,
                 target_endpoint: Some(endpoint),
@@ -1336,6 +1366,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("pending-peer"),
+                channel_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1417,6 +1448,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("shadow-peer"),
+                channel_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1489,6 +1521,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("central-peer"),
+                channel_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Central,
                 target_endpoint: None,
@@ -1499,6 +1532,7 @@ mod tests {
         driver
             .execute(PeerAction::StartDataPipe {
                 device_id: blew::DeviceId::from("peripheral-peer"),
+                channel_id: 1,
                 tx_gen: 1,
                 role: ConnectRole::Peripheral,
                 target_endpoint: None,
@@ -1741,6 +1775,39 @@ mod tests {
         assert_eq!(connected(&iface.calls()), 2);
     }
 
+    /// The registry installing a channel is what makes it live, so that is
+    /// what the driver tracks. `StartDataPipe` announces every one of them.
+    async fn announce_channel(
+        driver: &Driver<MockBleInterface>,
+        device_id: &blew::DeviceId,
+        channel_id: u64,
+        rx: &mut mpsc::Receiver<PeerCommand>,
+    ) {
+        driver
+            .execute(PeerAction::StartDataPipe {
+                device_id: device_id.clone(),
+                channel_id,
+                tx_gen: channel_id,
+                role: crate::transport::peer::ConnectRole::Central,
+                target_endpoint: None,
+                path: ConnectPath::Gatt,
+                l2cap_channel: None,
+            })
+            .await;
+        assert!(matches!(
+            next_command(rx).await,
+            PeerCommand::DataPipeReady { .. }
+        ));
+    }
+
+    fn disconnects(iface: &MockBleInterface) -> usize {
+        iface
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, CallKind::Disconnect(_)))
+            .count()
+    }
+
     /// `disconnect` is addressed by device, not by channel, so a close naming
     /// a channel the device has already replaced would take the replacement
     /// down with it.
@@ -1748,37 +1815,12 @@ mod tests {
     async fn closing_a_replaced_channel_leaves_the_replacement_connected() {
         let iface = Arc::new(MockBleInterface::new());
         let device_id = blew::DeviceId::from("replaced-chan-dev");
-        iface.on_connect(
-            device_id.clone(),
-            Ok(ChannelHandle {
-                id: 1,
-                path: ConnectPath::Gatt,
-            }),
-        );
-        iface.on_connect(
-            device_id.clone(),
-            Ok(ChannelHandle {
-                id: 2,
-                path: ConnectPath::Gatt,
-            }),
-        );
         let (driver, mut rx) = test_driver(Arc::clone(&iface));
 
-        for (attempt, attempt_gen) in [(0u32, 1u64), (1, 2)] {
-            driver
-                .execute(PeerAction::StartConnect {
-                    device_id: device_id.clone(),
-                    attempt,
-                    attempt_gen,
-                })
-                .await;
-            assert!(matches!(
-                next_command(&mut rx).await,
-                PeerCommand::ConnectSucceeded { .. }
-            ));
-        }
+        announce_channel(&driver, &device_id, 1, &mut rx).await;
+        announce_channel(&driver, &device_id, 2, &mut rx).await;
 
-        // A close for the first attempt's channel arrives late.
+        // A close for the first channel arrives late.
         driver
             .execute(PeerAction::CloseChannel {
                 device_id: device_id.clone(),
@@ -1790,11 +1832,9 @@ mod tests {
             })
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(
-            !iface
-                .calls()
-                .iter()
-                .any(|c| matches!(c, CallKind::Disconnect(_))),
+        assert_eq!(
+            disconnects(&iface),
+            0,
             "a stale close must not disconnect the device; got {:?}",
             iface.calls()
         );
@@ -1811,15 +1851,126 @@ mod tests {
             })
             .await;
         for _ in 0..50 {
-            if iface
-                .calls()
-                .iter()
-                .any(|c| matches!(c, CallKind::Disconnect(_)))
-            {
+            if disconnects(&iface) == 1 {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("the live channel's close never reached the interface");
+    }
+
+    /// Not every live channel comes back from `connect`: a notification can
+    /// promote a peer straight to `Connected` on a registry-minted handle
+    /// while a dial is still in flight, and the registry then ignores that
+    /// dial's result. Tracking ownership from `connect` instead of from the
+    /// registry's own announcement made every later close of that live
+    /// connection look stale, so the peer was never torn down.
+    #[tokio::test]
+    async fn a_registry_minted_channel_can_still_be_closed_after_a_dial_lands() {
+        let iface = Arc::new(MockBleInterface::new());
+        let device_id = blew::DeviceId::from("promoted-dev");
+        iface.on_connect(
+            device_id.clone(),
+            Ok(ChannelHandle {
+                id: 7,
+                path: ConnectPath::Gatt,
+            }),
+        );
+        let (driver, mut rx) = test_driver(Arc::clone(&iface));
+
+        // Inbound traffic promotes the peer on a handle the registry minted.
+        announce_channel(&driver, &device_id, 0, &mut rx).await;
+
+        // The dial that was already in flight completes; the registry drops
+        // its result, but the driver used to record its channel id anyway.
+        driver
+            .execute(PeerAction::StartConnect {
+                device_id: device_id.clone(),
+                attempt: 0,
+                attempt_gen: 1,
+            })
+            .await;
+        assert!(matches!(
+            next_command(&mut rx).await,
+            PeerCommand::ConnectSucceeded { .. }
+        ));
+
+        driver
+            .execute(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                channel: ChannelHandle {
+                    id: 0,
+                    path: ConnectPath::Gatt,
+                },
+                reason: crate::transport::peer::DisconnectReason::LinkLoss,
+            })
+            .await;
+        for _ in 0..50 {
+            if disconnects(&iface) == 1 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the live channel was never torn down");
+    }
+
+    /// A close we are going to skip must not retire the live channel's work
+    /// on its way past: a cancelled upgrade reports nothing back, so the
+    /// registry would sit in `Connected { upgrading: true }` for good.
+    #[tokio::test]
+    async fn a_stale_close_does_not_cancel_the_live_channels_upgrade() {
+        let iface = Arc::new(MockBleInterface::new());
+        let device_id = blew::DeviceId::from("stale-close-upgrade-dev");
+        let psm = 0x0080u16;
+        iface.seed_psm(Some(psm));
+        let (chan, _other) = blew::L2capChannel::pair(1024);
+        iface.on_open_l2cap(device_id.clone(), psm, Ok(chan));
+        // Keep the lane busy so the upgrade is still queued when the stale
+        // close is dispatched.
+        iface.set_connect_delay(std::time::Duration::from_millis(200));
+        let (driver, mut rx) = test_driver(Arc::clone(&iface));
+
+        announce_channel(&driver, &device_id, 2, &mut rx).await;
+        driver
+            .execute(PeerAction::StartConnect {
+                device_id: device_id.clone(),
+                attempt: 0,
+                attempt_gen: 1,
+            })
+            .await;
+        driver
+            .execute(PeerAction::UpgradeToL2cap {
+                device_id: device_id.clone(),
+                upgrade_gen: 1,
+            })
+            .await;
+        driver
+            .execute(PeerAction::CloseChannel {
+                device_id: device_id.clone(),
+                channel: ChannelHandle {
+                    id: 1,
+                    path: ConnectPath::Gatt,
+                },
+                reason: crate::transport::peer::DisconnectReason::LinkLoss,
+            })
+            .await;
+
+        loop {
+            match next_command(&mut rx).await {
+                PeerCommand::OpenL2capSucceeded { upgrade_gen, .. } => {
+                    assert_eq!(upgrade_gen, 1);
+                    break;
+                }
+                PeerCommand::OpenL2capFailed { error, .. } => {
+                    panic!("upgrade should have succeeded, got {error}")
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            disconnects(&iface),
+            0,
+            "the stale close must not have torn the device down"
+        );
     }
 }
