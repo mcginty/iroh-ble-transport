@@ -476,7 +476,7 @@ impl BleTransport {
         )
         .await?;
         let advertising_config = AdvertisingConfig {
-            local_name: "iroh".to_string(),
+            local_name: None,
             service_uuids: vec![key_uuid],
         };
         rollback.advertising = true;
