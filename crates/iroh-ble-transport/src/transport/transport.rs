@@ -389,6 +389,13 @@ async fn construct_step<T>(
 /// was waiting on came back. Rolling back something that never started costs a
 /// warning; not rolling back something that did is the leak this exists to
 /// prevent.
+///
+/// GATT service registration has no entry here, and cannot: `blew::Peripheral`
+/// exposes `add_service` with no removal counterpart, so dropping the
+/// `Peripheral` *is* the removal (mcginty/blew#34). That holds when `construct`
+/// created it — the `Arc` dies with the failed build. It does not hold for a
+/// peripheral supplied through [`BleTransportBuilder::peripheral`], which
+/// outlives us still carrying the services we registered on it.
 #[derive(Default)]
 struct ConstructRollback {
     advertising: bool,
