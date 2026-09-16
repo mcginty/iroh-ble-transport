@@ -8,7 +8,11 @@
 //!   cargo run --example central -p iroh-ble-transport
 //!   cargo run --example central -p iroh-ble-transport -- --name my-device
 //!
-//! Start `cargo run --example peripheral -p iroh-ble-transport` first so there is something to connect to.
+//! Start `cargo run --example peripheral -p iroh-ble-transport` on a *second
+//! machine* first, so there is something to connect to. A single Bluetooth
+//! controller does not discover its own advertisements, so running both
+//! examples on one host reports `No matching device found` — and a second
+//! adapter does not help, because blew always binds the default one.
 
 use iroh_ble_transport::{Central, CentralEvent, DeviceId, ScanFilter};
 use std::{env, time::Duration};

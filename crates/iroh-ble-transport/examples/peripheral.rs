@@ -7,8 +7,11 @@
 //! Run with:
 //!   cargo run --example peripheral -p iroh-ble-transport
 //!
-//! Then run `cargo run --example central -p iroh-ble-transport` on the same or another
-//! machine to connect to it.
+//! Then run `cargo run --example central -p iroh-ble-transport` on a *second
+//! machine* to connect to it. A single Bluetooth controller does not discover
+//! its own advertisements, so running both examples on one host never finds
+//! anything — and a second adapter does not help, because blew always binds
+//! the default one.
 
 use iroh_ble_transport::{
     AdvertisingConfig, AttributePermissions, CharacteristicProperties, DeviceId,

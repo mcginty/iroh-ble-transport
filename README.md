@@ -60,8 +60,18 @@ See:
   — the minimum viable setup, end to end.
 - [`examples/iroh_ble.rs`](crates/iroh-ble-transport/examples/iroh_ble.rs)
   — echo + 48 KB speed test over a dialer/listener pair.
+- [`examples/central.rs`](crates/iroh-ble-transport/examples/central.rs) and
+  [`examples/peripheral.rs`](crates/iroh-ble-transport/examples/peripheral.rs)
+  — the bare BLE roles without the iroh transport, useful for working out
+  whether a problem is in the radio layer or above it.
 - [`demos/iroh-ble-chat`](demos/iroh-ble-chat) — production-grade
   iroh-gossip app built on this transport.
+
+**Every example needs two machines.** A single Bluetooth controller does not
+discover its own advertisements, so a dialer and a listener — or a central and
+a peripheral — running on one host will never find each other, and blew always
+binds the default adapter, so adding a second one does not help. On macOS this
+holds even between two processes on the same machine.
 
 ## Demo
 

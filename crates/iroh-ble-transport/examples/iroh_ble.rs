@@ -11,7 +11,11 @@
 //!
 //! ## Usage
 //!
-//! On machine A (or terminal A):
+//! The two roles must run on **two separate machines**: a single Bluetooth
+//! controller does not discover its own advertisements, and blew always binds
+//! the default adapter, so a second one on the same host does not help.
+//!
+//! On machine A:
 //!
 //! ```sh
 //! cargo run --example iroh_ble
