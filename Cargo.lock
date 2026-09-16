@@ -505,9 +505,9 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.4.0-beta.4"
+version = "0.4.0-beta.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39b4cc1b4f45c090b1d3e2aef43fc9156227b4fab38512941f8c6401f1d4ab46"
+checksum = "d3bac28b55557c4a0149723397a43d615b70e8f731fc872250d5cf0abd333186"
 dependencies = [
  "bitflags 2.13.1",
  "bluer",
@@ -1256,7 +1256,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.4",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -5269,9 +5269,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",
@@ -6013,6 +6013,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b64191b275b66ffe2469e8af2c1cfe3bafa67b529ead792a6d0160888b4237"
 dependencies = [
  "proc-macro2",
+ "quote",
  "unicode-ident",
 ]
 
@@ -6300,9 +6301,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.4.0-beta.4"
+version = "0.4.0-beta.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6ac198ceef47b022eef3703f8514a55a042ec27f445a000976c0b5fb3a283ad"
+checksum = "332e0ac0babfff4a4d8fe8dc865b0799e71f0b3dc6a2c6c2fe848b1f6019110c"
 dependencies = [
  "blew",
  "jni 0.22.4",
@@ -6505,7 +6506,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
