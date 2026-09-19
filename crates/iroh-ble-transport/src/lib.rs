@@ -6,7 +6,8 @@ pub use blew::central::{CentralEvent, ScanFilter, WriteType};
 pub use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
 pub use blew::gatt::service::{GattCharacteristic, GattService};
 pub use blew::peripheral::{
-    AdvertisingConfig, PeripheralRequest, PeripheralStateEvent, ReadResponder, WriteResponder,
+    AdvertisingConfig, Delivery, LocalName, PeripheralRequest, PeripheralStateEvent, ReadResponder,
+    WriteResponder,
 };
 pub use blew::{BleDevice, Central, CentralConfig, DeviceId, Peripheral};
 pub use error::{BleError, BleResult};

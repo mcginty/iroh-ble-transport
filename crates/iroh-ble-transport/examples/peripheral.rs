@@ -15,7 +15,8 @@
 
 use iroh_ble_transport::{
     AdvertisingConfig, AttributePermissions, CharacteristicProperties, DeviceId,
-    GattCharacteristic, GattService, Peripheral, PeripheralRequest, PeripheralStateEvent,
+    GattCharacteristic, GattService, LocalName, Peripheral, PeripheralRequest,
+    PeripheralStateEvent,
 };
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -85,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     peripheral
         .start_advertising(&AdvertisingConfig {
-            local_name: Some(DEVICE_NAME.to_string()),
+            local_name: LocalName::Temporary(DEVICE_NAME.to_string()),
             service_uuids: vec![SERVICE_UUID],
         })
         .await?;

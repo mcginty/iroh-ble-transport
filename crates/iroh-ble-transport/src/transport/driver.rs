@@ -809,7 +809,7 @@ use async_trait::async_trait;
 use blew::central::ScanFilter;
 use blew::gatt::service::GattService;
 use blew::l2cap::types::Psm;
-use blew::peripheral::AdvertisingConfig;
+use blew::peripheral::{AdvertisingConfig, Delivery};
 use blew::{Central, L2capChannel, Peripheral};
 use uuid::{Uuid, uuid};
 
@@ -932,7 +932,16 @@ impl BleInterface for BlewDriver {
             .notify_characteristic(device_id, P2C_CHAR_UUID, bytes.to_vec())
             .await;
         match &result {
-            Ok(()) => tracing::trace!(device = %device_id, len, "notify_p2c ok"),
+            // NoSubscriber is a success that sent nothing: the central
+            // unsubscribed or dropped between our decision and the send. The
+            // ReliableChannel's ACK timeout retransmits, so it is not an error
+            // here, but it is not an ordinary send either.
+            Ok(Delivery::NoSubscriber) => {
+                tracing::debug!(device = %device_id, len, "notify_p2c dropped: no subscriber");
+            }
+            Ok(delivery) => {
+                tracing::trace!(device = %device_id, len, ?delivery, "notify_p2c ok");
+            }
             Err(e) => tracing::debug!(device = %device_id, len, err = %e, "notify_p2c err"),
         }
         result?;

@@ -10,7 +10,7 @@ use std::task::{Context, Poll, Waker};
 use arc_swap::ArcSwap;
 use blew::gatt::props::{AttributePermissions, CharacteristicProperties};
 use blew::gatt::service::{GattCharacteristic, GattService};
-use blew::peripheral::AdvertisingConfig;
+use blew::peripheral::{AdvertisingConfig, LocalName};
 use blew::{BlewError, Central, Peripheral};
 use bytes::Bytes;
 use iroh::address_lookup::{self, AddressLookup, EndpointData, EndpointInfo, Item};
@@ -483,7 +483,7 @@ impl BleTransport {
         )
         .await?;
         let advertising_config = AdvertisingConfig {
-            local_name: None,
+            local_name: LocalName::None,
             service_uuids: vec![key_uuid],
         };
         rollback.advertising = true;
