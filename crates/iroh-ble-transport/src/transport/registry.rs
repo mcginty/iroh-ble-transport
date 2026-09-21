@@ -1251,14 +1251,12 @@ impl Registry {
             }
             // Platform adapter-cycle wipes the peripheral's GATT table
             // and advertising state on Android (and sometimes macOS); the
-            // driver re-registers services, restarts the advertiser, and
-            // (if L2CAP is enabled) re-opens the listener so inbound
+            // driver re-registers services, (if L2CAP is enabled) re-opens
+            // the listener, and then restarts the advertiser so inbound
             // peers can find us again.
-            actions.push(PeerAction::RebuildGattServer);
-            actions.push(PeerAction::RestartAdvertising);
-            if matches!(self.l2cap_policy, L2capPolicy::PreferL2cap) {
-                actions.push(PeerAction::RestartL2capListener);
-            }
+            actions.push(PeerAction::RestorePeripheral {
+                restart_l2cap: matches!(self.l2cap_policy, L2capPolicy::PreferL2cap),
+            });
         }
     }
 
@@ -3923,22 +3921,13 @@ mod tests {
         });
         let actions = reg.handle(PeerCommand::AdapterStateChanged { powered: true });
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PeerAction::RebuildGattServer)),
-            "expected RebuildGattServer on adapter-on"
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PeerAction::RestartAdvertising)),
-            "expected RestartAdvertising on adapter-on"
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, PeerAction::RestartL2capListener)),
-            "L2capPolicy::Disabled should not request an L2CAP restart"
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::RestorePeripheral {
+                    restart_l2cap: false
+                }
+            )),
+            "expected RestorePeripheral without an L2CAP restart on adapter-on under L2capPolicy::Disabled"
         );
         match &reg.peer(&device_id).unwrap().phase {
             PeerPhase::Reconnecting { attempt: 0, .. } => {}
@@ -3951,9 +3940,12 @@ mod tests {
         let mut reg = Registry::new_for_test_with_policy(L2capPolicy::PreferL2cap);
         let actions = reg.handle(PeerCommand::AdapterStateChanged { powered: true });
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, PeerAction::RestartL2capListener)),
+            actions.iter().any(|a| matches!(
+                a,
+                PeerAction::RestorePeripheral {
+                    restart_l2cap: true
+                }
+            )),
             "PreferL2cap should request an L2CAP listener restart on adapter-on"
         );
     }

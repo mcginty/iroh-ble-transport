@@ -437,9 +437,12 @@ pub enum PeerAction {
         waker: Waker,
         result: Result<(), std::io::ErrorKind>,
     },
-    RebuildGattServer,
-    RestartAdvertising,
-    RestartL2capListener,
+    /// Re-register the GATT services, re-open the L2CAP listener (when
+    /// `restart_l2cap`), then restart advertising — in that order, in one
+    /// task, so advertising never comes up ahead of the server behind it.
+    RestorePeripheral {
+        restart_l2cap: bool,
+    },
     StartDataPipe {
         device_id: DeviceId,
         lifecycle_id: u64,

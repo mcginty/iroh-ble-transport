@@ -387,18 +387,22 @@ async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
         .await
         .unwrap();
 
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let restore_calls = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            let calls = iface.calls();
-            let has_rebuild = calls.iter().any(|c| matches!(c, CallKind::RebuildServer));
-            let has_restart_adv = calls
-                .iter()
-                .any(|c| matches!(c, CallKind::RestartAdvertising));
-            let has_restart_l2cap = calls
-                .iter()
-                .any(|c| matches!(c, CallKind::RestartL2capListener));
-            if has_rebuild && has_restart_adv && has_restart_l2cap {
-                return;
+            let restore_calls: Vec<CallKind> = iface
+                .calls()
+                .into_iter()
+                .filter(|c| {
+                    matches!(
+                        c,
+                        CallKind::RebuildServer
+                            | CallKind::RestartAdvertising
+                            | CallKind::RestartL2capListener
+                    )
+                })
+                .collect();
+            if restore_calls.len() >= 3 {
+                return restore_calls;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -406,6 +410,17 @@ async fn adapter_on_rebuilds_server_and_restarts_advertising_and_l2cap() {
     .await
     .expect(
         "expected rebuild_server + restart_advertising + restart_l2cap_listener after adapter-on",
+    );
+    assert!(
+        matches!(
+            restore_calls.as_slice(),
+            [
+                CallKind::RebuildServer,
+                CallKind::RestartL2capListener,
+                CallKind::RestartAdvertising,
+            ]
+        ),
+        "peripheral restore must rebuild the server and re-open L2CAP before advertising: {restore_calls:?}"
     );
 }
 

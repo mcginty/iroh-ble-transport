@@ -286,6 +286,8 @@ pub struct Driver<I: BleInterface> {
     /// Per-device serialization of native-connection work. Owned here so
     /// the workers die with the driver instead of outliving the actor.
     lanes: parking_lot::Mutex<HashMap<blew::DeviceId, DeviceLane>>,
+    /// Serializes adapter-cycle peripheral restores against each other.
+    peripheral_restore: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<I: BleInterface> Driver<I> {
@@ -311,6 +313,7 @@ impl<I: BleInterface> Driver<I> {
             routing,
             connections: Arc::new(crate::transport::conns::ConnectionRegistry::default()),
             lanes: parking_lot::Mutex::new(HashMap::new()),
+            peripheral_restore: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -564,24 +567,19 @@ impl<I: BleInterface> Driver<I> {
                 waker.wake();
             }
 
-            PeerAction::RebuildGattServer => {
+            PeerAction::RestorePeripheral { restart_l2cap } => {
                 let iface = Arc::clone(&self.iface);
+                let restore = Arc::clone(&self.peripheral_restore);
                 tokio::spawn(async move {
+                    // A quick off/on/off/on cycle dispatches a second restore
+                    // before the first finishes; interleaving the two would
+                    // reopen the ordering hazard this sequencing closes.
+                    let _guard = restore.lock().await;
                     let _ = iface.rebuild_server().await;
-                });
-            }
-
-            PeerAction::RestartAdvertising => {
-                let iface = Arc::clone(&self.iface);
-                tokio::spawn(async move {
+                    if restart_l2cap {
+                        let _ = iface.restart_l2cap_listener().await;
+                    }
                     let _ = iface.restart_advertising().await;
-                });
-            }
-
-            PeerAction::RestartL2capListener => {
-                let iface = Arc::clone(&self.iface);
-                tokio::spawn(async move {
-                    let _ = iface.restart_l2cap_listener().await;
                 });
             }
 
