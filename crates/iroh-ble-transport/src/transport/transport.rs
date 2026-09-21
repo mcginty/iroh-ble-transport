@@ -282,6 +282,7 @@ pub struct BleTransport {
     /// `AtomicWaker` (which would clobber prior registrations and leak wakeups).
     inbox_capacity_wakers: Arc<Mutex<Vec<Waker>>>,
     store: Arc<dyn PeerStore>,
+    adapter_state_rx: tokio::sync::watch::Receiver<BleAdapterState>,
 }
 
 impl std::fmt::Debug for BleTransport {
@@ -567,7 +568,11 @@ impl BleTransport {
             }
         }
 
-        let registry = Registry::new(l2cap_policy, local_id);
+        // `wait_ready` above only returns once both roles report powered.
+        let (adapter_state_tx, adapter_state_rx) =
+            tokio::sync::watch::channel(BleAdapterState::PoweredOn);
+        let registry =
+            Registry::new(l2cap_policy, local_id).with_adapter_state_tx(adapter_state_tx);
         let snap_for_actor = Arc::clone(&snapshots);
         let wakers_for_actor = Arc::clone(&inbox_capacity_wakers);
         let routing_for_actor = Arc::clone(&routing);
@@ -634,6 +639,7 @@ impl BleTransport {
             empty_frames,
             inbox_capacity_wakers,
             store,
+            adapter_state_rx,
         }))
     }
 
@@ -719,6 +725,20 @@ impl BleTransport {
         self.routing.scan_hint_for_prefix(&prefix).is_some()
     }
 
+    /// Current power state of the local Bluetooth adapter.
+    #[must_use]
+    pub fn adapter_state(&self) -> BleAdapterState {
+        *self.adapter_state_rx.borrow()
+    }
+
+    /// Subscribe to adapter power transitions. The receiver starts at the
+    /// current state; each change is published once, after the transport has
+    /// moved its peers into (or out of) `Restoring`.
+    #[must_use]
+    pub fn adapter_state_changes(&self) -> tokio::sync::watch::Receiver<BleAdapterState> {
+        self.adapter_state_rx.clone()
+    }
+
     /// Public-facing peer snapshot. Filters out `Unknown` (pre-state internal
     /// construction) and `Dead` (tombstones kept around for `DEAD_GC_TTL`
     /// dedup) so the returned list only contains peers that are actionable
@@ -773,6 +793,14 @@ impl BlePeerInfo {
             verified_endpoint,
         }
     }
+}
+
+/// Power state of the local Bluetooth adapter, as observed by the transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BleAdapterState {
+    PoweredOn,
+    PoweredOff,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

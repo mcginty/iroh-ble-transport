@@ -14,7 +14,7 @@ use iroh_ble_transport::transport::{
     registry::{Registry, SnapshotMaps},
     store::InMemoryPeerStore,
     test_util::{CallKind, MockBleInterface},
-    transport::L2capPolicy,
+    transport::{BleAdapterState, L2capPolicy},
 };
 use tokio::sync::mpsc;
 
@@ -1009,4 +1009,106 @@ async fn wait_for_call_count(
     })
     .await
     .expect("timed out waiting for calls");
+}
+
+/// Both the central and peripheral event streams report every adapter power
+/// transition, so the registry sees each one twice. Subscribers must see one
+/// edge per transition, published after the registry has acted on it.
+#[tokio::test]
+async fn adapter_state_changes_publish_once_per_transition() {
+    let iface = Arc::new(MockBleInterface::new());
+    let (tx, rx) = mpsc::channel::<PeerCommand>(256);
+    let (incoming_tx, _incoming_rx) = mpsc::channel::<IncomingPacket>(16);
+    let snapshots = Arc::new(ArcSwap::from(Arc::new(SnapshotMaps::default())));
+    let (retransmits, truncations, empty_frames) = zero_counters();
+    let routing_local = Arc::new(iroh_ble_transport::transport::routing::Routing::new());
+    let driver = Driver::new(
+        iface.clone(),
+        tx.clone(),
+        incoming_tx,
+        retransmits,
+        truncations,
+        empty_frames,
+        Arc::new(InMemoryPeerStore::new()),
+        Arc::clone(&routing_local),
+    );
+    let (state_tx, mut state_rx) = tokio::sync::watch::channel(BleAdapterState::PoweredOn);
+    let reg =
+        Registry::new_for_test_with_policy(L2capPolicy::Disabled).with_adapter_state_tx(state_tx);
+    let snap_for_actor = snapshots.clone();
+    tokio::spawn(async move {
+        reg.run(
+            rx,
+            driver,
+            snap_for_actor,
+            test_wakers(),
+            Arc::clone(&routing_local),
+        )
+        .await;
+    });
+
+    // An advertisement from a fresh device lands in the snapshot one actor
+    // iteration after every command queued ahead of it has been published.
+    let mut barrier_seq = 0u8;
+    let mut barrier = async || {
+        barrier_seq += 1;
+        let device_id = blew::DeviceId::from(format!("barrier-{barrier_seq}"));
+        tx.send(PeerCommand::Advertised {
+            prefix: [barrier_seq; KEY_PREFIX_LEN],
+            device_id: device_id.clone(),
+            rssi: None,
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !snapshots.load().peer_states.contains_key(&device_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("barrier advertisement never reached the snapshot");
+    };
+
+    tx.send(PeerCommand::AdapterStateChanged { powered: true })
+        .await
+        .unwrap();
+    barrier().await;
+    assert!(
+        !state_rx.has_changed().unwrap(),
+        "powered-on while already on must not publish"
+    );
+
+    tx.send(PeerCommand::AdapterStateChanged { powered: false })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), state_rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*state_rx.borrow_and_update(), BleAdapterState::PoweredOff);
+
+    tx.send(PeerCommand::AdapterStateChanged { powered: false })
+        .await
+        .unwrap();
+    barrier().await;
+    assert!(
+        !state_rx.has_changed().unwrap(),
+        "duplicate powered-off report must not publish"
+    );
+
+    tx.send(PeerCommand::AdapterStateChanged { powered: true })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), state_rx.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(*state_rx.borrow_and_update(), BleAdapterState::PoweredOn);
+    assert!(
+        iface
+            .calls()
+            .iter()
+            .any(|c| matches!(c, CallKind::RestartScan)),
+        "the power-on edge is published after the registry has acted on it"
+    );
 }

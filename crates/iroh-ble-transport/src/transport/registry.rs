@@ -10,12 +10,12 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use blew::DeviceId;
 use std::task::Waker;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::transport::driver::Driver;
 use crate::transport::interface::BleInterface;
 use crate::transport::peer::{PeerAction, PeerCommand, PeerEntry, PeerPhase};
-use crate::transport::transport::L2capPolicy;
+use crate::transport::transport::{BleAdapterState, L2capPolicy};
 
 const MAX_CONNECT_ATTEMPTS: u32 = 15;
 const DRAINING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -44,6 +44,8 @@ pub struct Registry {
     verified_prefixes: HashMap<crate::transport::peer::KeyPrefix, iroh_base::EndpointId>,
     my_endpoint: iroh_base::EndpointId,
     my_prefix: crate::transport::peer::KeyPrefix,
+    adapter_state: BleAdapterState,
+    adapter_state_tx: Option<watch::Sender<BleAdapterState>>,
 }
 
 impl Registry {
@@ -56,7 +58,24 @@ impl Registry {
             verified_prefixes: HashMap::new(),
             my_endpoint,
             my_prefix,
+            adapter_state: BleAdapterState::PoweredOn,
+            adapter_state_tx: None,
         }
+    }
+
+    /// Publish adapter power transitions to `tx` from the actor loop, after
+    /// the registry has acted on them. Both the central and peripheral event
+    /// streams report every transition, so only changes are sent.
+    #[must_use]
+    pub fn with_adapter_state_tx(mut self, tx: watch::Sender<BleAdapterState>) -> Self {
+        self.adapter_state = *tx.borrow();
+        self.adapter_state_tx = Some(tx);
+        self
+    }
+
+    #[must_use]
+    pub fn adapter_state(&self) -> BleAdapterState {
+        self.adapter_state
     }
 
     fn new_entry(next_lifecycle: &mut u64, device_id: DeviceId) -> PeerEntry {
@@ -1233,6 +1252,11 @@ impl Registry {
         now: std::time::Instant,
         powered: bool,
     ) {
+        self.adapter_state = if powered {
+            BleAdapterState::PoweredOn
+        } else {
+            BleAdapterState::PoweredOff
+        };
         if !powered {
             for entry in self.peers.values_mut() {
                 Self::abandon_outstanding(&mut self.next_lifecycle, actions, entry);
@@ -2167,6 +2191,14 @@ impl Registry {
                 driver.execute(action).await;
             }
             self.publish_snapshot(&snapshots);
+            if let Some(tx) = &self.adapter_state_tx {
+                let state = self.adapter_state;
+                tx.send_if_modified(|current| {
+                    let changed = *current != state;
+                    *current = state;
+                    changed
+                });
+            }
             if shutdown {
                 break;
             }
