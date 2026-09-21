@@ -496,12 +496,10 @@ impl BleTransport {
         .await?;
         info!(key_uuid = %key_uuid, "advertising started");
 
+        let scan_filter = blew::central::ScanFilter::default();
         rollback.scanning = true;
         let scanning = construct_step("start_scan", async {
-            match central
-                .start_scan(blew::central::ScanFilter::default())
-                .await
-            {
+            match central.start_scan(scan_filter.clone()).await {
                 Ok(()) => Ok(true),
                 Err(BlewError::NotSupported) => Ok(false),
                 Err(e) => Err(BleError::from(e)),
@@ -532,6 +530,7 @@ impl BleTransport {
             Arc::clone(&peripheral),
             services,
             advertising_config,
+            scanning.then_some(scan_filter),
             Arc::clone(&psm_atomic),
             inbox_tx.clone(),
         ));

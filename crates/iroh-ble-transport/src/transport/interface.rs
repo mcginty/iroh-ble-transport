@@ -25,6 +25,9 @@ pub trait BleInterface: Send + Sync + 'static {
     async fn rebuild_server(&self) -> BleResult<()>;
     async fn restart_advertising(&self) -> BleResult<()>;
     async fn restart_l2cap_listener(&self) -> BleResult<Option<u16>>;
+    /// Restart discovery after an adapter power cycle ended the scan. A no-op
+    /// when discovery was disabled at construction.
+    async fn restart_scan(&self) -> BleResult<()>;
     async fn is_powered(&self) -> bool;
     async fn refresh(&self, device_id: &DeviceId) -> BleResult<()>;
     /// Negotiated ATT MTU for a connected peer, as reported by the platform.
@@ -81,6 +84,9 @@ mod tests {
         }
         async fn restart_l2cap_listener(&self) -> BleResult<Option<u16>> {
             Ok(None)
+        }
+        async fn restart_scan(&self) -> BleResult<()> {
+            Ok(())
         }
         async fn is_powered(&self) -> bool {
             true

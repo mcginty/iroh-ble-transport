@@ -443,6 +443,7 @@ pub enum PeerAction {
     RestorePeripheral {
         restart_l2cap: bool,
     },
+    RestartScan,
     StartDataPipe {
         device_id: DeviceId,
         lifecycle_id: u64,

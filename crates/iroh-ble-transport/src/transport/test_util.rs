@@ -26,6 +26,7 @@ pub enum CallKind {
     RebuildServer,
     RestartAdvertising,
     RestartL2capListener,
+    RestartScan,
     IsPowered,
     Refresh(DeviceId),
 }
@@ -379,6 +380,11 @@ impl BleInterface for MockBleInterface {
             .calls
             .push(CallKind::RestartL2capListener);
         Ok(None)
+    }
+
+    async fn restart_scan(&self) -> BleResult<()> {
+        self.inner.lock().unwrap().calls.push(CallKind::RestartScan);
+        Ok(())
     }
 
     async fn is_powered(&self) -> bool {
