@@ -371,6 +371,7 @@ The transport exposes two snapshot APIs:
 - `BleTransport::metrics() -> BleMetricsSnapshot` — `tx_bytes`, `rx_bytes`, `retransmits`, `truncations` (cumulative atomics).
 - `BleTransport::snapshot_peers() -> Vec<BlePeerInfo>` — current `(device_id, phase, consecutive_failures, connect_path)` for every peer in the registry. Backed by an `arc_swap::ArcSwap<SnapshotMaps>` that the registry republishes on every state change.
 - `BleTransport::device_for_endpoint(EndpointId) -> Option<DeviceId>` — resolves an iroh endpoint to a BLE device via the routing table's prefix map.
+- `BleTransport::adapter_state() -> BleAdapterState` / `adapter_state_changes() -> watch::Receiver<BleAdapterState>` — local adapter power (`PoweredOn`/`PoweredOff`). Published by the registry actor after it has handled the transition, deduplicated across the central and peripheral event streams (both report every change).
 
 The chat app polls these from `bandwidth_tick` (1 s) and `transport_state_tick` (1 s) and forwards diffs to the frontend as `bandwidth` and `ble-peer-updated`/`ble-peer-removed` Tauri events.
 
