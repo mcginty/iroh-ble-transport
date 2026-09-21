@@ -1253,10 +1253,13 @@ impl Registry {
             // and advertising state on Android (and sometimes macOS); the
             // driver re-registers services, (if L2CAP is enabled) re-opens
             // the listener, and then restarts the advertiser so inbound
-            // peers can find us again.
+            // peers can find us again. The scan dies with the adapter on
+            // both Android and Apple too, and is not resumed by the
+            // platform, so the driver restarts it to keep discovery alive.
             actions.push(PeerAction::RestorePeripheral {
                 restart_l2cap: matches!(self.l2cap_policy, L2capPolicy::PreferL2cap),
             });
+            actions.push(PeerAction::RestartScan);
         }
     }
 
@@ -3928,6 +3931,10 @@ mod tests {
                 }
             )),
             "expected RestorePeripheral without an L2CAP restart on adapter-on under L2capPolicy::Disabled"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(a, PeerAction::RestartScan)),
+            "expected RestartScan on adapter-on"
         );
         match &reg.peer(&device_id).unwrap().phase {
             PeerPhase::Reconnecting { attempt: 0, .. } => {}
@@ -6681,6 +6688,9 @@ mod tests {
             }
             async fn restart_l2cap_listener(&self) -> crate::error::BleResult<Option<u16>> {
                 Ok(None)
+            }
+            async fn restart_scan(&self) -> crate::error::BleResult<()> {
+                Ok(())
             }
             async fn is_powered(&self) -> bool {
                 true

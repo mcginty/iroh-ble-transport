@@ -583,6 +583,13 @@ impl<I: BleInterface> Driver<I> {
                 });
             }
 
+            PeerAction::RestartScan => {
+                let iface = Arc::clone(&self.iface);
+                tokio::spawn(async move {
+                    let _ = iface.restart_scan().await;
+                });
+            }
+
             PeerAction::PutPeerStore { prefix, snapshot } => {
                 let store = Arc::clone(&self.store);
                 tokio::spawn(async move {
@@ -828,6 +835,10 @@ pub struct BlewDriver {
     /// after an adapter-off/on cycle wipes platform state.
     services: Vec<GattService>,
     advertising_config: AdvertisingConfig,
+    /// The filter `construct` started scanning with, for `restart_scan` to
+    /// reuse after an adapter cycle. `None` when the backend refused to scan,
+    /// so a restart keeps discovery disabled rather than asking again.
+    scan_filter: Option<ScanFilter>,
     /// Shared PSM value, updated when the L2CAP listener is (re)started.
     /// Zero means "no PSM advertised yet".
     psm: Arc<AtomicU16>,
@@ -841,6 +852,7 @@ impl BlewDriver {
         peripheral: Arc<Peripheral>,
         services: Vec<GattService>,
         advertising_config: AdvertisingConfig,
+        scan_filter: Option<ScanFilter>,
         psm: Arc<AtomicU16>,
         inbox: mpsc::Sender<PeerCommand>,
     ) -> Self {
@@ -851,6 +863,7 @@ impl BlewDriver {
             channels_by_device: Mutex::new(HashMap::new()),
             services,
             advertising_config,
+            scan_filter,
             psm,
             inbox,
         }
@@ -1040,6 +1053,24 @@ impl BleInterface for BlewDriver {
                 Ok(None)
             }
         }
+    }
+
+    async fn restart_scan(&self) -> crate::error::BleResult<()> {
+        let Some(filter) = &self.scan_filter else {
+            return Ok(());
+        };
+        if let Err(e) = self.central.stop_scan().await {
+            tracing::debug!(?e, "restart_scan: stop_scan ignored");
+        }
+        if let Err(e) = self.central.start_scan(filter.clone()).await {
+            tracing::warn!(
+                error = %e,
+                "scan restart failed after adapter cycle; discovery disabled"
+            );
+            return Err(e.into());
+        }
+        tracing::info!("scanning restarted after adapter cycle");
+        Ok(())
     }
 
     async fn is_powered(&self) -> bool {
