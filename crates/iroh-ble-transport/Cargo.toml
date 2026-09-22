@@ -1,6 +1,6 @@
 [package]
 name = "iroh-ble-transport"
-version = "0.5.1-beta.4"
+version = "0.5.1-beta.5"
 edition = "2024"
 rust-version.workspace = true
 authors = ["Jake McGinty <me@jakebot.org>"]
