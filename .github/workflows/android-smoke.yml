@@ -94,6 +94,9 @@ jobs:
 
   build-chat:
     name: Build chat demo APK
+    # Builds from the workspace lockfile, so a nightly run would only repeat
+    # what the last push already checked.
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
