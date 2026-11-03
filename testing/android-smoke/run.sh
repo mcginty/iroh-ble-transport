@@ -3,7 +3,7 @@
 # The launch passes only if the app logs IROH_BLE_SMOKE_OK and is still running a
 # few seconds later.
 #
-#   smoke/android/run.sh [build|launch|all] [aarch64|x86_64]
+#   testing/android-smoke/run.sh [build|launch|all] [aarch64|x86_64]
 #
 # Defaults: all, x86_64. IROH_BLE_SMOKE_LATEST=1 runs `cargo update` before the
 # build, so it uses the newest tauri/tao/wry the version requirements allow

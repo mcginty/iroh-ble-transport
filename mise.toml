@@ -269,7 +269,7 @@ run = "cargo ndk -t arm64-v8a check -p iroh-ble-transport --all-targets --all-fe
 [tasks."ci:android-smoke"]
 description = "Build the Android smoke app and launch it on a running emulator/device (args: [build|launch|all] [aarch64|x86_64])"
 tools = { "cargo:tauri-cli" = "2" }
-run = "smoke/android/run.sh"
+run = "testing/android-smoke/run.sh"
 
 [tasks."ci:build-chat-android"]
 description = "Build the chat demo's debug APK without launching it (catches Gradle/manifest-merge failures)"

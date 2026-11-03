@@ -54,7 +54,7 @@ jobs:
       - run: rustup target add x86_64-linux-android
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: smoke/android
+          workspaces: testing/android-smoke
       - uses: android-actions/setup-android@v3
         with:
           # The action still defaults to 'tools platform-tools', but the
@@ -90,7 +90,7 @@ jobs:
           target: ${{ env.EMULATOR_TARGET }}
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: smoke/android/run.sh launch x86_64
+          script: testing/android-smoke/run.sh launch x86_64
 
   build-chat:
     name: Build chat demo APK
