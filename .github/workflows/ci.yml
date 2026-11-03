@@ -26,7 +26,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: jdx/mise-action@v4
-      - run: mise install --force rust cargo-binstall cargo:cargo-nextest cargo:cargo-deny node pnpm
+      # Not `mise install --force rust` on macOS: the image's rustup comes from
+      # Homebrew, and mise's forced reinstall runs a hardcoded
+      # `~/.cargo/bin/rustup`, which doesn't exist there.
+      - name: Install Rust
+        run: ${{ runner.os == 'macOS' && 'rustup component add rustfmt clippy' || 'mise install --force rust' }}
+      - run: mise install --force cargo-binstall cargo:cargo-nextest cargo:cargo-deny node pnpm
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux system dependencies
         if: runner.os == 'Linux'
@@ -39,7 +44,8 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: jdx/mise-action@v4
-      - run: mise install --force rust
+      # See the verify job: mise's forced Rust reinstall fails on macOS.
+      - run: rustup target add aarch64-apple-ios
       - uses: Swatinem/rust-cache@v2
       - run: mise run ci:check-ios
 
