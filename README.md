@@ -27,6 +27,52 @@ library for Rust.
 
 This library currently supports iOS, macOS, Android, and Linux.
 
+### Android
+
+- **Android 13 (API 33) or later.** blew's Android library declares
+  `minSdk 33`; an app with a lower `minSdk` fails its manifest merge. In a
+  Tauri app, set `bundle.android.minSdkVersion` to `33` in `tauri.conf.json`
+  and `minSdk = 33` in `gen/android/app/build.gradle.kts`.
+- **iroh's system DNS needs `ndk_context`, which blew no longer publishes.**
+  iroh reads the system DNS servers through `ndk_context`; when nothing has
+  published it, iroh falls back to public resolvers. BLE is unaffected, but
+  DNS-dependent IP connectivity suffers on networks that block or rewrite
+  public DNS (enterprise networks, captive portals, Private DNS).
+  - **Tauri 2.12 and later:** tao publishes `ndk_context` itself, so there is
+    nothing to do. Do **not** publish it yourself — not with
+    `ndk_context::initialize_android_context`, not with a helper that wraps
+    it, not with `install_android_context_once`. A second publish aborts the
+    process.
+  - **Tauri 2.11 and earlier:** nothing publishes it. Publish it from the
+    handles blew already holds, once the plugin is registered (for example in
+    your `setup` hook) and before binding the iroh `Endpoint`. This needs a
+    direct `blew` dependency at the same version `tauri-plugin-blew` uses:
+
+    ```rust
+    #[cfg(target_os = "android")]
+    fn publish_ndk_context_for_iroh() {
+        let (Some(vm), Some(ctx)) = (
+            blew::platform::android::java_vm(),
+            blew::platform::android::application_context(),
+        ) else {
+            return;
+        };
+        unsafe {
+            tauri_plugin_blew::install_android_context_once(
+                vm.get_raw().cast(),
+                ctx.as_raw().cast(),
+            );
+        }
+    }
+    ```
+
+    Remove the call when you move to Tauri 2.12: tao's own publish in
+    `onCreate` would then abort the app.
+  - **`panic = "abort"`:** iroh detects a missing `ndk_context` with
+    `catch_unwind`, which does nothing under `panic = "abort"`. Without a
+    published context, such an app aborts on its first DNS read instead of
+    falling back.
+
 ## Usage
 
 BLE is a high-touch transport — it needs more wiring than the IP-based
