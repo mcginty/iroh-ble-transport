@@ -1,0 +1,115 @@
+name: Android smoke
+
+# Launches a real Tauri app on an emulator and brings up BleTransport under an
+# iroh Endpoint. Catches what only an activity start exercises: tauri-plugin-blew
+# taking the app Context alongside tao's own ndk_context publish (blew#56),
+# blew's Kotlin managers loading, and the transport registering its GATT
+# service, advertising and L2CAP listener on the platform stack.
+#
+# Also builds the chat demo's debug APK, which `cargo ndk check` never does, so
+# Gradle and manifest-merge failures (such as blew raising its minSdk) show up
+# before a chat release.
+#
+# PRs and pushes build from the lockfiles. The nightly run updates the smoke
+# app to the newest tauri/tao/wry/blew first, since blew#56 came from a tao
+# release that a lockfile would have hidden.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 9 * * *"
+  workflow_dispatch:
+    inputs:
+      latest:
+        description: "Update to the latest compatible dependencies before building"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  IROH_BLE_SMOKE_LATEST: ${{ (github.event_name == 'schedule' || inputs.latest) && '1' || '0' }}
+  EMULATOR_API_LEVEL: 35
+  EMULATOR_TARGET: google_apis
+  EMULATOR_ARCH: x86_64
+  # mise.toml declares `android-sdk`, and mise would point ANDROID_HOME at its
+  # own install, which has no NDK or system images. Leave ANDROID_HOME to
+  # setup-android and the runner's preinstalled SDK. See release.yml.
+  MISE_DISABLE_TOOLS: android-sdk
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Launch on emulator (${{ (github.event_name == 'schedule' || inputs.latest) && 'latest deps' || 'locked' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust java
+      - run: rustup target add x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: testing/android-smoke
+      - uses: android-actions/setup-android@v3
+        with:
+          # The action still defaults to 'tools platform-tools', but the
+          # obsolete 'tools' package was removed from the SDK repository and
+          # sdkmanager now fails on it.
+          packages: platform-tools
+      # run.sh picks the newest NDK under $ANDROID_HOME/ndk.
+      - name: Build the smoke APK
+        run: mise run ci:android-smoke build x86_64
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      # The emulator action downloads the system image on every run, and a
+      # corrupt download can fail the job before the app ever launches.
+      # sdkmanager skips a package that is already installed, so a cache hit
+      # skips the download. actions/cache saves only after a successful job, so
+      # a bad image can't be cached. Resolved in the shell: the runner's
+      # ANDROID_HOME is not in the `env` context.
+      - name: Locate the emulator system image
+        run: echo "SYSTEM_IMAGE_DIR=$ANDROID_HOME/system-images/android-$EMULATOR_API_LEVEL/$EMULATOR_TARGET/$EMULATOR_ARCH" >> "$GITHUB_ENV"
+      - name: Cache the emulator system image
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SYSTEM_IMAGE_DIR }}
+          key: system-image-${{ env.EMULATOR_API_LEVEL }}-${{ env.EMULATOR_TARGET }}-${{ env.EMULATOR_ARCH }}
+      - name: Launch on emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ env.EMULATOR_API_LEVEL }}
+          arch: ${{ env.EMULATOR_ARCH }}
+          target: ${{ env.EMULATOR_TARGET }}
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: testing/android-smoke/run.sh launch x86_64
+
+  build-chat:
+    name: Build chat demo APK
+    # Builds from the workspace lockfile, so a nightly run would only repeat
+    # what the last push already checked.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: jdx/mise-action@v4
+      - run: mise install --force rust java node pnpm
+      - uses: Swatinem/rust-cache@v2
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - name: Install Linux system dependencies
+        # nasm is required by rav1e (via ravif, for the chat app's image encoding).
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libglib2.0-dev pkg-config nasm
+      - name: Point Tauri at the newest preinstalled NDK
+        run: echo "NDK_HOME=$(find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)" >> "$GITHUB_ENV"
+      - run: mise run ci:build-chat-android
