@@ -202,6 +202,8 @@ impl From<DisconnectCause> for DisconnectReason {
             DisconnectCause::Gatt133 => DisconnectReason::Gatt133,
             DisconnectCause::Timeout => DisconnectReason::Timeout,
             DisconnectCause::Unknown(c) => DisconnectReason::Unknown(c),
+            // A cause added after blew 0.6 carries no platform status code.
+            _ => DisconnectReason::Unknown(-1),
         }
     }
 }

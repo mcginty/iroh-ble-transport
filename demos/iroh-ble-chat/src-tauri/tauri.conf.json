@@ -34,7 +34,8 @@
       "icons/icon.ico"
     ],
     "android": {
-      "autoIncrementVersionCode": true
+      "autoIncrementVersionCode": true,
+      "minSdkVersion": 33
     },
     "iOS": {
       "developmentTeam": "XG66F95CNS",

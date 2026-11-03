@@ -123,6 +123,10 @@ pub async fn run_central_events(
             CentralEvent::AdapterStateChanged { powered } => {
                 PeerCommand::AdapterStateChanged { powered }
             }
+            other => {
+                tracing::debug!(event = ?other, "central event pump: ignoring unhandled event");
+                continue;
+            }
         };
         if inbox.send(cmd).await.is_err() {
             tracing::debug!("central event pump: inbox closed, shutting down");
@@ -170,6 +174,10 @@ pub async fn run_peripheral_state_events(
                         char_uuid,
                     }
                 }
+            }
+            other => {
+                tracing::debug!(event = ?other, "peripheral state event pump: ignoring unhandled event");
+                continue;
             }
         };
         if inbox.send(cmd).await.is_err() {
@@ -236,6 +244,10 @@ pub async fn run_peripheral_requests(
                 } else {
                     responder.respond(Vec::new());
                 }
+                continue;
+            }
+            other => {
+                tracing::debug!(request = ?other, "peripheral request pump: rejecting unhandled request");
                 continue;
             }
         };

@@ -171,6 +171,8 @@ fn handle_state_event(event: PeripheralStateEvent, subscribers: &Mutex<HashSet<D
                 }
             }
         }
+
+        other => println!("<- unhandled state event: {other:?}"),
     }
 }
 
@@ -200,5 +202,7 @@ fn handle_request(req: PeripheralRequest) {
                 r.success();
             }
         }
+
+        other => println!("<- unhandled request: {other:?}"),
     }
 }

@@ -505,9 +505,9 @@ dependencies = [
 
 [[package]]
 name = "blew"
-version = "0.5.1-beta.7"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c320e7a5bd05324455d9524030a2ba2f3cb67be5cf55692b97ef4655d295f13"
+checksum = "afe3d2fc9f459953a1144513b30b1da34596ac74e45714987d03bc71fb8be9e6"
 dependencies = [
  "bitflags 2.13.2",
  "bluer",
@@ -515,7 +515,6 @@ dependencies = [
  "dispatch2",
  "futures-core",
  "jni 0.22.4",
- "ndk-context",
  "objc2",
  "objc2-core-bluetooth",
  "objc2-core-foundation",
@@ -6229,9 +6228,9 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.5.1-beta.7"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b691a5c2bb6cfa7fce741b5c72db3b4aa80eb27e774a986119806854ee30b09"
+checksum = "e620b0379bc04bd195601c5660cb8d7924b6d659f6bd7052343eceb328a70998"
 dependencies = [
  "blew",
  "jni 0.22.4",
