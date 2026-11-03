@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">"iroh-ble-smoke"</string>
+    <string name="main_activity_title">"iroh-ble-smoke"</string>
+</resources>

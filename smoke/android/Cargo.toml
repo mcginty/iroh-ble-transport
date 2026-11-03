@@ -1,0 +1,31 @@
+[package]
+name = "iroh-ble-android-smoke"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Launches a Tauri app on Android, brings up BleTransport under an iroh Endpoint, and reports how far it got"
+
+# Kept out of the workspace: it is only ever built for Android by the
+# android-smoke CI job, and a Tauri app in the workspace would make every
+# desktop build and test pay for it.
+[workspace]
+
+[lib]
+name = "iroh_ble_android_smoke_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = [] }
+tauri-plugin-blew = "0.6.2"
+iroh-ble-transport = { path = "../../crates/iroh-ble-transport" }
+iroh = "1.0.3"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+log = "0.4"
+# The transport logs through `tracing`; with no subscriber installed, the `log`
+# feature forwards its events to android_logger so they land in logcat.
+tracing = { version = "0.1", features = ["log"] }

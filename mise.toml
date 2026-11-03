@@ -265,3 +265,16 @@ run = "cargo check --target aarch64-apple-ios -p iroh-ble-transport --all-target
 description = "Type-check all iroh-ble-transport targets and features for Android"
 depends = ["android:setup"]
 run = "cargo ndk -t arm64-v8a check -p iroh-ble-transport --all-targets --all-features"
+
+[tasks."ci:android-smoke"]
+description = "Build the Android smoke app and launch it on a running emulator/device (args: [build|launch|all] [aarch64|x86_64])"
+tools = { "cargo:tauri-cli" = "2" }
+run = "smoke/android/run.sh"
+
+[tasks."ci:build-chat-android"]
+description = "Build the chat demo's debug APK without launching it (catches Gradle/manifest-merge failures)"
+dir = "demos/iroh-ble-chat"
+run = """
+pnpm install --frozen-lockfile
+TAURI_CLI_NO_DEV_SERVER=true pnpm tauri android build --debug --apk --target aarch64
+"""
