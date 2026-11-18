@@ -68,9 +68,9 @@ cargo run --example peripheral -p iroh-ble-transport          # bare peripheral 
 | Crate | Role |
 |-------|------|
 | `blew` (git: mcginty/blew) | Cross-platform BLE — central, peripheral, GATT, L2CAP CoC |
-| `iroh 1.0` (`unstable-custom-transports`) | QUIC endpoint, custom transport trait |
+| `iroh 1.4` (`unstable-custom-transports`) | QUIC endpoint, custom transport trait |
 | `iroh-base 1.0` | `EndpointId`, `CustomAddr`, `TransportAddr` |
-| `noq-udp 1.1` | `RecvMeta` — unsealed public dep of iroh's `CustomEndpoint::poll_recv`; must track iroh's own requirement |
+| `noq-udp 1.4` | `RecvMeta` — unsealed public dep of iroh's `CustomEndpoint::poll_recv`; must track iroh's own requirement |
 | `tokio 1` | Async runtime |
 | `arc-swap` | Lock-free snapshot publication of registry state |
 | `parking_lot` | Sync mutexes inside the registry/routing tables |
